@@ -27,6 +27,14 @@
           "terminal"
         ]
       },
+      "cedar-and-ask": {
+        "type": "chain",
+        "mode": "all",
+        "backends": [
+          "cedar",
+          "terminal"
+        ]
+      },
       "terminal": {
         "type": "terminal"
       }

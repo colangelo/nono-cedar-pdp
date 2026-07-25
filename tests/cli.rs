@@ -146,6 +146,13 @@ fn checking_the_command_fixtures_reproduces_the_documented_decisions() {
         "{stdout}"
     );
 
+    // The third thing the requirement asks `check` to report, next to the decision
+    // and the matched policies: how long the evaluation took.
+    assert!(
+        stdout.contains(" µs)"),
+        "the evaluation time must be reported: {stdout}"
+    );
+
     let (ok, stdout) = check_fixture("git-force-push.json");
     assert!(!ok, "{stdout}");
     assert!(

@@ -164,6 +164,11 @@ The `command_policies` block (the full working profile is
         "mode": "any",
         "backends": ["cedar", "terminal"]
       },
+      "cedar-and-ask": {
+        "type": "chain",
+        "mode": "all",
+        "backends": ["cedar", "terminal"]
+      },
       "terminal": { "type": "terminal" }
     },
     "approval_defaults": { "backend": "cedar", "timeout_secs": 5 },
