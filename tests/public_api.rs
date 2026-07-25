@@ -39,6 +39,22 @@ fn the_d15_guards_bypass_pieces_are_not_exported() {
          authorize around the guard `Engine::evaluate` runs first"
     );
 
+    // The module marker alone is not enough: a `pub fn` inside a `pub(crate)`
+    // module can still leak through a one-line `pub use self::entities::build;`
+    // without disturbing the module declaration above. Capping the function
+    // itself at `pub(crate)` turns any such re-export into a hard compile error
+    // (E0364, "only public within the crate, and cannot be re-exported
+    // outside") — the same cap that already protects `Decision::from_response`.
+    let entities = source("src/cedar/entities.rs");
+    assert!(
+        entities.contains("pub(crate) fn build"),
+        "src/cedar/entities.rs no longer declares `pub(crate) fn build`. The D15 \
+         guard's bypass pieces must not be exported: a `pub fn build` inside the \
+         pub(crate) module can be re-exported with a one-line `pub use` that \
+         leaves the module marker intact, so the function itself must carry the \
+         pub(crate) cap that makes any re-export a compile error (E0364)"
+    );
+
     let decision = source("src/decision.rs");
     assert!(
         decision.contains("pub(crate) fn from_response"),

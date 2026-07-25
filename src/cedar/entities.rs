@@ -69,7 +69,13 @@ fn argv_tail(args: &[String]) -> String {
         .join(" ")
 }
 
-pub fn build(q: &PolicyQuery, schema: &Schema) -> Result<(Request, Entities), BuildError> {
+/// Crate-capped, not just module-hidden: a `pub fn` inside the `pub(crate)`
+/// module could still leak through `pub use self::entities::build;` in
+/// `cedar/mod.rs`, bypassing the D15 ambiguous-path guard `Engine::evaluate`
+/// runs first. `pub(crate)` on the function itself makes any such re-export a
+/// hard compile error (E0364) — the same cap `Decision::from_response` carries.
+/// Pinned by `tests/public_api.rs`.
+pub(crate) fn build(q: &PolicyQuery, schema: &Schema) -> Result<(Request, Entities), BuildError> {
     let agent = Entity::new_no_attrs(
         uid(&format!("Nono::Agent::\"{}\"", escape(&q.agent)))?,
         HashSet::new(),
