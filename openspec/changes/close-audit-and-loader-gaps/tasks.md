@@ -23,8 +23,8 @@ filtered test runs must both pass.
 
 ## 4. Endpoint-path guard bypass (#27)
 
-- [ ] 4.1 Narrow `cedar::entities` to `pub(crate)` and `Decision::from_response` to `pub(crate)`; whole workspace (lib + bin + integration tests) compiles — the bin crate is the public-API canary
-- [ ] 4.2 Tripwire test asserting the two visibility markers in source, failing with a message that names the requirement ("the D15 guard's bypass pieces must not be exported")
+- [x] 4.1 Narrow `cedar::entities` to `pub(crate)` and `Decision::from_response` to `pub(crate)`; whole workspace (lib + bin + integration tests) compiles — the bin crate is the public-API canary
+- [x] 4.2 Tripwire test asserting the two visibility markers in source, failing with a message that names the requirement ("the D15 guard's bypass pieces must not be exported")
 
 ## 5. Verification
 

@@ -29,7 +29,12 @@ impl Decision {
     ///
     /// Fails closed on evaluation errors: if any policy errored we cannot know
     /// whether a `forbid` was skipped, so an `Allow` is not trustworthy.
-    pub fn from_response(response: &Response, eval_us: u128) -> Self {
+    ///
+    /// Crate-private on purpose: a public raw-`Response` conversion is one half
+    /// of authorizing a request without `Engine::evaluate`, whose D15 guard
+    /// denies ambiguous endpoint paths before any policy is consulted. Pinned by
+    /// `tests/public_api.rs`.
+    pub(crate) fn from_response(response: &Response, eval_us: u128) -> Self {
         let mut matched: Vec<String> = response
             .diagnostics()
             .reason()
