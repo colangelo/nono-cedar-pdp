@@ -15,5 +15,5 @@ TDD throughout: failing test first, watched failing for the right reason.
 
 ## 3. Verification
 
-- [ ] 3.1 `just test` full and filtered (`cargo test --lib config`) green; `just lint` clean
-- [ ] 3.2 `openspec validate --changes drop-unknown-agent-knob` passes
+- [x] 3.1 `just test` full and filtered (`cargo test --lib config`) green; `just lint` clean
+- [x] 3.2 `openspec validate --changes drop-unknown-agent-knob` passes
