@@ -21,7 +21,7 @@ Each audit line SHALL carry an RFC 3339 UTC timestamp, the nono `request_id` and
 - **WHEN** a malformed or unsupported request is denied without ever becoming a policy query
 - **THEN** the line still contains the `child_pid`, `intercept_rule` and `rule_label` keys, each explicitly `null`
 
-#### Scenario: Control bytes in the routing fields cannot reach a terminal raw
+#### Scenario: Control bytes in request-derived fields cannot reach a terminal raw
 
-- **WHEN** a request's `intercept_rule` or `rule_label` carries control characters that JSON string encoding does not escape (DEL, or a C1 control such as CSI)
-- **THEN** the recorded value has them escaped, so reading the trail in a terminal cannot execute them
+- **WHEN** any request-derived audit value — `intercept_rule`, `rule_label`, `request_id`, `session_id`, or `backend` — carries control characters that JSON string encoding does not escape (DEL, or a C1 control such as CSI)
+- **THEN** the recorded value has them escaped on the raw bytes of the audit file, so reading the trail in a terminal cannot execute them

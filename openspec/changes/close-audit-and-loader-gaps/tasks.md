@@ -41,3 +41,15 @@ filtered test runs must both pass.
 - [x] 6.5 Corpus verbatim additions from the spec-coverage audit: `/search?q=..%2F..%2Fetc` in the non-ambiguous set and `/repos/..%5C../user/keys` in the denied set; assert the `.#10-git.cedar` emacs lock file's WARN line is present in the skip-log test
 - [x] 6.6 Temper the tripwire/test wording to the narrowed spec claim (no route *this library offers* skips the guard) so the assertion message does not overclaim what visibility caps buy
 - [x] 6.7 Full + filtered tests green, `just lint` clean; `openspec validate --changes close-audit-and-loader-gaps` passes
+
+## 7. Second remediation round (2026-07-26, security re-audit of the remediation)
+
+The re-audit proved the DEL/C1 escaping stopped at the two routing fields while the
+delta spec's SHALL covers every request-derived value: `request_id`, `session_id`
+and `backend` still reach the audit file raw on the decided path (the rejected path
+already escapes via `scrape_context`).
+
+- [ ] 7.1 Failing test: a decided line whose `request_id`, `session_id` and `backend` carry U+009B (CSI) and U+007F (DEL) lands in the audit FILE with no raw 0x9b/0x7f bytes — assert on the file's raw bytes, not a tracing sink, and use C1/DEL specifically (the C0-only test is what let this survive)
+- [ ] 7.2 Implement: `control_escape` for the identifier fields in `record()` at the recording boundary; comment states the boundary rule (every request-derived value is escaped here, serde covers C0 only)
+- [ ] 7.3 One sentence in `src/sanitize.rs` module docs: the escaping is terminal-safety, not a reversible encoding — text that literally spells an escape sequence reads identically to an escaped control, so the trail is not forensically injective
+- [ ] 7.4 Full + filtered tests green, `just lint` clean; `openspec validate --changes close-audit-and-loader-gaps` passes
