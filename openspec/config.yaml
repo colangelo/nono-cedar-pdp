@@ -1,0 +1,55 @@
+schema: spec-driven
+
+context: |
+  Project: nono-cedar-pdp — a fail-closed Cedar Policy Decision Point (PDP) that
+  answers nono's WebhookApproval callbacks. nono (github.com/nolabs-ai/nono, Rust,
+  kernel-enforced agent sandbox via Seatbelt/Landlock) stays the Policy Enforcement
+  Point; this daemon only decides. No fork of nono is needed — the seam is its stock
+  webhook approval backend.
+
+  Tech stack: Rust 2021, MSRV 1.89. cedar-policy 4.11 (embedded, not a separate
+  server), axum 0.8 + tower-http, tokio, arc-swap, notify, clap, serde, toml, time,
+  thiserror, tracing. `nono` 0.69 is a DEV-dependency only (wire-conformance test);
+  it must never appear under [dependencies] — see ADR-001.
+
+  Authoritative design docs, already written and approved — read these before
+  proposing anything, and do not re-derive their decisions:
+    - docs/superpowers/specs/2026-07-25-nono-cedar-pdp-design.md (design spec, D1-D8)
+    - docs/superpowers/plans/2026-07-25-nono-cedar-pdp-v1.md (10-task implementation plan)
+    - docs/adr/ADR-001-rust-and-cedar-crate.md
+    - docs/research/00-groundwork.md, docs/research/01-landscape.md
+
+  Verified upstream contract (read from nono v0.69.0 source; do not re-guess):
+    - POST {"backend":"<name>","request":{...}}; inner request internally tagged by
+      "capability_type" in {capability,network,endpoint,command}.
+    - Only `command` and `endpoint` ever reach a webhook. `network` is never
+      constructed in production code; filesystem `capability` elevation is hardwired
+      to the terminal backend.
+    - Response: {"decision":"allow"} or {"decision":"deny","reason":"..."}. Never
+      emit nono's internal ApprovalDecision enum shape.
+    - Fail-closed upstream: non-2xx => Denied; unparseable body or unknown decision
+      => hard error; default timeout 60s; 64 KiB response cap.
+    - Endpoint requests hardcode session_id "proxy" and child_pid 0 — no session
+      identity for L7.
+    - `args` is lossy: nono drops non-UTF-8 argv entries, so positions shift.
+      Positional argument matching is UNSOUND. Cedar `args` is a Set<String> so
+      indexing is unexpressible by construction.
+    - The webhook is unauthenticated in both directions; loopback-only bind, with
+      https-on-loopback as a follow-up.
+
+  Conventions:
+  - Fail closed everywhere. Any parse failure, unsupported variant, evaluation error
+    or missing policy resolves to deny. Never allow on an error path.
+  - Wire parsing lenient (no deny_unknown_fields); own config parsing strict
+    (deny_unknown_fields). Drift is caught by the conformance test instead.
+  - TDD: write the failing test first, watch it fail, then implement.
+  - Justfile is the task runner; default recipe is `just --list`. `trash`, never `rm`.
+  - Conventional commits, granular per task. Always `main`, never `master`.
+
+rules:
+  proposal:
+    - Cite the approved design spec rather than re-deriving decisions already made in it
+    - Always state the fail-closed consequence of anything that can go wrong
+  tasks:
+    - Every task must state its verification command and the expected output
+    - Tests come before implementation within each task
