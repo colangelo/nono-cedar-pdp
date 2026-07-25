@@ -140,11 +140,12 @@ in the webhook backend config.
 | D13 | Policy directory and audit log MUST live outside any tree the sandboxed agent can write; shipped defaults are home-anchored, never CWD-relative | Hot-reload turns a writable policy dir into a privilege-escalation path: the agent writes `permit(principal, action, resource);` and the PDP adopts it within a debounce. Proven end-to-end against the previous `./policies` default |
 | D14 | The shipped read-only git permit pins the subcommand with an **anchored `argv_tail`** test, and a second, independent `forbid` covers git's code-executing flags (`-c`, `--config-env`, `--exec-path`, `--upload-pack`, `--receive-pack`) | Set membership cannot express position: `args.contains("status")` is true of `git -c core.fsmonitor=<cmd> status`, which git *executes*. Anchoring is the only expressible position pin (`args[0]` is gone from `argv_tail`, so its first token is the subcommand). Two independent layers, each proven to deny the exploit alone, so a future membership-shaped permit cannot resurrect it. Cost: `git -c … status` is denied — fail-safe, and a prompt under `chain`/`any` |
 | D15 | Endpoint `path` stays **raw**; a path whose meaning depends on the upstream's normalisation is denied before any policy runs | `resource.path like "/repos/*"` was satisfied by `/repos/../user/keys` (and `%2e%2e`, `%252e%252e`, `..;/`). Normalising here would change what a policy matches *and* guess at which of many normalisation rules the upstream applies; refusing the ambiguity keeps `path` faithful and fails closed. Query strings, dots inside a segment, and a stray `%` below the first decode pass are deliberately not ambiguous |
+| D16 | The audit sink revalidates the `(st_dev, st_ino)` of its path **before every record** and reopens on a mismatch; a failed reopen keeps writing to the handle already held | An append handle survives `rename`/`unlink` and its writes keep succeeding, so a rotation silently detached the trail: decisions were answered and recorded into an inode nothing can read at the configured path, with `/healthz` still green (proven by renaming the log under a running daemon). One `stat` per record is nothing next to a Cedar evaluation, and "periodic" would leave a window of unrecorded decisions. Dropping the line on a failed reopen would lose more than appending to the previous file, and neither path may change a decision |
 
 D9–D11 (empty policy dir refuses to start, policy ids carry file provenance, deny vs
 broken are different signals) were recorded during the change proposal and live in
 `openspec/changes/add-cedar-pdp-v1/design.md`; the numbering here continues from them.
-D12 and D13 are post-implementation audit corrections; D14 and D15 come from the
+D12 and D13 are post-implementation audit corrections; D14–D16 come from the
 adversarial security audit that followed.
 
 ### D12 — `argv_tail` replaces `argv`: one anchoring target, and it excludes the shim path
@@ -244,6 +245,39 @@ already performs, both sit outside any repository working tree, and the `just sm
 recipe must read the audit log from the configured path rather than assuming the repo
 root. Operators who relocate them keep the same invariant: the policy dir and the audit
 log must not be reachable by the agent's write grants.
+
+The repo-relative shape stays available as `nono-cedar-pdp.dev.toml` (plus
+`just serve-dev`), because editing `./policies` and tailing `./decisions.jsonl` is how
+this thing is developed. It is separated from the shipped config so the dev shortcut is
+a deliberate choice rather than the default, and `serve` names the risk out loud on
+every start with it.
+
+**What the two startup checks buy — and what they do not.** `serve` refuses to start on
+a group- or world-writable policy directory (or policy file), and warns when either path
+resolves inside the current working directory. Neither is the control that stops the
+escalation above, and the code, the specs and the README say so in the same words:
+
+- **The refusal does nothing about the sandboxed agent.** Seatbelt and Landlock are
+  path-based and do not change uid, so an agent nono launches runs as the *same user* as
+  this daemon: owner-write is exactly the access it has, and no mode this process could
+  set would take it away. The refusal covers a **different and weaker** threat — another
+  local user (a shared group, a service account, anyone under `o+w`) who could otherwise
+  add a `permit`. Worth refusing over; not a sandbox boundary.
+- **The cwd warning is a heuristic proxy, wrong in both directions.** It cannot read the
+  nono profile, so it *misses* an absolute `policy_dir` inside a granted tree — on macOS
+  the default groups grant write to `/tmp`, `/private/tmp`, `$TMPDIR` and `/var/folders`,
+  so a policy dir under any temp path is agent-writable and this check stays quiet — and
+  it *fires* on a plain dev run where no agent exists at all.
+- **The only real control is the profile.** The policy dir and audit log must not sit
+  inside any path the sandbox profile grants write access to. That is checkable:
+  `nono profile show <profile> --format manifest` lists every resolved grant (so
+  `filesystem.allow`/`write`/`allow_file`/`write_file`, `workdir.access`, `--allow-cwd`
+  and group-supplied grants all appear), and every
+  `command_policies.commands.*.from.*.sandbox.fs_write`/`fs_write_file` in the profile
+  has to be read separately, because the resolved manifest does not include per-command
+  sandbox grants (verified against nono 0.69.0: a marker path added to `fs_write` appears
+  in neither `--json` nor `--format manifest`). `just smoke` runs exactly that comparison
+  as an assertion.
 
 ## 4. Architecture
 

@@ -64,9 +64,11 @@ opposite: strict, because a typo in your own security config should fail loudly.
 
 ```bash
 just --list                # every recipe
-cargo run -- validate      # load + strict-validate ./policies, then exit
+just install-policies      # copy the starter pack into ~/.config/nono-cedar-pdp/policies
+cargo run -- validate      # load + strict-validate the configured policy dir, then exit
 cargo run -- check tests/fixtures/git-status.json      # evaluate one saved payload
 just serve                 # run the daemon (release build, foreground)
+just serve-dev             # same, but with the repo-relative dev config (warns loudly)
 just smoke                 # end-to-end: a real `nono run` decided by Cedar
 ```
 
@@ -74,20 +76,28 @@ just smoke                 # end-to-end: a real `nono run` decided by Cedar
 
 ```toml
 bind = "127.0.0.1:8181"          # loopback only; a non-loopback bind is a load error
-policy_dir = "./policies"
-audit_log = "./decisions.jsonl"  # created 0600, parents included
+policy_dir = "~/.config/nono-cedar-pdp/policies"
+audit_log = "~/.local/state/nono-cedar-pdp/decisions.jsonl"   # created 0600, parents included
 
 [agents]                         # nono approval-backend name -> Cedar Agent
 cedar = "claude-code"
 # unknown_agent = "unknown"      # fallback for an unmapped backend name
 ```
 
+Both paths are outside any repository working tree **on purpose** — see
+[Keep the policy directory out of the sandbox](#keep-the-policy-directory-out-of-the-sandbox),
+which is the part of this README to read before deploying anything.
+`nono-cedar-pdp.dev.toml` keeps the repo-relative shape (`./policies`,
+`./decisions.jsonl`) for development; `serve` prints a loud `SECURITY:` warning for
+every path that resolves inside its working directory, so the dev shortcut cannot be
+mistaken for a deployment.
+
 Endpoints:
 
 - `POST /v1/approve` — the decision endpoint. Always `200` with an allow or a deny;
   a malformed body gets *our* deny reason rather than axum's `400`, so the reason
   lands in nono's audit trail.
-- `GET /healthz` — `{"generation":1,"policies":5,"policy_dir":"./policies"}`.
+- `GET /healthz` — `{"generation":1,"policies":5,"policy_dir":"/Users/you/.config/nono-cedar-pdp/policies"}`.
   `503` if no policies are loaded, so "PDP broken" is distinguishable from
   "policy said no".
 
@@ -103,7 +113,9 @@ DENY: denied by 10-git:no-history-rewrites (1497 µs)
 Editing a policy file reloads the set in place (~150 ms debounce). A reload that
 fails to parse or validate keeps the **last-good** set and does not advance the
 generation, so a bad edit mid-session cannot deny-all a running agent. Startup with
-an invalid or empty policy directory refuses to run.
+an invalid or empty policy directory refuses to run — as does startup with a policy
+directory (or policy file) that is group- or world-writable, since another local user
+could otherwise add a `permit`.
 
 Each decision appends one line to the audit log:
 
@@ -114,6 +126,17 @@ Each decision appends one line to the audit log:
  "resource":"git [/private/.../shims/git status]","decision":"allow",
  "matched":["10-git:git-read-only"],"reason":"permitted by 10-git:git-read-only","eval_us":1670}
 ```
+
+The log is safe to rotate under a running daemon. An append handle survives a
+`rename`, and its writes keep succeeding, so the naive version silently stops
+recording anything readable at the configured path while `/healthz` stays green —
+which is how a trail detaches without a single error. Before each record the daemon
+compares the `(st_dev, st_ino)` of the configured path against the handle it holds and
+reopens (0600) if they differ, so `logrotate`, an archiving `mv` or an `rm` all leave
+the next decision recorded where the config says. A reopen that cannot succeed keeps
+appending to the file already open and logs an error; an in-place truncation is
+reported as a shrink. As everywhere in the audit path, none of this can change a
+decision.
 
 ## Wiring nono to it
 
@@ -184,9 +207,13 @@ nono run --allow-cwd --profile examples/cedar-pdp-smoke.json -- git push --force
 ```
 
 `just smoke` does exactly this against a freshly started daemon and asserts both
-decisions appear in the audit log with the expected policy ids. If nono reports that
-tool-sandbox is inactive, run `nono setup` first; `nono why --command git --caller
-session --profile cedar-pdp-smoke` shows whether the command policy resolves at all.
+decisions appear in the audit log with the expected policy ids. Note what it does *not*
+do: it never points the daemon at this repository's `./policies`, because this profile
+makes the repository root agent-writable — it copies the pack to
+`~/.cache/nono-cedar-pdp/smoke`, proves no write grant reaches it, and reads its
+assertions from the configured audit-log path. If nono reports that tool-sandbox is
+inactive, run `nono setup` first; `nono why --command git --caller session --profile
+cedar-pdp-smoke` shows whether the command policy resolves at all.
 
 ### Three rollout postures
 
@@ -269,6 +296,82 @@ that chained the launch. A profile that intercepts a command literally named `se
 therefore produces a payload indistinguishable from a direct launch. Disambiguating
 needs a distinct field upstream.
 
+## Keep the policy directory out of the sandbox
+
+**The policy directory is hot-reloaded, so write access to it is write access to every
+decision this daemon will make.** Dropping `permit (principal, action, resource);` into
+any `*.cedar` file there is adopted after the ~150 ms debounce with nothing but an INFO
+line. The audit log is the compensating control for an unauthenticated webhook, so write
+access to *it* is the ability to truncate or forge the record of what was decided. This
+is not theoretical: with the old `policy_dir = "./policies"` default, a process **inside
+the nono sandbox** overwrote both starter policies through the smoke profile's own
+grants, the PDP reloaded them, and a `git push --force` that had been denied came back
+`allow`.
+
+**The one control that prevents this is your nono profile.** Not file permissions: nono's
+sandboxes are path-based — Seatbelt on macOS, Landlock on Linux — and neither changes
+uid, so a command nono launches runs as the *same user* as this daemon. Every mode bit
+the daemon could set, it sets against *other* users; against the sandboxed agent they buy
+nothing. So the rule is:
+
+> The policy directory and the audit log must never sit inside a path the sandbox profile
+> grants write access to.
+
+### Checking your own profile against that rule
+
+Two places grant writes, and only one of them shows up in the resolved profile:
+
+```bash
+# 1. Session-sandbox grants, fully resolved: filesystem.allow / .write / .allow_file /
+#    .write_file, workdir.access ("readwrite" grants the cwd of `nono run`), --allow-cwd,
+#    and anything a `groups.include` entry adds.
+nono profile show <profile> --format manifest \
+  | jq -r '.filesystem.grants[] | select(.access | test("write")) | "\(.access)\t\(.path)"'
+
+# 2. Per-command sandbox grants. These are NOT in the resolved manifest (verified against
+#    nono 0.69.0), so read them out of the profile itself. A "." here is relative to the
+#    command's working directory.
+jq -r '.command_policies.commands // {} | to_entries[] as $c
+       | $c.value.from // {} | to_entries[]
+       | "\($c.key) from \(.key): fs_write=\(.value.sandbox.fs_write // [])"
+         + " fs_write_file=\(.value.sandbox.fs_write_file // [])"' <profile>
+```
+
+Then check that neither your `policy_dir` nor your `audit_log` is one of those paths or
+underneath one. `just smoke` runs exactly this comparison as an assertion, against
+`examples/cedar-pdp-smoke.json`, before it starts the daemon — that profile grants the
+sandboxed `git` `fs_write: ["."]` **and** `workdir.access: "readwrite"`, so the repository
+root is agent-writable and the smoke daemon's state deliberately lives elsewhere
+(`~/.cache/nono-cedar-pdp/smoke`).
+
+Two traps worth knowing: on macOS the **default** profile groups grant write to `/tmp`,
+`/private/tmp`, `$TMPDIR` and `/var/folders`, so a policy directory under any temp path is
+agent-writable no matter how absolute it looks; and a grant on a parent directory is a
+grant on everything below it.
+
+### What the two startup checks actually buy
+
+`serve` performs two checks before it loads anything. Both are worth having and neither is
+the control above — do not read them as one:
+
+- **Refusal on a group- or world-writable policy directory or policy file** (naming the
+  path, the mode and `chmod go-w`). This defends against **other local users** — a shared
+  group, a service account, anyone under `o+w` — which is a real but *weaker* threat than
+  the sandboxed agent. It does nothing about the agent, which runs as the same uid and has
+  owner-write by construction. (A user-private group counts as group-writable: the daemon
+  cannot tell a private group from a shared one, so `chmod go-w` is the answer either way.)
+- **A loud `SECURITY:` warning when `policy_dir` or `audit_log` resolves inside the current
+  working directory** — the common case of "the tree the agent is working in", and what
+  makes the dev config unmistakable. It is a **heuristic proxy, wrong in both directions**:
+  it cannot read your profile, so it *misses* an absolute `policy_dir` that happens to sit
+  inside a granted tree (the `$TMPDIR` case above), and it *fires* on a plain development
+  run where no agent exists at all. The warning is not a substitute for the `jq` check.
+
+Neither check inspects the ancestors of the policy directory, so a group-writable *parent*
+(which would let another user swap the directory itself) is not detected. The audit log's
+mode is tightened to `0600` on open rather than being a refusal, because a log the daemon
+cannot own is still better recorded than not recorded.
+
 ## Security posture
 
 The webhook is **unauthenticated in both directions**. nono sends no credential, so
@@ -285,7 +388,10 @@ daemon does can answer `allow` to everything. Two consequences:
 
 Until then, treat the port as part of the trusted local surface, and remember that the
 audit log is the record of what was actually decided — `matched` names the policy, so a
-suspicious allow is traceable.
+suspicious allow is traceable. That role is why the log is kept `0600`, why the daemon
+notices a rotation instead of writing into a detached inode, and why its path belongs
+outside every write grant in your profile (see
+[Keep the policy directory out of the sandbox](#keep-the-policy-directory-out-of-the-sandbox)).
 
 ## Docs
 

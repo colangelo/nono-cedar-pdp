@@ -52,10 +52,28 @@ context: |
       malformed or non-UTF-8 escape — is denied before any policy is consulted.
     - The webhook is unauthenticated in both directions; loopback-only bind, with
       https-on-loopback as a follow-up.
+    - `nono profile show <profile> --format manifest` prints every RESOLVED
+      filesystem grant (so `filesystem.allow`/`write`/`allow_file`/`write_file`,
+      `workdir.access: "readwrite"`, `--allow-cwd` and group-supplied grants all
+      appear, expanded). It does NOT include per-command sandbox grants
+      (`command_policies.commands.*.from.*.sandbox.fs_write`/`fs_write_file`) —
+      verified against 0.69.0 by adding a marker path, which appeared in neither
+      `--json` nor `--format manifest`. Any "can the agent write here?" check must
+      read both. On macOS the default groups grant write to /tmp, /private/tmp,
+      $TMPDIR and /var/folders.
 
   Conventions:
   - Fail closed everywhere. Any parse failure, unsupported variant, evaluation error
     or missing policy resolves to deny. Never allow on an error path.
+  - The daemon's own state is part of its trust boundary: `policy_dir` (hot-reloaded)
+    and `audit_log` must sit outside every path a nono profile grants the sandbox
+    write access to. Shipped defaults are home-anchored, never CWD-relative;
+    `nono-cedar-pdp.dev.toml` is the repo-relative dev shortcut and makes `serve`
+    warn. Nothing in the daemon can enforce this — Seatbelt/Landlock are path-based
+    and do not change uid, so the agent runs as the SAME USER: the startup refusal on
+    a group/world-writable policy dir covers other local users only, and the
+    inside-the-cwd warning is a heuristic that both over- and under-fires. Never
+    describe either as a sandbox boundary.
   - Wire parsing lenient (no deny_unknown_fields); own config parsing strict
     (deny_unknown_fields). Drift is caught by the conformance test instead.
   - TDD: write the failing test first, watch it fail, then implement.

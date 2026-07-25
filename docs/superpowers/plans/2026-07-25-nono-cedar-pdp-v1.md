@@ -69,6 +69,19 @@ the upstream's normalisation (`/repos/../user/keys` and its encodings) before an
 is consulted. `policies/10-git.cedar`, `src/endpoint_path.rs` and the tests are the
 shipped truth.
 
+**Superseded a third time by the security audit (design spec D13/D16), for the daemon's
+own state.** Every `policy_dir = "./policies"` / `audit_log = "./decisions.jsonl"` and
+every `wc -l ./decisions.jsonl` below is the plan as written, not as shipped: those paths
+sit inside the tree the documented smoke profile grants the sandboxed agent, which was
+proven to let a process *inside* the sandbox rewrite the live policies and flip a denied
+`git push --force` to `allow`. The shipped config is home-anchored
+(`~/.config/nono-cedar-pdp/policies`, `~/.local/state/nono-cedar-pdp/decisions.jsonl`),
+the repo-relative shape moved to `nono-cedar-pdp.dev.toml` (which makes `serve` warn),
+`serve` refuses a group- or world-writable policy directory, `just smoke` builds its own
+state outside the repository, and the audit sink revalidates its inode before every
+record so a rotation cannot silently detach the trail. `nono-cedar-pdp.toml`, the
+`Justfile`, `src/isolation.rs` and `src/audit.rs` are the shipped truth.
+
 **Real endpoint-request JSON** (field set from `crates/nono/src/supervisor/types.rs`; the proxy hardcodes `session_id: "proxy"` and `child_pid: 0`):
 
 ```json
