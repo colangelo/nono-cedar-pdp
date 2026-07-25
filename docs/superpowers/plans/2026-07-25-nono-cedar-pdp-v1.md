@@ -27,12 +27,31 @@
 
 These were confirmed by compiling and running spikes against real dependencies on 2026-07-25. Do not re-litigate them; do not assume anything beyond them.
 
-**Real command-request JSON** (produced by upstream's own serializer):
+**Command-request JSON.** ⚠️ **CORRECTED 2026-07-25 (post-implementation audit).** The
+shape below round-trips upstream's serde, but its `args` value came from upstream's
+**unit-test fixture** (`crates/nono/src/supervisor/mod.rs:209-217`) and is NOT what nono
+sends at runtime:
 
 ```json
 {"capability_type":"command","request_id":"r1","command":"git","args":["git","push"],
  "caller":"session","intercept_rule":"push","reason":null,"child_pid":42,"session_id":"s1"}
 ```
+
+At runtime `args` is the shim process's raw argv, so **`args[0]` is an absolute per-run
+shim path**, never the command name:
+
+```json
+{"capability_type":"command","request_id":"tool-sandbox-approve-git-1784990893285791000",
+ "command":"git",
+ "args":["/private/tmp/nono-tool-sandbox-13819-1784990893285791000-a4d3bceb3ec061c0/shims/git","status"],
+ "caller":"session","intercept_rule":"status","reason":null,
+ "child_pid":13820,"session_id":"35abc0894927242e"}
+```
+
+`command` still carries the name. Anchored patterns (`argv like "git *"`,
+`args.contains("git")`) therefore never match in production — fail-safe in a `permit`,
+**fail-open in a `forbid`** — which is why the schema gained `argv_tail` (`args[1..]`
+joined). See the design spec §2 "Correction" and D12 for the upstream line references.
 
 **Real endpoint-request JSON** (field set from `crates/nono/src/supervisor/types.rs`; the proxy hardcodes `session_id: "proxy"` and `child_pid: 0`):
 
