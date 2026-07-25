@@ -1,4 +1,5 @@
 pub mod adapter;
+pub mod audit;
 pub mod cedar;
 pub mod config;
 pub mod decision;

@@ -90,5 +90,10 @@ fn run_check(
     let body = std::fs::read(fixture).map_err(|e| e.to_string())?;
     let query =
         nono_cedar_pdp::adapter::nono_webhook::parse(&body, &config).map_err(|e| e.to_string())?;
-    Ok(engine.evaluate(&query))
+    let decision = engine.evaluate(&query);
+    match nono_cedar_pdp::audit::AuditLog::open(&config.audit_log) {
+        Ok(log) => log.record(&query, &decision),
+        Err(e) => eprintln!("warning: audit log unavailable: {e}"),
+    }
+    Ok(decision)
 }

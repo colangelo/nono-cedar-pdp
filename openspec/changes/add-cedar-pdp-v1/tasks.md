@@ -52,10 +52,10 @@ Global gate for every group: `just lint && just test` must pass before the group
 
 ## 7. Decision audit log
 
-- [ ] 7.1 Write failing `src/audit.rs` tests: two decisions produce two parseable lines with the full field set and an RFC 3339 timestamp; the created file is mode `0600`; a missing parent directory is created. Verify: `cargo test --lib audit` → fails
-- [ ] 7.2 Implement `AuditLog::open` (creates parents, `0600`, append) and `AuditLog::record` (serialize failure and write failure are logged and swallowed, never altering a decision), plus `AuditRecord`. Verify: `cargo test --lib audit` → 2 passed
-- [ ] 7.3 Wire the audit log into `check`. Verify: run `check`, then `tail -1 ./decisions.jsonl` → a line containing `"decision":"allow"`
-- [ ] 7.4 Commit: `feat: JSONL decision audit log`
+- [x] 7.1 Write failing `src/audit.rs` tests: two decisions produce two parseable lines with the full field set and an RFC 3339 timestamp; the created file is mode `0600`; a missing parent directory is created. Verify: `cargo test --lib audit` → fails
+- [x] 7.2 Implement `AuditLog::open` (creates parents, `0600`, append) and `AuditLog::record` (serialize failure and write failure are logged and swallowed, never altering a decision), plus `AuditRecord`. Verify: `cargo test --lib audit` → 2 passed
+- [x] 7.3 Wire the audit log into `check`. Verify: run `check`, then `tail -1 ./decisions.jsonl` → a line containing `"decision":"allow"`
+- [x] 7.4 Commit: `feat: JSONL decision audit log`
 
 ## 8. HTTP decision endpoint
 
