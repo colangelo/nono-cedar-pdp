@@ -8,6 +8,19 @@
 //! access to the record of what was decided, which is the compensating control for
 //! an unauthenticated webhook.
 //!
+//! The refusal covers the **ancestor chain** too, because the mode of the policy
+//! directory itself never mattered if a parent is loose: whoever can write an
+//! ancestor renames the directory out from under the daemon and substitutes their
+//! own. The walk runs over the absolutized (symlink-resolved) path, parent up to
+//! root, existing components only, and refuses on a group- or world-writable
+//! ancestor **without the sticky bit**. Sticky exempts an *ancestor* — it blocks
+//! renaming or unlinking entries owned by someone else, which is precisely the
+//! ancestor attack, so `/tmp`-style `1777` chains stay usable — but it never
+//! exempts the policy directory itself, where the attack is *creating* a new
+//! `*.cedar` file and sticky does not restrict creation. Like every check in this
+//! module, the walk defends against other local users only; it says nothing about
+//! the sandboxed agent (point 1 below).
+//!
 //! **Both checks here are much weaker than they look, and being precise about that
 //! is the point of this module.**
 //!
@@ -48,6 +61,25 @@ pub enum IsolationError {
     Writable {
         what: &'static str,
         path: PathBuf,
+        mode: String,
+        who: String,
+    },
+    #[error(
+        "{what} {path} has a {who}-writable non-sticky ancestor {ancestor} (mode {mode}) — \
+         another local user could rename entries in that ancestor and substitute the whole \
+         tree below it, redirecting what this daemon reads and writes there no matter how \
+         tight the {what}'s own mode is, so it refuses to serve. Fix with `chmod go-w \
+         {ancestor}`, or set the sticky bit (`chmod +t {ancestor}`) if the directory is \
+         deliberately shared: sticky stops others renaming or unlinking entries they do not \
+         own, which is why /tmp-style 1777 directories are exempt here (and why sticky does \
+         not exempt the policy directory itself, where creating a new *.cedar file is the \
+         attack). This says nothing about a sandboxed agent, which runs as the same user as \
+         this daemon and is bounded only by its nono profile's write grants"
+    )]
+    WritableAncestor {
+        what: &'static str,
+        path: PathBuf,
+        ancestor: PathBuf,
         mode: String,
         who: String,
     },
@@ -104,6 +136,8 @@ pub fn check(
         // that decides who can change a policy is the target's.
         refuse_if_loosely_writable("policy file", &path)?;
     }
+    refuse_on_loose_ancestors("policy directory", &policy_dir)?;
+    refuse_on_loose_ancestors("audit log", &audit_log)?;
 
     let mut warnings = Vec::new();
     if let Some(base) = base {
@@ -132,6 +166,70 @@ fn refuse_if_loosely_writable(what: &'static str, path: &Path) -> Result<(), Iso
         });
     }
     Ok(())
+}
+
+/// Walk every existing ancestor of `path` — its parent up to the root — and refuse
+/// on one that is group- or world-writable without the sticky bit.
+///
+/// `path` is already absolutized, so the chain being walked is the real one, not a
+/// lexical guess through symlinks. An ancestor that does not exist yet (the audit
+/// log's directory before the first record) cannot have its entries renamed by
+/// anyone and is skipped; an ancestor that exists but cannot be inspected is a
+/// refusal — an unknown mode has to count as a loose one, or the walk is exactly as
+/// good as not having one.
+fn refuse_on_loose_ancestors(what: &'static str, path: &Path) -> Result<(), IsolationError> {
+    let mut current = path.parent();
+    while let Some(ancestor) = current {
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
+        match std::fs::metadata(ancestor) {
+            // Only a directory can host the rename. Mode bits on a file or device
+            // ancestor (`/dev/null/decisions.jsonl` is the config typo that hits
+            // this) grant no power over directory entries, and nothing below one
+            // can ever exist — the audit log's own open fails with an honest "not
+            // a directory" instead of a rename warning that cannot apply.
+            Ok(metadata) if metadata.is_dir() => {
+                let mode = metadata.permissions().mode() & 0o7777;
+                if let Some(who) = loose_ancestor_writers(mode) {
+                    return Err(IsolationError::WritableAncestor {
+                        what,
+                        path: path.to_path_buf(),
+                        ancestor: ancestor.to_path_buf(),
+                        mode: format!("{mode:04o}"),
+                        who: who.to_string(),
+                    });
+                }
+            }
+            Ok(_) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(IsolationError::Io {
+                    path: ancestor.to_path_buf(),
+                    source,
+                });
+            }
+        }
+        current = ancestor.parent();
+    }
+    Ok(())
+}
+
+/// Like [`loose_writers`], but for an *ancestor*, where the sticky bit IS a
+/// mitigation. Two different attacks, two different truth tables: on the policy
+/// directory itself the attack is *creating* a new `*.cedar` file — a new file is a
+/// new policy, and sticky does not restrict creation. On an ancestor the attack is
+/// *renaming* our component out from under the daemon and substituting another
+/// tree, which is exactly what sticky blocks (only the entry's owner, or the
+/// directory's, may rename or unlink it). Creating a sibling does not help the
+/// attacker here: our component's name is already taken. Without this exemption
+/// every path below `/tmp` (mode `1777`) would refuse, a false positive that
+/// breeds override flags.
+fn loose_ancestor_writers(mode: u32) -> Option<&'static str> {
+    if mode & 0o1000 != 0 {
+        return None;
+    }
+    loose_writers(mode)
 }
 
 /// Who besides the owner may write, if anyone. The sticky bit is deliberately not
@@ -346,6 +444,143 @@ mod tests {
         let err = check(&missing, &root.path().join("decisions.jsonl"), None).unwrap_err();
         assert!(matches!(err, IsolationError::Io { .. }), "{err}");
         assert!(err.to_string().contains("nowhere"), "{err}");
+    }
+
+    /// The mode of the policy directory itself never mattered if an ancestor is
+    /// loose: another local user who can write the *parent* renames the directory
+    /// out from under the daemon and substitutes their own. The refusal must name
+    /// the ancestor — the operator would otherwise stare at a `0700` policy dir
+    /// wondering what to fix.
+    #[test]
+    fn a_loose_non_sticky_ancestor_of_the_policy_dir_refuses_to_serve() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("shared");
+        std::fs::create_dir(&parent).unwrap();
+        let dir = policy_dir(&parent);
+        chmod(&parent, 0o770);
+
+        let err = check(&dir, &root.path().join("decisions.jsonl"), None).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            matches!(err, IsolationError::WritableAncestor { .. }),
+            "want an ancestor refusal, got {text}"
+        );
+        assert!(
+            text.contains(&parent.display().to_string()),
+            "the ancestor must be named, not the policy dir: {text}"
+        );
+        assert!(text.contains("0770"), "the mode must be named: {text}");
+        assert!(text.contains("group"), "{text}");
+        assert!(
+            text.contains("sticky"),
+            "the operator needs the sticky rationale to understand why /tmp is fine \
+             and this is not: {text}"
+        );
+        assert!(
+            text.contains("chmod go-w"),
+            "the operator needs the remedy: {text}"
+        );
+        assert!(
+            text.contains("same user"),
+            "the refusal must not overstate itself — it defends against other local \
+             users, not the sandboxed agent: {text}"
+        );
+    }
+
+    /// The sticky bit blocks exactly the ancestor attack — renaming or unlinking an
+    /// entry owned by someone else — so a `/tmp`-style `1777` ancestor is not a
+    /// refusal. (It stays a refusal on the policy directory itself, where the attack
+    /// is *creating* a new `*.cedar` file and sticky does not restrict creation.)
+    /// Every test in this suite already runs under `/private/var/folders/...`, so a
+    /// false positive here would also brick the fixtures.
+    #[test]
+    fn a_sticky_world_writable_ancestor_is_not_a_refusal() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = root.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        let dir = policy_dir(&shared);
+        chmod(&shared, 0o1777);
+
+        let warnings = check(&dir, &root.path().join("decisions.jsonl"), None)
+            .unwrap_or_else(|e| panic!("a sticky ancestor must not refuse: {e}"));
+        assert!(warnings.is_empty(), "{warnings:#?}");
+    }
+
+    /// The audit log's chain matters for the same reason the policy dir's does: a
+    /// substituted audit directory silently redirects the record of what was
+    /// decided, which is the compensating control for an unauthenticated webhook.
+    #[test]
+    fn a_loose_non_sticky_ancestor_of_the_audit_log_refuses_to_serve() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = policy_dir(root.path());
+        let logs = root.path().join("logs");
+        std::fs::create_dir(&logs).unwrap();
+        chmod(&logs, 0o707);
+
+        let err = check(&dir, &logs.join("decisions.jsonl"), None).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            matches!(err, IsolationError::WritableAncestor { .. }),
+            "want an ancestor refusal, got {text}"
+        );
+        assert!(
+            text.contains("audit log"),
+            "the message must say which state path is at stake: {text}"
+        );
+        assert!(
+            text.contains(&logs.display().to_string()),
+            "the ancestor must be named: {text}"
+        );
+        assert!(text.contains("0707"), "{text}");
+        assert!(text.contains("world"), "{text}");
+    }
+
+    /// A non-directory ancestor is not the walk's business: mode bits on a file or
+    /// device grant no power over directory entries, so there is no rename attack
+    /// through it — and nothing below it can ever exist, so the path fails later at
+    /// the audit log's own open with an honest "not a directory". The daemon still
+    /// refuses to serve either way; what this pins is *which* error the operator
+    /// reads (the real fixture is `/dev/null/decisions.jsonl`, whose `0666` is a
+    /// device's, not a loose directory's).
+    #[test]
+    fn a_world_writable_non_directory_ancestor_is_not_the_walks_refusal() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = policy_dir(root.path());
+        let blocker = root.path().join("blocker.txt");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        chmod(&blocker, 0o666);
+
+        let warnings = check(&dir, &blocker.join("decisions.jsonl"), None)
+            .unwrap_or_else(|e| panic!("a file ancestor is the open's error, not the walk's: {e}"));
+        assert!(warnings.is_empty(), "{warnings:#?}");
+    }
+
+    /// Fail closed on the walk too: an ancestor that cannot be stat'ed is an
+    /// ancestor whose writers are unknown, and skipping it would make the walk
+    /// exactly as good as not having one. A directory without search permission in
+    /// the chain makes everything below it un-stat-able.
+    #[test]
+    fn an_ancestor_that_cannot_be_stated_refuses_to_serve() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = policy_dir(root.path());
+        let locked = root.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        // Readable but not searchable: stat of anything below fails with EACCES,
+        // which is not "does not exist" and must not be treated as it.
+        chmod(&locked, 0o600);
+
+        let err = check(&dir, &locked.join("sub/decisions.jsonl"), None).unwrap_err();
+        // Restore search permission first so the tempdir can clean up after itself.
+        chmod(&locked, 0o700);
+        let text = err.to_string();
+        assert!(
+            matches!(err, IsolationError::Io { .. }),
+            "an uninspectable ancestor must fail closed, got {text}"
+        );
+        assert!(
+            text.contains("locked/sub"),
+            "the uninspectable ancestor must be named: {text}"
+        );
     }
 
     #[test]

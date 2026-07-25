@@ -7,12 +7,12 @@ and filtered (`cargo test --lib isolation`, `cargo test --lib watcher`) — see
 
 ## 1. Ancestor walk in `isolation::check` (startup)
 
-- [ ] 1.1 Failing test: a policy directory that is owner-only but whose parent is group-writable non-sticky refuses with `IsolationError::Writable`-class error naming the *ancestor* path and its mode
-- [ ] 1.2 Failing test: a world-writable **sticky** ancestor (mode `1777`) is not a refusal (the tempdir fixture chain itself must keep passing — every existing test runs under `/private/var/folders/...`)
-- [ ] 1.3 Failing test: a loosely-writable non-sticky ancestor of the **audit log** refuses, naming the ancestor
-- [ ] 1.4 Failing test: an ancestor that cannot be stat'ed refuses (fail closed, `Io`-class), not skipped
-- [ ] 1.5 Implement the ancestor walk over the absolutized paths (parent → root, existing components only); new error variant or extended `Writable` message must carry path, mode, who, and the sticky rationale; wire it into `check` for both `policy_dir` and `audit_log`
-- [ ] 1.6 Module docs: document the ancestor rule, the sticky-exempts-ancestors-only nuance (D1), and re-state scope honesty (defends against other local users, not the agent)
+- [x] 1.1 Failing test: a policy directory that is owner-only but whose parent is group-writable non-sticky refuses with `IsolationError::Writable`-class error naming the *ancestor* path and its mode
+- [x] 1.2 Failing test: a world-writable **sticky** ancestor (mode `1777`) is not a refusal (the tempdir fixture chain itself must keep passing — every existing test runs under `/private/var/folders/...`)
+- [x] 1.3 Failing test: a loosely-writable non-sticky ancestor of the **audit log** refuses, naming the ancestor
+- [x] 1.4 Failing test: an ancestor that cannot be stat'ed refuses (fail closed, `Io`-class), not skipped
+- [x] 1.5 Implement the ancestor walk over the absolutized paths (parent → root, existing components only); new error variant or extended `Writable` message must carry path, mode, who, and the sticky rationale; wire it into `check` for both `policy_dir` and `audit_log` (plus one settled nuance found by the existing suite: a **non-directory** ancestor — `/dev/null/decisions.jsonl` — is skipped by the walk, because mode bits on a file or device grant no rename power and the audit log's own open fails with the honest ENOTDIR; pinned by its own test)
+- [x] 1.6 Module docs: document the ancestor rule, the sticky-exempts-ancestors-only nuance (D1), and re-state scope honesty (defends against other local users, not the agent)
 
 ## 2. Refusal core shared with the reload path
 
