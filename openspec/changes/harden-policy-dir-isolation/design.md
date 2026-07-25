@@ -50,9 +50,13 @@ false positive the epic explicitly warns breeds override flags.
 
 Alternative considered: refusing on sticky world-writable ancestors too. Rejected:
 it makes `/tmp`-anchored dev setups impossible while adding no protection against
-the rename attack sticky already blocks. (A *sibling-creation* attack — pre-creating
-a colliding name in a sticky dir — requires the name to be free, which it is not:
-our component exists.)
+the rename attack sticky already blocks. Corrected by the re-verify (2026-07-26):
+sticky does **not** block *pre-creation* — an attacker can create-and-own a
+then-missing component (the policy directory itself under `/tmp`, or the audit log
+file before its first record) and every mode test passes while the owner keeps full
+power over it. That half is closed by the ownership refusal (D6), not by sticky;
+the sticky exemption stands only for the rename attack against components that
+already exist and are ours.
 
 ### D2 — Walk the existing ancestors of the absolutized path, stop at root
 
@@ -93,13 +97,60 @@ repeating them every debounce is noise that trains operators to filter ERROR-adj
 output). Same errors, same `IsolationError` variants, one implementation — the
 startup path and the reload path cannot drift apart.
 
+### D6 — Ownership refusal: components owned by neither euid nor root refuse (added by the security re-audit, 2026-07-26)
+
+Mode bits answer "who may write through the permission system"; ownership answers
+"who may change the answer". An attacker-owned component passes every mode test
+while its owner can `chmod`, rename or rewrite it at will — the concrete case the
+audit demonstrated is a policy directory another user pre-created under a
+`/tmp`-style sticky ancestor. So the refusal core also requires every checked
+component — policy dir, loadable policy files, existing ancestors of both state
+paths, and the audit log file when it exists — to be owned by the daemon's
+effective uid or by root. Root is allowed deliberately: a root-installed,
+root-owned policy pack the daemon cannot write is *stronger* than a user-owned
+one, and system ancestors (`/`, `/Users`) are root-owned everywhere. Precedent:
+OpenSSH `StrictModes` applies exactly this owner-or-root rule to `~/.ssh`.
+(`geteuid` comes from `libc`, already in the dependency tree; the call is a single
+`unsafe` block with a SAFETY comment — it cannot fail and touches no memory.)
+
+This also closes the planted-*file* half of the transient-loosening attack: a file
+another user created during a loose window stays owned by them, so it is refused
+even after the operator repairs the directory mode. What ownership cannot close is
+*content modified in place* in a file we own while the file itself was loose — mode
+re-checks cannot see history, so the refusal's remedy text tells the operator to
+review contents before tightening (spec scenario), and content provenance beyond
+that is epic #1's policy-signing child, deliberately out of scope here.
+
+### D7 — Resolve the configured paths once, before the checks (added with D6)
+
+The verify gate proved the gap live: the walk checked the canonicalized chain while
+the loader traversed the configured lexical chain, so a loosely-writable directory
+that merely *held a symlink* on the configured path was never inspected — and its
+writer could repoint the symlink under a running daemon. Fix: `run_serve`
+canonicalizes `policy_dir` (it must exist to serve) and resolves the existing
+prefix of `audit_log` once, before the checks; the engine, the watcher and the
+audit log are all constructed with the resolved paths, so the checked chain and the
+used chain are the same object and a post-startup repoint changes nothing the
+daemon will ever read. A symlink already pointing into an attacker-owned tree at
+startup is caught by D6 on the resolved components. Alternative considered —
+walking the lexical chain as well — rejected: it duplicates the check surface
+forever, while resolve-once removes the divergence that made the lexical chain
+matter at all.
+
 ## Risks / Trade-offs
 
 - **[TOCTOU]** The re-check happens before `load_dir` re-reads the files; a
   loosening between check and read is not caught until the next event. → Accepted:
-  the window shrinks from "forever after startup" to "one debounce"; mode bits were
-  never a boundary against the agent, and the other-local-user attacker cannot time
-  a race they do not control. Documented in the module docs.
+  the *detection* window shrinks from "forever after startup" to "one debounce";
+  mode bits were never a boundary against the agent, and the other-local-user
+  attacker cannot time a race they do not control. Documented in the module docs.
+- **[Transient loosening leaves history mode checks cannot see]** A mode re-check
+  proves nothing about what happened while the path *was* loose: a file another
+  user planted then is caught by the ownership refusal (D6) forever after, but a
+  file we own whose *content* was modified in place during the window is adopted
+  once the mode is repaired. → The refusal's remedy text tells the operator to
+  review contents before tightening; content provenance (signing) is epic #1's
+  child and deliberately not claimed here.
 - **[No event on ancestor chmod]** `notify` watches the policy dir, so an ancestor
   going loose does not itself trigger the re-check; it is caught at the next policy
   event. → Accepted and documented: watching every ancestor is platform-fragile

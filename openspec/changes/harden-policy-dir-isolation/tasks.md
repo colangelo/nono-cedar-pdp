@@ -31,3 +31,15 @@ and filtered (`cargo test --lib isolation`, `cargo test --lib watcher`) — see
 - [x] 4.1 `just test` (full) and filtered `cargo test isolation`/`cargo test watcher` both green; `just lint` clean
 - [x] 4.2 `just smoke` against real nono still passes with the hardened checks in place (home-anchored default paths must not trip the ancestor walk on a real macOS home)
 - [x] 4.3 `openspec validate --changes harden-policy-dir-isolation` passes
+
+## 5. Remediation from the security re-audit (2026-07-26, design D6/D7)
+
+- [ ] 5.1 Failing test: a policy directory (or loadable policy file, or existing ancestor of either state path, or existing audit-log file) owned by a uid that is neither the daemon's euid nor root refuses to serve, naming the path and owning uid (test with a fake-uid seam or by asserting the check function's logic against injected metadata — chown needs privileges the suite does not have; design D6 allows a seam in the same style the walk already uses for stat errors)
+- [ ] 5.2 Implement the owner-or-root refusal in the shared refusal core (startup + reload paths both inherit it); `geteuid` via `libc` behind one commented `unsafe` block; error text explains why ownership matters when modes look tight
+- [ ] 5.3 Failing test: `run_serve` resolves `policy_dir` through a symlink before the checks and hands the resolved path to engine/watcher/audit — assert via the serve wiring (e.g. healthz or `Engine::policy_dir()`) that the active path is the resolved one (D7)
+- [ ] 5.4 Implement resolve-once-at-startup in `run_serve` for `policy_dir` and the existing prefix of `audit_log`; module docs state that the checked chain and the used chain are the same object and that a post-startup repoint changes nothing
+- [ ] 5.5 Extend the writability refusal's remedy text: tightening the mode does not undo content added or modified while loose — review before `chmod go-w`; assert the message text
+- [ ] 5.6 Watcher-level tests for the two remaining WHEN disjuncts of the reload re-check scenario: a loadable policy file going loose mid-session, and an existing ancestor going loose mid-session — both keep last-good and log ERROR
+- [ ] 5.7 Pin the README documentation clauses in `tests/docs.rs`: the profile-checking procedure (`nono profile show --format manifest` + `fs_write` sweep), the sticky-ancestor rationale, and the ownership rule — silent doc regression must fail a test
+- [ ] 5.8 Update README + module docs for D6/D7 with the same scope honesty (other local users, never the sandboxed agent); design doc D13 trail pointer updated
+- [ ] 5.9 Full + filtered tests green, `just lint` clean, `just smoke` still green (real home chain must satisfy the ownership rule)

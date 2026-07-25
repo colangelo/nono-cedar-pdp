@@ -48,9 +48,12 @@ as sent. Unambiguous paths SHALL continue to be evaluated with the raw path valu
 
 The guard SHALL NOT be bypassable through the library's public surface: the pieces
 that build an authorization request from a policy query and the pieces that convert a
-raw authorizer response into a decision SHALL NOT be publicly exported, so the only
-externally reachable route from a policy query to a decision runs the ambiguity check
-first. This is the same closed-seam property the engine's constructors already have.
+raw authorizer response into a decision SHALL NOT be publicly exported, so this
+library offers no route from a policy query to a decision that skips the ambiguity
+check. (A caller re-implementing entity construction against the `cedar-policy` crate
+directly is outside this guarantee — they are not on this library's decision path,
+and no visibility rule can bind code that does not call it.) This is the same
+closed-seam property the engine's constructors already have.
 
 The examined part of the target SHALL be everything before the first raw `?`, and no
 other truncation SHALL be applied. RFC 3986 §5.2.4 defines `remove_dot_segments` over the

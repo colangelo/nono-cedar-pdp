@@ -15,12 +15,35 @@ lets another local user rename the directory out from under the daemon and subst
 their own, so the mode of the directory itself never mattered. The sticky bit exempts
 an *ancestor* — it prevents renaming or unlinking entries owned by someone else, which
 is the ancestor attack — but SHALL NOT exempt the policy directory itself, where the
-attack is creating a new `*.cedar` file and sticky does not prevent creation. It SHALL
-also fail closed when the policy directory, a policy file, or an ancestor cannot be
-inspected at all. Separately it SHALL warn — loudly, naming the risk — when the policy
-directory or the audit log resolves inside the current working directory, so that the
-repo-relative development configuration keeps working while being impossible to mistake
-for a deployment.
+attack is creating a new `*.cedar` file and sticky does not prevent creation.
+
+Mode bits alone are not the whole check, because an owner may change them at will:
+`serve` SHALL also refuse to start when the policy directory, a loadable policy file,
+an existing ancestor of either state path, or the audit log file itself (when it
+exists) is **owned by neither the daemon's effective user nor root**, naming the path
+and the owning uid. A component another local user owns passes every mode test while
+that user retains the power to loosen, rename or rewrite it — the sticky bit stops
+renames of entries you do not own, but it does not stop an attacker *pre-creating* a
+component and owning it, and ownership is the check that closes that half.
+
+The refusal checks and the policy loader SHALL operate on the **same resolved path**:
+`serve` resolves the configured `policy_dir` (and the existing prefix of `audit_log`)
+once at startup, before the checks, and every later load, watch and reload re-check
+uses the resolved path — so a symlink on the configured path cannot be repointed after
+startup to redirect a load to a tree the checks never saw, and a symlink already
+pointing at an attacker-owned tree is caught by the ownership refusal on the resolved
+components.
+
+A writability refusal's remedy text SHALL NOT overpromise: alongside `chmod go-w` it
+SHALL tell the operator that content added or modified while the path was writable by
+others is not undone by tightening the mode, so the directory's contents need review
+before the remedy is applied.
+
+It SHALL also fail closed when the policy directory, a policy file, or an ancestor
+cannot be inspected at all. Separately it SHALL warn — loudly, naming the risk — when
+the policy directory or the audit log resolves inside the current working directory, so
+that the repo-relative development configuration keeps working while being impossible
+to mistake for a deployment.
 
 Both checks SHALL be documented for what they actually buy, wherever they are
 described:
@@ -63,6 +86,21 @@ described:
 - **WHEN** `serve` resolves an audit log whose existing ancestor chain contains a directory writable by group or other without the sticky bit
 - **THEN** it exits non-zero without binding a port, and the message names the ancestor path and its mode — a substituted audit directory silently redirects the record of what was decided
 
+#### Scenario: A state-path component owned by another user refuses to start
+
+- **WHEN** the policy directory, a loadable policy file, an existing ancestor of either state path, or an existing audit log file is owned by a uid that is neither the daemon's effective user nor root — for example a policy directory another local user pre-created under a sticky world-writable ancestor, with modes that look tight
+- **THEN** `serve` exits non-zero without binding a port, and the message names the path and the owning uid, because an owner can loosen, rename or rewrite the component regardless of its current mode
+
+#### Scenario: A symlinked policy path is resolved once, before the checks
+
+- **WHEN** `policy_dir` is configured through a symlink
+- **THEN** the daemon resolves the path before the startup checks and uses the resolved path for loading, watching and every reload re-check, so repointing the symlink after startup does not redirect any later load to a tree the checks never inspected
+
+#### Scenario: The writability remedy warns about content changed while loose
+
+- **WHEN** a writability refusal is reported for the policy directory or a policy file
+- **THEN** the message tells the operator that tightening the mode does not undo content added or modified while the path was writable, so the contents need review before `chmod go-w` is applied
+
 #### Scenario: A loose file the loader ignores is not a refusal
 
 - **WHEN** the policy directory contains a group-writable `.cedar` name the loader skips, such as an editor lock file
@@ -77,9 +115,9 @@ described:
 
 ### Requirement: Re-check the state paths before adopting a reloaded policy set
 
-The hot-reload path SHALL re-run the writability checks — the policy directory, every
-policy file the loader would load, and the existing ancestor chain — before a freshly
-loaded policy set replaces the active one. When the re-check refuses, the daemon SHALL
+The hot-reload path SHALL re-run the writability and ownership checks — the policy
+directory, every policy file the loader would load, and the existing ancestor chain —
+before a freshly loaded policy set replaces the active one. When the re-check refuses, the daemon SHALL
 retain the last-known-good policy set, SHALL NOT adopt any file content read from the
 offending directory, and SHALL log the refusal at ERROR naming the path and mode — the
 same containment posture as a broken policy edit, because the in-memory set predates

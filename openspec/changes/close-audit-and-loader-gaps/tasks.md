@@ -31,3 +31,13 @@ filtered test runs must both pass.
 - [x] 5.1 `just test` full and filtered (`cargo test --lib audit`, `cargo test --lib engine`, `cargo test --test server`, `cargo test --test policies`) green; `just lint` clean
 - [x] 5.2 `just smoke` still green (audit-line shape change must not break the smoke recipe's assertions)
 - [x] 5.3 `openspec validate --changes close-audit-and-loader-gaps` passes
+
+## 6. Remediation from the security re-audit (2026-07-26)
+
+- [ ] 6.1 Failing test: an `intercept_rule` (and a `rule_label`) carrying DEL/C1 control bytes (e.g. U+009B CSI) reaches the audit line escaped, never raw — assert on the raw file bytes, since serde escapes C0 but not DEL/C1
+- [ ] 6.2 Implement: `control_escape` for `intercept_rule` and `rule_label` at the audit recording boundary (both `record` paths); comment states why serde's own escaping is not enough
+- [ ] 6.3 Failing test: an endpoint request whose wire `child_pid` is non-zero has that value on its audit line (fidelity: record the claim, do not rewrite it to 0)
+- [ ] 6.4 Implement: thread `child_pid` through `query::Target::Endpoint` from the wire; fix the `AuditRecord` field doc ("as sent" becomes true); Cedar entities unchanged (the schema has no endpoint child_pid attribute)
+- [ ] 6.5 Corpus verbatim additions from the spec-coverage audit: `/search?q=..%2F..%2Fetc` in the non-ambiguous set and `/repos/..%5C../user/keys` in the denied set; assert the `.#10-git.cedar` emacs lock file's WARN line is present in the skip-log test
+- [ ] 6.6 Temper the tripwire/test wording to the narrowed spec claim (no route *this library offers* skips the guard) so the assertion message does not overclaim what visibility caps buy
+- [ ] 6.7 Full + filtered tests green, `just lint` clean; `openspec validate --changes close-audit-and-loader-gaps` passes

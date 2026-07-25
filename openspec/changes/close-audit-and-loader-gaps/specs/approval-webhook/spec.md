@@ -21,4 +21,4 @@ The command-request corpus SHALL model every `intercept_rule` shape the upstream
 #### Scenario: The fixture corpus models the real intercept_rule shapes
 
 - **WHEN** the command-request test corpus is enumerated
-- **THEN** it contains payloads whose `intercept_rule` is a single token, a space-joined multi-token rule, the `<catch-all>` label, and an `invocation_policy.*` label — each driven through parse, evaluation and audit with the value surviving to the audit line byte-identically
+- **THEN** it contains payloads whose `intercept_rule` is a single token, a space-joined multi-token rule, the `<catch-all>` label, and an `invocation_policy.*` label — each driven through parse, evaluation and audit with the value surviving to the audit line byte-identically (none of the real shapes contains a control character; hostile control bytes are escaped at the audit boundary like every other request-derived field)

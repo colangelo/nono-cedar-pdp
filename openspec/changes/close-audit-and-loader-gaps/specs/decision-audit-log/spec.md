@@ -4,7 +4,7 @@
 
 ### Requirement: Audit lines are self-sufficient for review
 
-Each audit line SHALL carry an RFC 3339 UTC timestamp, the nono `request_id` and `session_id`, the approval backend name, the resolved agent, the Cedar principal, the action, a resource summary, the child pid, the intercept rule (for command requests) or route rule label (for endpoint requests), the decision, the matched policy identifiers, the decision reason, and the evaluation time. This is sufficient to answer "what was asked, who asked, **what routed the request here**, what was decided, and which rule decided it" without consulting any other source. The key set SHALL be identical on every line: a value the request did not carry is an explicit `null`, so a consumer can tell "not known" from "not recorded" — command lines carry a null `rule_label`, endpoint lines a null `intercept_rule`, and rejected-request lines null for all three of `child_pid`, `intercept_rule` and `rule_label`.
+Each audit line SHALL carry an RFC 3339 UTC timestamp, the nono `request_id` and `session_id`, the approval backend name, the resolved agent, the Cedar principal, the action, a resource summary, the child pid, the intercept rule (for command requests) or route rule label (for endpoint requests), the decision, the matched policy identifiers, the decision reason, and the evaluation time. This is sufficient to answer "what was asked, who asked, **what routed the request here**, what was decided, and which rule decided it" without consulting any other source. The key set SHALL be identical on every line: a value the request did not carry is an explicit `null`, so a consumer can tell "not known" from "not recorded" — command lines carry a null `rule_label`, endpoint lines a null `intercept_rule`, and rejected-request lines null for all three of `child_pid`, `intercept_rule` and `rule_label`. `child_pid` SHALL record the value the wire carried for both request variants (real nono sends `0` for endpoint requests; a sender claiming otherwise leaves its claim on the record rather than having it silently rewritten). Request-derived text recorded in audit values — the intercept rule and rule label included — SHALL have control characters escaped at the recording boundary, the same rule the resource summary already follows: JSON string encoding escapes only C0 controls, so DEL and C1 controls (CSI among them) would otherwise reach an operator's terminal raw when the trail is read.
 
 #### Scenario: Audit line fields for a decided command request
 
@@ -20,3 +20,8 @@ Each audit line SHALL carry an RFC 3339 UTC timestamp, the nono `request_id` and
 
 - **WHEN** a malformed or unsupported request is denied without ever becoming a policy query
 - **THEN** the line still contains the `child_pid`, `intercept_rule` and `rule_label` keys, each explicitly `null`
+
+#### Scenario: Control bytes in the routing fields cannot reach a terminal raw
+
+- **WHEN** a request's `intercept_rule` or `rule_label` carries control characters that JSON string encoding does not escape (DEL, or a C1 control such as CSI)
+- **THEN** the recorded value has them escaped, so reading the trail in a terminal cannot execute them

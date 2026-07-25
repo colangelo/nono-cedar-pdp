@@ -24,8 +24,21 @@ A unified `rule` would erase which upstream concept supplied the value —
 `intercept_rule` and `rule_label` are different upstream fields with different
 grammars, and the audit line's job is fidelity. The record's existing invariant
 ("the key set never changes; absent is explicit null") extends to the new keys,
-including on `record_rejected` lines. `child_pid` records what was sent (0 for
-endpoint requests, as upstream hardcodes), not a synthesized absence.
+including on `record_rejected` lines.
+
+Two corrections from the security re-audit (2026-07-26):
+
+- `child_pid` is **echoed from the wire for both variants** — `Target::Endpoint`
+  gains the field so the audit line records what was actually sent (real nono
+  sends 0; a sender claiming otherwise leaves its claim on the record). The first
+  implementation pinned `Some(0)` for endpoints, which rewrote rather than
+  recorded.
+- `intercept_rule` and `rule_label` are **control-escaped at the recording
+  boundary** (`sanitize::control_escape`, same as the resource summary). JSON
+  string encoding escapes only C0, so DEL and C1 controls (CSI included) in these
+  request-derived values would otherwise land raw in the trail an operator reads
+  in a terminal. The real shapes contain no control bytes, so the byte-identical
+  corpus assertion is unaffected.
 
 ### D2 — Fixture corpus pinned to upstream's rule-label grammar (#24)
 
