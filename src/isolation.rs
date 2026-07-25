@@ -96,8 +96,10 @@ pub enum IsolationError {
         "{what} {path} is {who}-writable (mode {mode}) — another local user could add or \
          rewrite a policy and decide this daemon's approvals, so it refuses to serve. Fix with \
          `chmod go-w {path}` (a user-private group counts: this process cannot tell one from a \
-         shared group). This says nothing about a sandboxed agent, which runs as the same user \
-         as this daemon and is bounded only by its nono profile's write grants"
+         shared group) — but review the contents first: tightening the mode does not undo \
+         content added or modified while the path was writable by others. This says nothing \
+         about a sandboxed agent, which runs as the same user as this daemon and is bounded \
+         only by its nono profile's write grants"
     )]
     Writable {
         what: &'static str,
@@ -618,6 +620,31 @@ mod tests {
         assert!(
             text.contains("chmod go-w"),
             "the operator needs the remedy: {text}"
+        );
+    }
+
+    /// Tightening a mode is not a time machine: content added or modified while
+    /// the path was loose survives `chmod go-w`, so the remedy must send the
+    /// operator to review before they trust the tightened directory. (The
+    /// planted-*file* half is closed by ownership — a file someone else created
+    /// stays theirs — but content changed in place in a file we own is history
+    /// no re-check can see; design D6's named limit.)
+    #[test]
+    fn the_writability_remedy_warns_that_chmod_does_not_undo_content_changed_while_loose() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = policy_dir(root.path());
+        chmod(&dir, 0o770);
+
+        let err = check(&dir, &root.path().join("decisions.jsonl"), None).unwrap_err();
+        let text = err.to_string();
+        assert!(matches!(err, IsolationError::Writable { .. }), "{text}");
+        assert!(
+            text.contains("review"),
+            "the remedy must send the operator to review the contents: {text}"
+        );
+        assert!(
+            text.contains("does not undo"),
+            "the remedy must say what chmod cannot fix: {text}"
         );
     }
 
