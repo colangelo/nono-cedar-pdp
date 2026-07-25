@@ -111,6 +111,36 @@ pub fn check(
     let policy_dir = absolutize(policy_dir, base.as_deref());
     let audit_log = absolutize(audit_log, base.as_deref());
 
+    refuse_untrusted_policy_dir(&policy_dir)?;
+    refuse_on_loose_ancestors("audit log", &audit_log)?;
+
+    let mut warnings = Vec::new();
+    if let Some(base) = base {
+        if policy_dir.starts_with(&base) {
+            warnings.push(policy_dir_inside_cwd(&policy_dir, &base));
+        }
+        if audit_log.starts_with(&base) {
+            warnings.push(audit_log_inside_cwd(&audit_log, &base));
+        }
+    }
+    Ok(warnings)
+}
+
+/// The refusal core for the policy directory: the directory itself, every policy
+/// file the loader would load, and the existing ancestor chain.
+///
+/// One implementation, two callers (D5): [`check`] at startup, and the watcher
+/// before every reload — so the startup path and the reload path cannot drift
+/// apart. No cwd warnings here: those are advisory posture messages, and repeating
+/// them on every debounce would train operators to filter ERROR-adjacent output.
+/// Like everything in this module, an `Err` defends against other local users; it
+/// says nothing about the sandboxed agent, which runs as the same user as this
+/// daemon.
+pub(crate) fn refuse_untrusted_policy_dir(policy_dir: &Path) -> Result<(), IsolationError> {
+    // Absolutize so the ancestor walk runs over the real, symlink-resolved chain.
+    // Idempotent for the already-absolutized path `check` passes; the watcher
+    // hands over the configured (possibly repo-relative) path as-is.
+    let policy_dir = absolutize(policy_dir, None);
     refuse_if_loosely_writable("policy directory", &policy_dir)?;
     // Every file the loader would actually load. A `.cedar` name it skips — an
     // editor's lock file or backup — decides nothing, and refusing over one would
@@ -136,19 +166,7 @@ pub fn check(
         // that decides who can change a policy is the target's.
         refuse_if_loosely_writable("policy file", &path)?;
     }
-    refuse_on_loose_ancestors("policy directory", &policy_dir)?;
-    refuse_on_loose_ancestors("audit log", &audit_log)?;
-
-    let mut warnings = Vec::new();
-    if let Some(base) = base {
-        if policy_dir.starts_with(&base) {
-            warnings.push(policy_dir_inside_cwd(&policy_dir, &base));
-        }
-        if audit_log.starts_with(&base) {
-            warnings.push(audit_log_inside_cwd(&audit_log, &base));
-        }
-    }
-    Ok(warnings)
+    refuse_on_loose_ancestors("policy directory", &policy_dir)
 }
 
 fn refuse_if_loosely_writable(what: &'static str, path: &Path) -> Result<(), IsolationError> {
