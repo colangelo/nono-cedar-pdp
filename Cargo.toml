@@ -1,0 +1,41 @@
+[package]
+name = "nono-cedar-pdp"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "Apache-2.0"
+description = "Cedar policy decision point for nono's webhook approval backend"
+
+[lib]
+name = "nono_cedar_pdp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nono-cedar-pdp"
+path = "src/main.rs"
+
+[dependencies]
+cedar-policy = "4.11"
+axum = "0.8"
+tower-http = { version = "0.7", features = ["catch-panic"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+arc-swap = "1.9"
+notify = "8.2"
+clap = { version = "4.6", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+time = { version = "0.3", features = ["formatting"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+nono = { version = "0.69.0", default-features = false }
+tower = { version = "0.5", features = ["util"] }
+tempfile = "3"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
