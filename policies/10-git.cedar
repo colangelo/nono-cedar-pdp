@@ -87,6 +87,13 @@ forbid (
 // working tree is the real exposure there and nono's sandbox, not this PDP, is what
 // bounds it. `ext::` remote helpers (`git clone 'ext::sh -c evil'`) execute too;
 // they need `clone`/`fetch`/`push`, which the anchored permit above never approves.
+//
+// What "read-only" still does NOT mean, honestly: a permitted subcommand can write a
+// file (`git diff --output=<path>`) and can run whatever the *repository's own* config
+// names (`core.pager`, `diff.external`, an `alias`), because that config needs no
+// command-line flag. Both are bounded by nono's fs grants and kernel sandbox, not by
+// this policy — the PDP decides which command line runs, not what a permitted command
+// may touch. Tighten the sandbox grants in the nono profile for that half.
 @id("no-code-executing-git-flags")
 forbid (
   principal,
