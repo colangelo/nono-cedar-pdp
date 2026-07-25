@@ -40,4 +40,4 @@ filtered test runs must both pass.
 - [x] 6.4 Implement: thread `child_pid` through `query::Target::Endpoint` from the wire; fix the `AuditRecord` field doc ("as sent" becomes true); Cedar entities unchanged (the schema has no endpoint child_pid attribute)
 - [x] 6.5 Corpus verbatim additions from the spec-coverage audit: `/search?q=..%2F..%2Fetc` in the non-ambiguous set and `/repos/..%5C../user/keys` in the denied set; assert the `.#10-git.cedar` emacs lock file's WARN line is present in the skip-log test
 - [x] 6.6 Temper the tripwire/test wording to the narrowed spec claim (no route *this library offers* skips the guard) so the assertion message does not overclaim what visibility caps buy
-- [ ] 6.7 Full + filtered tests green, `just lint` clean; `openspec validate --changes close-audit-and-loader-gaps` passes
+- [x] 6.7 Full + filtered tests green, `just lint` clean; `openspec validate --changes close-audit-and-loader-gaps` passes
