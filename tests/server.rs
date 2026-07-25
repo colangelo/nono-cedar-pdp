@@ -87,6 +87,17 @@ fn command_body(command: &str, args: &[&str]) -> String {
 }
 
 fn command_body_with_request_id(request_id: &str, command: &str, args: &[&str]) -> String {
+    command_body_with_rule(request_id, "rule", command, args)
+}
+
+/// A command body whose `intercept_rule` the test chooses: the corpus of real rule
+/// shapes needs to vary exactly this field.
+fn command_body_with_rule(
+    request_id: &str,
+    intercept_rule: &str,
+    command: &str,
+    args: &[&str],
+) -> String {
     serde_json::json!({
         "backend": "cedar",
         "request": {
@@ -95,7 +106,7 @@ fn command_body_with_request_id(request_id: &str, command: &str, args: &[&str]) 
             "command": command,
             "args": args,
             "caller": "session",
-            "intercept_rule": "rule",
+            "intercept_rule": intercept_rule,
             "reason": null,
             "child_pid": 42,
             "session_id": "s1"
@@ -416,6 +427,53 @@ async fn the_audit_line_names_the_rule_that_decided_and_the_evaluation_time() {
     );
 }
 
+/// Every `intercept_rule` shape real nono sends, driven through the full path —
+/// HTTP parse → evaluate → audit — asserting the value reaches the audit line
+/// byte-identically. The shapes are verified upstream facts, not guesses: in
+/// nolabs-ai/nono `crates/nono-cli/src/tool-sandbox/policy.rs`,
+/// `ResolvedInterceptAction::rule_label()` returns the matched rule's args joined
+/// with spaces (upstream's own test asserts `"push --force"`), `"<catch-all>"` for
+/// an empty-args rule, and `evaluate_invocation_policy` produces the labels
+/// `invocation_policy.approve[<index>]` and `invocation_policy.default`. A corpus
+/// that only ever sends single tokens cannot catch a consumer that assumes one
+/// word.
+#[tokio::test]
+async fn every_real_intercept_rule_shape_survives_to_the_audit_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = server::router(state(&dir));
+    let shapes = [
+        "status",                       // one rule arg
+        "push --force",                 // args joined with spaces
+        "<catch-all>",                  // the label of an empty-args rule
+        "invocation_policy.approve[0]", // invocation-policy approve label
+        "invocation_policy.default",    // invocation-policy default label
+    ];
+    for (index, rule) in shapes.iter().enumerate() {
+        let (status, _) = post_to(
+            &app,
+            &command_body_with_rule(&format!("rule-{index}"), rule, "git", &[SHIM_GIT, "status"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rule}");
+    }
+
+    let lines = audit_lines(&dir);
+    assert_eq!(lines.len(), shapes.len(), "{lines:#?}");
+    for (line, rule) in lines.iter().zip(shapes) {
+        assert_eq!(
+            line["intercept_rule"],
+            serde_json::json!(rule),
+            "the rule that routed the request must survive to the audit line \
+             byte-identically: {line:#?}"
+        );
+        assert_eq!(line["child_pid"], 42, "{line:#?}");
+        assert!(
+            line.as_object().unwrap().contains_key("rule_label") && line["rule_label"].is_null(),
+            "a command line carries rule_label as an explicit null: {line:#?}"
+        );
+    }
+}
+
 /// The endpoint half of the wire had no end-to-end coverage at all: the adapter and
 /// the engine each had a unit test, but nothing posted an `endpoint` envelope to
 /// `/v1/approve` and looked at what was recorded. `httpRequest` is the whole L7
@@ -453,6 +511,19 @@ async fn an_endpoint_envelope_is_decided_and_audited_over_http() {
     assert!(
         line["eval_us"].as_u64().is_some_and(|us| us > 0),
         "{line:#?}"
+    );
+    // What routed the request here: the route rule label exactly as sent, the pid
+    // upstream hardcodes to 0 for its proxy, and an explicitly null intercept_rule
+    // — the key set is identical on every line kind.
+    assert_eq!(
+        line["rule_label"], "endpoint_policy.approve[GET /repos/*]",
+        "the label must survive as sent: {line:#?}"
+    );
+    assert_eq!(line["child_pid"], 0, "{line:#?}");
+    assert!(
+        line.as_object().unwrap().contains_key("intercept_rule")
+            && line["intercept_rule"].is_null(),
+        "an endpoint line carries intercept_rule as an explicit null: {line:#?}"
     );
 
     // A method the permit does not cover is denied, so the permit is not a
@@ -677,6 +748,16 @@ async fn a_malformed_body_is_audited_without_context() {
         "{:#?}",
         lines[0]
     );
+    // The fixed key set holds on the rejection path too: nothing routed a request
+    // that never parsed, so all three routing keys are explicit nulls, not absent.
+    for key in ["child_pid", "intercept_rule", "rule_label"] {
+        assert!(
+            lines[0].as_object().unwrap().contains_key(key),
+            "a rejected line must carry {key} as an explicit null: {:#?}",
+            lines[0]
+        );
+        assert!(lines[0][key].is_null(), "{key}: {:#?}", lines[0]);
+    }
 }
 
 /// Upstream builds `request_id` as `…-approve-{command}-{nanos}`, so the agent

@@ -5,15 +5,15 @@ filtered test runs must both pass.
 
 ## 1. Audit record completeness (#24)
 
-- [ ] 1.1 Failing test: a decided command request's audit line carries `child_pid` and `intercept_rule` as sent, and an explicitly null `rule_label`
-- [ ] 1.2 Failing test: a decided endpoint request's audit line carries `rule_label` as sent, `child_pid` 0, and an explicitly null `intercept_rule`
-- [ ] 1.3 Failing test: a rejected (malformed/unsupported) request's audit line still contains all three keys, each null
-- [ ] 1.4 Implement: extend `AuditRecord`, `record`, `record_rejected`; key set fixed, values from `query.target`
+- [x] 1.1 Failing test: a decided command request's audit line carries `child_pid` and `intercept_rule` as sent, and an explicitly null `rule_label`
+- [x] 1.2 Failing test: a decided endpoint request's audit line carries `rule_label` as sent, `child_pid` 0, and an explicitly null `intercept_rule`
+- [x] 1.3 Failing test: a rejected (malformed/unsupported) request's audit line still contains all three keys, each null
+- [x] 1.4 Implement: extend `AuditRecord`, `record`, `record_rejected`; key set fixed, values from `query.target`
 
 ## 2. intercept_rule fixture corpus (#24)
 
-- [ ] 2.1 Failing test(s): command payloads with `intercept_rule` of each verified real shape — `"status"`, `"push --force"`, `"<catch-all>"`, `"invocation_policy.approve[0]"`, `"invocation_policy.default"` — driven through HTTP parse → evaluate → audit, asserting the value reaches the audit line byte-identically (cite the upstream source of the shapes in the fixture comments: nolabs-ai/nono crates/nono-cli/src/tool-sandbox/policy.rs `rule_label()`)
-- [ ] 2.2 Extend `tests/fixtures/` with at least one multi-token-rule payload so the offline `check` command exercises a non-single-token shape too
+- [x] 2.1 Failing test(s): command payloads with `intercept_rule` of each verified real shape — `"status"`, `"push --force"`, `"<catch-all>"`, `"invocation_policy.approve[0]"`, `"invocation_policy.default"` — driven through HTTP parse → evaluate → audit, asserting the value reaches the audit line byte-identically (cite the upstream source of the shapes in the fixture comments: nolabs-ai/nono crates/nono-cli/src/tool-sandbox/policy.rs `rule_label()`)
+- [x] 2.2 Extend `tests/fixtures/` with at least one multi-token-rule payload so the offline `check` command exercises a non-single-token shape too
 
 ## 3. load_dir silent drop (#26)
 

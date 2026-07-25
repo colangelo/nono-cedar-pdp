@@ -161,6 +161,23 @@ fn checking_the_command_fixtures_reproduces_the_documented_decisions() {
     );
 }
 
+/// The offline path exercises a multi-token `intercept_rule` too. JSON fixtures
+/// cannot carry comments, so the upstream citation lives here: real nono builds
+/// the rule label by joining the matched intercept rule's args with spaces
+/// (nolabs-ai/nono `crates/nono-cli/src/tool-sandbox/policy.rs`,
+/// `ResolvedInterceptAction::rule_label()` — upstream's own test asserts
+/// `"push --force"`), so a corpus of single tokens would green-light a consumer
+/// that assumes one word.
+#[test]
+fn checking_a_multi_token_intercept_rule_fixture_reproduces_the_decision() {
+    let (ok, stdout) = check_fixture("git-force-push-multi-token-rule.json");
+    assert!(!ok, "{stdout}");
+    assert!(
+        stdout.contains("DENY: denied by 10-git:no-history-rewrites"),
+        "a space-joined rule must parse and decide like any other: {stdout}"
+    );
+}
+
 /// Run `validate` against `policy_dir`. Returns (success, stdout + stderr): the
 /// count goes to stdout and the validation errors to stderr, and a test about the
 /// gate wants both.

@@ -26,6 +26,20 @@ pub struct AuditRecord<'a> {
     pub principal: Option<String>,
     pub action: Option<&'a str>,
     pub resource: Option<String>,
+    /// The pid of the intercepted child, as sent. Upstream hardcodes 0 for its
+    /// proxy's endpoint requests; null only on a rejected line, where no request
+    /// was ever parsed.
+    pub child_pid: Option<u32>,
+    /// The intercept rule that routed a *command* request here, as sent — the
+    /// matched rule's args joined with spaces (`"status"`, `"push --force"`),
+    /// `"<catch-all>"`, or an `invocation_policy.*` label. Null on endpoint and
+    /// rejected lines.
+    pub intercept_rule: Option<&'a str>,
+    /// The route rule label that routed an *endpoint* request here, as sent
+    /// (`endpoint_policy.approve[GET /repos/*]`). Null on command and rejected
+    /// lines. Kept separate from `intercept_rule` on purpose: they are different
+    /// upstream fields with different grammars, and the line's job is fidelity.
+    pub rule_label: Option<&'a str>,
     pub decision: &'static str,
     pub matched: &'a [String],
     pub reason: &'a str,
@@ -224,6 +238,21 @@ impl AuditLog {
     /// Record a decision. A logging failure must never change a decision, so
     /// errors are traced and swallowed.
     pub fn record(&self, query: &PolicyQuery, decision: &Decision) {
+        // What routed the request here, per target kind. The endpoint pid is the
+        // 0 upstream's proxy hardcodes on the wire (mirrored in
+        // `wire::EndpointRequest::child_pid`): the adapter pins the proxy identity
+        // rather than echoing wire values, so the pinned 0 is recorded — an
+        // explicit value, not a synthesized absence.
+        let (child_pid, intercept_rule, rule_label) = match &query.target {
+            crate::query::Target::Command {
+                intercept_rule,
+                child_pid,
+                ..
+            } => (Some(*child_pid), Some(intercept_rule.as_str()), None),
+            crate::query::Target::Endpoint { rule_label, .. } => {
+                (Some(0), None, Some(rule_label.as_str()))
+            }
+        };
         self.append(&AuditRecord {
             ts: now_rfc3339(),
             request_id: Some(&query.request_id),
@@ -233,6 +262,9 @@ impl AuditLog {
             principal: Some(format!("Nono::Caller::{:?}", query.caller)),
             action: Some(query.action_name()),
             resource: Some(query.resource_summary()),
+            child_pid,
+            intercept_rule,
+            rule_label,
             decision: if decision.allow { "allow" } else { "deny" },
             matched: &decision.matched,
             reason: &decision.reason,
@@ -258,6 +290,11 @@ impl AuditLog {
                 .capability_type
                 .as_deref()
                 .map(|variant| format!("capability_type={variant}")),
+            // Nothing routed a request that was never parsed into a query: the
+            // key set stays fixed, so all three are explicit nulls.
+            child_pid: None,
+            intercept_rule: None,
+            rule_label: None,
             decision: if decision.allow { "allow" } else { "deny" },
             matched: &decision.matched,
             reason: &decision.reason,
@@ -410,6 +447,131 @@ mod tests {
                 child_pid: 42,
             },
         }
+    }
+
+    fn endpoint_query() -> PolicyQuery {
+        PolicyQuery {
+            agent: "claude-code".to_string(),
+            session_id: "proxy".to_string(),
+            caller: "proxy".to_string(),
+            caller_kind: CallerKind::Session,
+            request_id: "p1".to_string(),
+            backend: "cedar".to_string(),
+            reason: None,
+            target: Target::Endpoint {
+                route_id: "github-api".to_string(),
+                upstream: "https://api.github.com".to_string(),
+                method: "GET".to_string(),
+                path: "/repos/foo/bar".to_string(),
+                rule_label: "endpoint_policy.approve[GET /repos/*]".to_string(),
+            },
+        }
+    }
+
+    /// Every audit line at `path`, parsed.
+    fn lines(path: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// The routing context Cedar saw — the pid that asked and the intercept rule
+    /// that routed the request here — has to be on the line, or an investigator
+    /// reconstructs it from nono's own logs instead of ours. `rule_label` is the
+    /// endpoint counterpart and stays an explicit null on a command line: the key
+    /// set never changes, so "not known" stays distinguishable from "not recorded".
+    #[test]
+    fn a_decided_command_line_carries_the_pid_and_rule_that_routed_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decisions.jsonl");
+        let log = AuditLog::open(&path).unwrap();
+
+        log.record(&query(), &crate::decision::Decision::deny("nope"));
+
+        let line = &lines(&path)[0];
+        assert_eq!(line["child_pid"], 42, "{line:#}");
+        assert_eq!(line["intercept_rule"], "status", "{line:#}");
+        // `line["rule_label"]` is Null for a *missing* key too, so presence is
+        // asserted separately: an explicit null is the contract.
+        assert!(
+            line.as_object().unwrap().contains_key("rule_label"),
+            "a command line must carry rule_label as an explicit null, not omit \
+             the key: {line:#}"
+        );
+        assert!(line["rule_label"].is_null(), "{line:#}");
+    }
+
+    /// The endpoint half of the same requirement: the route rule label exactly as
+    /// sent, the pid upstream hardcodes to 0 for its proxy, and an explicitly null
+    /// `intercept_rule`.
+    #[test]
+    fn a_decided_endpoint_line_carries_the_rule_label_and_the_proxys_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decisions.jsonl");
+        let log = AuditLog::open(&path).unwrap();
+
+        log.record(&endpoint_query(), &crate::decision::Decision::deny("nope"));
+
+        let line = &lines(&path)[0];
+        assert_eq!(
+            line["rule_label"], "endpoint_policy.approve[GET /repos/*]",
+            "the label must survive as sent: {line:#}"
+        );
+        assert_eq!(line["child_pid"], 0, "{line:#}");
+        assert!(
+            line.as_object().unwrap().contains_key("intercept_rule"),
+            "an endpoint line must carry intercept_rule as an explicit null, not \
+             omit the key: {line:#}"
+        );
+        assert!(line["intercept_rule"].is_null(), "{line:#}");
+    }
+
+    /// A rejected request never became a `PolicyQuery`, so none of the three
+    /// routing fields is known — and each must still be an explicit null, because
+    /// the fixed key set is the invariant a consumer leans on. All three line
+    /// kinds go through one log so the equality is asserted, not implied.
+    #[test]
+    fn every_line_kind_carries_the_same_key_set_with_nulls_for_the_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decisions.jsonl");
+        let log = AuditLog::open(&path).unwrap();
+
+        log.record(&query(), &crate::decision::Decision::deny("command"));
+        log.record(&endpoint_query(), &crate::decision::Decision::deny("endpoint"));
+        log.record_rejected(
+            &crate::adapter::nono_webhook::RejectedContext::default(),
+            &crate::decision::Decision::deny("rejected"),
+        );
+
+        let lines = lines(&path);
+        assert_eq!(lines.len(), 3, "{lines:#?}");
+
+        let rejected = &lines[2];
+        for key in ["child_pid", "intercept_rule", "rule_label"] {
+            assert!(
+                rejected.as_object().unwrap().contains_key(key),
+                "a rejected line must still carry {key} as an explicit null: {rejected:#}"
+            );
+            assert!(rejected[key].is_null(), "{key} on a rejected line: {rejected:#}");
+        }
+
+        let key_set = |line: &serde_json::Value| -> Vec<String> {
+            let mut keys: Vec<String> = line.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(
+            key_set(&lines[0]),
+            key_set(&lines[1]),
+            "command and endpoint lines must have the same key set"
+        );
+        assert_eq!(
+            key_set(&lines[0]),
+            key_set(&lines[2]),
+            "a rejected line must have the same key set as a decided one"
+        );
     }
 
     #[test]
