@@ -43,6 +43,25 @@
 //! checks, ownership defends against other local users only — the sandboxed
 //! agent runs as the same uid and owns these paths already.
 //!
+//! One more rule makes the two above mean what they say: `serve` **resolves the
+//! configured paths once**, at startup and before any check (D7 — `policy_dir`
+//! through `canonicalize`, the audit log through [`resolve_existing_prefix`]),
+//! and constructs the engine, the watcher and the audit log with the resolved
+//! paths. The checked chain and the used chain are therefore the same object: a
+//! symlink on the *configured* path cannot be repointed after startup to
+//! redirect a reload to a tree these checks never walked (that gap was live
+//! before D7 — the walk inspected the canonical chain while the loader
+//! traversed the configured lexical one), and a symlink already pointing into
+//! another user's tree at startup is caught by the ownership rule on the
+//! resolved components. The residual, named rather than hidden: an attacker who
+//! can write a lexical component's holding directory can still, *before
+//! startup*, point the link at a stale tree this daemon's user genuinely owns —
+//! every resolved-chain check passes, because the tree really is ours. That
+//! takes an unusual configured path (the shipped home-anchored defaults have no
+//! foreign-writable lexical components) and a useful stale tree to exist; the
+//! complete answer is the profile-derived check and policy signing under
+//! epic #1.
+//!
 //! **Both checks here are much weaker than they look, and being precise about that
 //! is the point of this module.**
 //!
@@ -489,6 +508,20 @@ fn audit_log_inside_cwd(audit_log: &Path, cwd: &Path) -> String {
         log = audit_log.display(),
         cwd = cwd.display(),
     )
+}
+
+/// Absolute, symlink-resolved form of a configured state path whose full chain
+/// may not exist yet — the audit log before its first record: as much of the
+/// path as exists is canonicalized and the rest is appended lexically.
+///
+/// `serve` resolves both configured paths exactly once, at startup and before
+/// the checks (D7; `policy_dir` must exist, so it goes through plain
+/// `canonicalize`) — so the chain the checks walk and the chain the loader, the
+/// watcher and the audit log use are the same object, and a symlink on the
+/// *configured* path repointed after startup changes nothing the daemon will
+/// ever read. See the module docs for the one residual this leaves.
+pub fn resolve_existing_prefix(path: &Path) -> PathBuf {
+    absolutize(path, None)
 }
 
 /// Absolute, symlink-resolved form of `path`, resolving as much of it as exists.

@@ -115,7 +115,25 @@ async fn run_serve(config_path: &std::path::Path) -> Result<(), String> {
     use nono_cedar_pdp::{audit::AuditLog, server};
     use std::sync::Arc;
 
-    let config = Config::load(config_path).map_err(|e| e.to_string())?;
+    let mut config = Config::load(config_path).map_err(|e| e.to_string())?;
+    // Resolve the configured state paths ONCE, before the checks (D7): the
+    // chain the isolation checks walk and the chain the loader, the watcher and
+    // the audit log use must be the same object, or a symlink on the configured
+    // path could be repointed after startup to a tree the checks never saw.
+    // `policy_dir` must exist to serve, so failing to resolve it is a refusal;
+    // the audit log may not exist yet, so its *existing prefix* is what
+    // resolves. Everything below holds only the resolved paths — a post-startup
+    // repoint of the configured path changes nothing the daemon will ever read.
+    // (The named residual — a pre-startup repoint at a stale tree this same
+    // user owns — is in `isolation`'s module docs.)
+    config.policy_dir = std::fs::canonicalize(&config.policy_dir).map_err(|e| {
+        format!(
+            "resolving policy_dir {}: {e} — refusing to serve without knowing which \
+             directory the policies would come from",
+            config.policy_dir.display()
+        )
+    })?;
+    config.audit_log = nono_cedar_pdp::isolation::resolve_existing_prefix(&config.audit_log);
     // Before anything is loaded, opened or bound: who can write the policies
     // decides every approval this daemon will ever make. An `Err` here is a
     // refusal to serve; the warnings are advisory and deliberately loud. Both

@@ -570,6 +570,83 @@ fn a_started_daemon_answers_healthz_and_approve_over_a_real_socket() {
     assert_eq!(second["decision"], "deny");
 }
 
+/// D7: `serve` resolves the configured `policy_dir` once, before the isolation
+/// checks, and hands the *resolved* path to the engine, the watcher and every
+/// reload re-check — so the chain the checks walked and the chain the loader
+/// reads are the same object, and repointing a symlink on the configured path
+/// after startup changes nothing the daemon will ever read. `/healthz`
+/// reporting the resolved directory is the observable half of that wiring: a
+/// daemon reporting the symlink path is a daemon that loaded through a chain
+/// the checks never saw.
+#[test]
+fn a_symlinked_policy_dir_is_resolved_before_serving() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = copy_shipped_policies(dir.path());
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let addr = free_loopback_addr();
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "policy_dir = \"{}\"\naudit_log = \"{}\"\nbind = \"{addr}\"\n",
+            link.display(),
+            dir.path().join("decisions.jsonl").display()
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nono-cedar-pdp"))
+        .arg("serve")
+        .arg("--config")
+        .arg(&config)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut health = String::new();
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().unwrap() {
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "the daemon exited during startup ({status}): {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+            health = get(addr, "/healthz");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let body = health
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no body in the healthz response: {health:?}"));
+    let json: serde_json::Value = serde_json::from_str(body.trim())
+        .unwrap_or_else(|e| panic!("unparseable healthz body ({e}): {health:?}"));
+    let reported = json["policy_dir"]
+        .as_str()
+        .unwrap_or_else(|| panic!("healthz reports no policy_dir: {json:#}"));
+
+    let resolved = std::fs::canonicalize(&real).unwrap();
+    assert_eq!(
+        reported,
+        resolved.display().to_string(),
+        "the daemon must serve from the resolved chain, not the configured symlink"
+    );
+    assert!(
+        !reported.contains("link"),
+        "the symlink path is the chain the checks never walked: {reported}"
+    );
+}
+
 /// A policy directory a second local user can write is a directory in which
 /// someone else can add `permit (principal, action, resource);`. It is not the
 /// sandbox-escape defence — the agent runs as this same user — but it is a
