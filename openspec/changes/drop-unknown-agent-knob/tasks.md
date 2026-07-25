@@ -11,7 +11,7 @@ TDD throughout: failing test first, watched failing for the right reason.
 
 ## 2. Documentation
 
-- [ ] 2.1 README: remove the `# unknown_agent = "unknown"` example line; add the one-sentence contract (fallback is fixed; shipped baseline denies it; unmapped backend is always a loud deny)
+- [x] 2.1 README: remove the `# unknown_agent = "unknown"` example line; add the one-sentence contract (fallback is fixed; shipped baseline denies it; unmapped backend is always a loud deny)
 
 ## 3. Verification
 

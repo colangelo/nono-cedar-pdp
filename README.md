@@ -86,8 +86,12 @@ audit_log = "~/.local/state/nono-cedar-pdp/decisions.jsonl"   # created 0600, pa
 
 [agents]                         # nono approval-backend name -> Cedar Agent
 cedar = "claude-code"
-# unknown_agent = "unknown"      # fallback for an unmapped backend name
 ```
+
+A backend name absent from `[agents]` always resolves to the fixed identity
+`unknown`, which the shipped baseline pack denies explicitly
+(`00-baseline:no-unknown-agents`) — an unmapped backend is a loud deny, never a
+quiet pass-through.
 
 Both paths are outside any repository working tree **on purpose** — see
 [Keep the policy directory out of the sandbox](#keep-the-policy-directory-out-of-the-sandbox),
