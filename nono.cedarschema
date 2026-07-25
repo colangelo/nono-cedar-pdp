@@ -1,0 +1,42 @@
+namespace Nono {
+  entity Agent;
+  entity Session in [Agent];
+  entity Caller in [Session];
+
+  entity Command {
+    command: String,
+    args: Set<String>,
+    argv: String,
+    arg_count: Long,
+  };
+
+  entity HttpEndpoint {
+    route_id: String,
+    upstream: String,
+    method: String,
+    path: String,
+  };
+
+  action launchCommand appliesTo {
+    principal: [Caller],
+    resource: [Command],
+    context: {
+      backend: String,
+      intercept_rule: String,
+      caller_kind: String,
+      reason?: String,
+      child_pid: Long,
+      session_id: String,
+    }
+  };
+
+  action httpRequest appliesTo {
+    principal: [Caller],
+    resource: [HttpEndpoint],
+    context: {
+      backend: String,
+      rule_label: String,
+      reason?: String,
+    }
+  };
+}

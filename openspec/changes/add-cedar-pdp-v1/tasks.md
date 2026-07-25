@@ -28,10 +28,10 @@ Global gate for every group: `just lint && just test` must pass before the group
 
 ## 4. Cedar schema
 
-- [ ] 4.1 Create `nono.cedarschema` exactly as given in the plan: `Caller in Session in Agent`, `Command` with `args: Set<String>`, `HttpEndpoint`, actions `launchCommand`/`httpRequest` with optional `reason?` context
-- [ ] 4.2 Write failing `src/cedar/schema.rs` tests: schema compiles and exposes both actions, a well-formed policy strict-validates, a set-membership argument policy validates, a policy referencing `resource.cwd` fails validation. Verify: `cargo test --lib cedar::schema` → fails
-- [ ] 4.3 Implement `SCHEMA_SRC` (`include_str!`), `load()` surfacing `SchemaWarning`s via `tracing::warn`, `SchemaLoadError`. Verify: `cargo test --lib cedar::schema` → 4 passed
-- [ ] 4.4 Commit: `feat: embedded Cedar schema for nono approval requests`
+- [x] 4.1 Create `nono.cedarschema` exactly as given in the plan: `Caller in Session in Agent`, `Command` with `args: Set<String>`, `HttpEndpoint`, actions `launchCommand`/`httpRequest` with optional `reason?` context
+- [x] 4.2 Write failing `src/cedar/schema.rs` tests: schema compiles and exposes both actions, a well-formed policy strict-validates, a set-membership argument policy validates, a policy referencing `resource.cwd` fails validation. Verify: `cargo test --lib cedar::schema` → fails
+- [x] 4.3 Implement `SCHEMA_SRC` (`include_str!`), `load()` surfacing `SchemaWarning`s via `tracing::warn`, `SchemaLoadError`. Verify: `cargo test --lib cedar::schema` → 4 passed
+- [x] 4.4 Commit: `feat: embedded Cedar schema for nono approval requests`
 
 ## 5. Policy loading, validation, and the validate CLI
 
