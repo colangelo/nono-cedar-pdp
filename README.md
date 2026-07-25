@@ -378,9 +378,9 @@ grant on everything below it.
 
 ### What the built-in checks actually buy
 
-`serve` checks its own state paths before it loads anything, and re-checks the policy
-directory on every hot reload. All of it is worth having and none of it is the control
-above — do not read them as one:
+`serve` resolves its configured state paths once at startup, checks them before it loads
+anything, and re-checks the policy directory on every hot reload. All of it is worth
+having and none of it is the control above — do not read them as one:
 
 - **Refusal on a group- or world-writable policy directory or policy file** (naming the
   path, the mode and `chmod go-w`). This defends against **other local users** — a shared
@@ -388,6 +388,8 @@ above — do not read them as one:
   the sandboxed agent. It does nothing about the agent, which runs as the same uid and has
   owner-write by construction. (A user-private group counts as group-writable: the daemon
   cannot tell a private group from a shared one, so `chmod go-w` is the answer either way.)
+  The refusal also says to **review the contents before tightening**: `chmod` does not
+  undo content added or modified while the path was writable by others.
 - **Refusal on a loosely-writable non-sticky *ancestor* of the policy directory or the
   audit log.** Write access to a parent is the power to rename the directory out from
   under the daemon and substitute another, so the mode of the directory itself never
@@ -396,6 +398,36 @@ above — do not read them as one:
   it never exempts the policy directory itself, where the attack is *creating* a new
   `*.cedar` file and sticky does not restrict creation. Same threat model as above:
   other local users, not the agent.
+- **Refusal on any state-path component owned by neither the daemon's user nor root.**
+  Modes answer who may write through the permission system; ownership answers who may
+  *change* the answer — a component another local user owns passes every mode test while
+  that user keeps the power to loosen, rename or rewrite it, and the sticky bit stops
+  renames of entries you do not own but not *pre-creating* a then-missing component (a
+  policy directory under a `/tmp`-style ancestor, an audit log before its first record)
+  and owning it. So the policy directory, every loadable policy file, every existing
+  ancestor of both state paths, and the audit log file once it exists must be owned by
+  the daemon's effective user or by root — root deliberately, because a root-installed
+  pack this daemon cannot write is *stronger* than a user-owned one, system ancestors
+  (`/`, `/Users`) are root-owned everywhere, and owner-or-root is the rule OpenSSH's
+  `StrictModes` applies to `~/.ssh`. Ownership closes pre-creation, not in-place content
+  history: a file this user owns whose content changed while its mode was loose is
+  adopted once the mode is repaired, which is why the remedy above says review first.
+  And it is still about other local users only — the sandboxed agent runs as the same
+  uid and *is* the owner already.
+- **The configured paths are resolved once, at startup, before any check.** The chain
+  the checks walk and the chain the loader, the watcher and the audit log use are the
+  same object, so a symlink on the configured path cannot be repointed after startup to
+  redirect a reload to a tree the checks never saw; a symlink already pointing into
+  another local user's tree at startup is caught by the ownership refusal on the
+  resolved components. One residual, named rather than hidden: whoever can write a
+  *lexical* component's holding directory can still, before startup, point the link at a
+  stale tree this daemon's user genuinely owns — every resolved-chain check then passes,
+  because the tree really is ours. That takes an unusual configured path (the shipped
+  home-anchored defaults have no foreign-writable lexical components) and a useful stale
+  tree to exist; the complete answer is the profile-derived check and policy signing on
+  the backlog. Resolving paths defends the *check's* integrity against other local
+  users — the sandboxed agent needs no symlink tricks against a path its profile already
+  grants.
 - **The same refusals re-run on every hot reload**, before a freshly read policy set can
   replace the active one. A policy directory that becomes loosely writable *while the
   daemon runs* is therefore not adopted silently: the last-known-good set keeps
@@ -411,8 +443,12 @@ above — do not read them as one:
   inside a granted tree (the `$TMPDIR` case above), and it *fires* on a plain development
   run where no agent exists at all. The warning is not a substitute for the `jq` check.
 
-The audit log's own mode is tightened to `0600` on open rather than being a refusal,
-because a log the daemon cannot own is still better recorded than not recorded.
+The audit log's own *mode* is tightened to `0600` on open rather than being a refusal,
+because a trail the daemon cannot keep private is still better recorded than not
+recorded — but an audit log *owned by another user* refuses like any other component:
+its owner could rewrite the record no matter what mode the open sets, and mode bits
+were never a defence against the agent anyway (same uid, same rules as everything
+above).
 
 ## Security posture
 

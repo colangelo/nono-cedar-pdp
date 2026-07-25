@@ -305,6 +305,23 @@ keeping the last-known-good set and logging at ERROR on refusal. The threat mode
 unchanged and stated wherever the checks are described: other local users, never the
 sandboxed agent.
 
+A security re-audit of that change (2026-07-26, D6/D7 of the same OpenSpec change)
+closed two more gaps. First, **ownership**: every checked component — policy dir,
+loadable policy files, existing ancestors of both state paths, the audit log file once
+it exists — must be owned by the daemon's effective uid or by root, because a
+foreign-owned component passes every mode test while its owner can chmod, rename or
+rewrite it at will (sticky stops renames of entries you do not own, not *pre-creating*
+and owning a then-missing component; owner-or-root is OpenSSH's `StrictModes` rule).
+Second, **resolve-once**: `serve` canonicalizes `policy_dir` and resolves the existing
+prefix of `audit_log` before the checks and hands the resolved paths to the engine,
+watcher and audit log, so the checked chain and the used chain are the same object and
+a post-startup repoint of a symlink on the configured path changes nothing the daemon
+reads. The named residual (a pre-startup repoint at a stale tree the daemon's user
+genuinely owns passes every resolved-chain check) and the named limit of ownership
+(in-place content history in files we own — the writability remedy says review before
+tightening) stay with epic #1's profile-derived check and policy signing. Threat model
+still unchanged: other local users, never the sandboxed agent.
+
 ## 4. Architecture
 
 One Rust binary (lib + bin). The lib half (`wire`, `query`, `cedar/`) is what a

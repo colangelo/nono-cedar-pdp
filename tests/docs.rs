@@ -257,6 +257,30 @@ fn the_documented_caveats_and_risks_are_still_in_the_readme() {
             "a Cedar denial becomes a prompt",
             "then you get a terminal prompt",
         ),
+        // The state-path isolation section. The profile-checking procedure is
+        // the one control that works against the sandboxed agent, so it must
+        // stay findable: the resolved-manifest command, and the per-command
+        // fs_write/fs_write_file sweep the resolved manifest omits.
+        (
+            "the profile-checking procedure: resolved grants",
+            "nono profile show <profile> --format manifest",
+        ),
+        (
+            "the profile-checking procedure: per-command grants",
+            "fs_write_file",
+        ),
+        // Why a /tmp-style 1777 chain is fine while a 770 parent is not — and
+        // why the same exemption never applies to the policy dir itself.
+        (
+            "the sticky-ancestor rationale",
+            "sticky does not restrict creation",
+        ),
+        // The ownership rule: modes answer who may write, ownership answers who
+        // may change the answer.
+        (
+            "the ownership rule",
+            "owned by neither the daemon's user nor root",
+        ),
     ] {
         // Matched against the README with every whitespace run collapsed, so
         // re-wrapping a paragraph is not a test failure — only deleting the guidance
