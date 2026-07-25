@@ -1,0 +1,5 @@
+policy_dir = "./policies"
+audit_log = "./decisions.jsonl"
+
+[agents]
+cedar = "claude-code"

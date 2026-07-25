@@ -35,11 +35,11 @@ Global gate for every group: `just lint && just test` must pass before the group
 
 ## 5. Policy loading, validation, and the validate CLI
 
-- [ ] 5.1 Write failing `src/cedar/engine.rs` loader tests: provenance ids from `@id`/ordinal, non-`.cedar` files ignored, empty dir is `PolicyLoadError::Empty`, syntax error names the file, schema violation is `Validation`, duplicate ids in one file are `Duplicate`, `bootstrap` exposes a snapshot at generation 1. Verify: `cargo test --lib cedar::engine` → fails
-- [ ] 5.2 Implement `LoadedPolicies`, `PolicyLoadError`, `load_dir(dir, schema, generation)` using `PolicySet::from_str` per file plus `Policy::new_id` (no manual `;` splitting), then `Validator::new(schema.clone()).validate(…, ValidationMode::Strict)`
-- [ ] 5.3 Implement `Engine::{bootstrap, snapshot, schema, policy_dir, reload}` over `ArcSwap<LoadedPolicies>`. Verify: `cargo test --lib cedar::engine` → 7 passed
-- [ ] 5.4 Add the clap CLI skeleton in `src/main.rs` with the `validate` subcommand and `tracing_subscriber` init. Verify: `cargo run -- validate --config ./nono-cedar-pdp.toml` against a one-policy dir → `OK: 1 policies loaded and validated`, exit 0
-- [ ] 5.5 Commit: `feat: policy loading with strict validation and validate CLI`
+- [x] 5.1 Write failing `src/cedar/engine.rs` loader tests: provenance ids from `@id`/ordinal, non-`.cedar` files ignored, empty dir is `PolicyLoadError::Empty`, syntax error names the file, schema violation is `Validation`, duplicate ids in one file are `Duplicate`, `bootstrap` exposes a snapshot at generation 1. Verify: `cargo test --lib cedar::engine` → fails
+- [x] 5.2 Implement `LoadedPolicies`, `PolicyLoadError`, `load_dir(dir, schema, generation)` using `PolicySet::from_str` per file plus `Policy::new_id` (no manual `;` splitting), then `Validator::new(schema.clone()).validate(…, ValidationMode::Strict)`
+- [x] 5.3 Implement `Engine::{bootstrap, snapshot, schema, policy_dir, reload}` over `ArcSwap<LoadedPolicies>`. Verify: `cargo test --lib cedar::engine` → 7 passed
+- [x] 5.4 Add the clap CLI skeleton in `src/main.rs` with the `validate` subcommand and `tracing_subscriber` init. Verify: `cargo run -- validate --config ./nono-cedar-pdp.toml` against a one-policy dir → `OK: 1 policies loaded and validated`, exit 0
+- [x] 5.5 Commit: `feat: policy loading with strict validation and validate CLI`
 
 ## 6. Entity building, decisions, and the check CLI
 
