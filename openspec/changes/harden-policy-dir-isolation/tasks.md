@@ -28,6 +28,6 @@ and filtered (`cargo test --lib isolation`, `cargo test --lib watcher`) — see
 
 ## 4. Verification
 
-- [ ] 4.1 `just test` (full) and filtered `cargo test isolation`/`cargo test watcher` both green; `just lint` clean
-- [ ] 4.2 `just smoke` against real nono still passes with the hardened checks in place (home-anchored default paths must not trip the ancestor walk on a real macOS home)
-- [ ] 4.3 `openspec validate --changes harden-policy-dir-isolation` passes
+- [x] 4.1 `just test` (full) and filtered `cargo test isolation`/`cargo test watcher` both green; `just lint` clean
+- [x] 4.2 `just smoke` against real nono still passes with the hardened checks in place (home-anchored default paths must not trip the ancestor walk on a real macOS home)
+- [x] 4.3 `openspec validate --changes harden-policy-dir-isolation` passes
