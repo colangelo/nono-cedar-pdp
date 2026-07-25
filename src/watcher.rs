@@ -1,7 +1,24 @@
 //! Filesystem watch on the policy directory.
 //!
-//! Debounces bursts (editors write several events per save) and reloads through
-//! `Engine::reload`, which keeps the last-good set on failure.
+//! Debounces bursts (editors write several events per save), re-checks that the
+//! directory is still trusted (`isolation::refuse_untrusted_policy_dir` — the
+//! serve layer's concern, kept out of `cedar::engine` so the engine can lift
+//! upstream unchanged), and reloads through `Engine::reload`, which keeps the
+//! last-good set on failure.
+//!
+//! The re-check exists because the startup refusal is only as good as the moment
+//! it ran: a policy directory that becomes group-writable *mid-session* would
+//! otherwise be re-read and adopted silently on the next edit. Two honest limits,
+//! accepted and documented rather than hidden: the check runs before the reload
+//! reads the files, so a loosening *between* check and read is not caught until
+//! the next event (the TOCTOU window shrinks from "forever after startup" to one
+//! debounce — and the other-local-user attacker this defends against cannot time
+//! a race they do not control); and `notify` watches the policy directory only,
+//! so an ancestor going loose does not itself wake the watcher — it is caught at
+//! the next policy event. Like the startup check, all of this defends against
+//! **other local users**: the sandboxed agent runs as the same uid as the daemon
+//! and was never constrained by mode bits, only by its nono profile's write
+//! grants.
 
 use crate::cedar::engine::Engine;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -18,9 +35,16 @@ pub fn spawn(engine: Arc<Engine>) -> notify::Result<RecommendedWatcher> {
     let mut watcher = notify::recommended_watcher(tx)?;
     watcher.watch(engine.policy_dir(), RecursiveMode::NonRecursive)?;
 
+    // The watch thread logs with whatever dispatcher its spawner had. A bare
+    // `thread::spawn` would fall back to the process-global default — identical in
+    // production, where `main` installs the global subscriber before anything else,
+    // but it would silently bypass a thread-local one, and "the operator is told at
+    // ERROR" is a behaviour the reload-refusal tests have to be able to observe.
+    let dispatch = tracing::dispatcher::get_default(|current| current.clone());
     std::thread::Builder::new()
         .name("policy-watcher".to_string())
         .spawn(move || {
+            let _dispatch = tracing::dispatcher::set_default(&dispatch);
             while let Ok(first) = rx.recv() {
                 if let Err(e) = first {
                     tracing::warn!(error = %e, "policy watch error");
@@ -28,6 +52,24 @@ pub fn spawn(engine: Arc<Engine>) -> notify::Result<RecommendedWatcher> {
                 }
                 // Drain the burst an editor save produces.
                 while rx.recv_timeout(DEBOUNCE).is_ok() {}
+                // Re-check trust after the drain and BEFORE the reload touches the
+                // directory, so nothing read from a loosened tree can become the
+                // active set. On refusal the in-memory set predates the loosening
+                // and is the only trusted policy state left, so it stays (same
+                // posture as a broken edit, D7) and the watch survives — repairing
+                // the mode and editing again recovers without a restart. ERROR,
+                // not WARN: a quieter level would let the "adopted silently"
+                // failure this closes recur one level down. See the module docs
+                // for the TOCTOU window and the other-local-users scope.
+                if let Err(e) = crate::isolation::refuse_untrusted_policy_dir(engine.policy_dir())
+                {
+                    tracing::error!(
+                        error = %e,
+                        "policy directory is no longer trusted; keeping the \
+                         last-good policy set"
+                    );
+                    continue;
+                }
                 match engine.reload() {
                     Ok(generation) => {
                         tracing::info!(generation, "policies reloaded from disk")
@@ -159,6 +201,102 @@ mod tests {
         assert!(
             !engine.evaluate(&git_status()).allow,
             "the repaired policy set must be the one deciding"
+        );
+    }
+
+    fn chmod(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// The startup refusal is only as good as the moment it ran: a policy directory
+    /// that becomes group-writable *while the daemon runs* used to be re-read and
+    /// adopted silently ~150 ms after the next edit. The re-check runs here in the
+    /// watcher, after the debounce drain and before `Engine::reload` touches the
+    /// directory, so nothing read from the loosened tree can become the active set.
+    /// Same containment posture as a broken edit: keep the last-good set, tell the
+    /// operator at ERROR — a WARN would let the "adopted silently" failure recur one
+    /// level down. (Like the startup check, this defends against other local users;
+    /// the sandboxed agent runs as the same uid and was never stopped by mode bits.)
+    #[test]
+    fn a_policy_dir_loosened_mid_session_is_refused_and_the_last_good_set_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = dir.path().join("p.cedar");
+        std::fs::write(&policy, POLICY).unwrap();
+        let schema = crate::cedar::schema::load().unwrap();
+        let engine = Arc::new(
+            crate::cedar::engine::Engine::bootstrap(schema, dir.path().to_path_buf()).unwrap(),
+        );
+        // Capture before the spawn: the watch thread logs on its own thread and
+        // inherits the dispatcher of whoever spawned it, so a capture installed
+        // later would never see its refusal.
+        let capture = crate::test_log::capture();
+        let _watcher = spawn(Arc::clone(&engine)).unwrap();
+        assert!(
+            engine.evaluate(&git_status()).allow,
+            "the last-good set permits git status before the loosening"
+        );
+
+        // Loosen the directory, then make an edit that would flip the decision if
+        // the reload were wrongly adopted.
+        chmod(dir.path(), 0o770);
+        std::fs::write(&policy, r#"forbid (principal, action, resource);"#).unwrap();
+
+        assert!(
+            !within(Duration::from_secs(2), || engine.snapshot().generation != 1
+                || !engine.evaluate(&git_status()).allow),
+            "a policy set read from a loosened directory must not be adopted: \
+             generation {}",
+            engine.snapshot().generation
+        );
+        let log = capture.text();
+        assert!(
+            log.contains("ERROR"),
+            "the refusal must be ERROR, not a level an operator filters out: {log:?}"
+        );
+        assert!(log.contains("0770"), "the mode must be named: {log:?}");
+        assert!(
+            log.contains(&dir.path().display().to_string()),
+            "the offending path must be named: {log:?}"
+        );
+    }
+
+    /// A refusal must not take the watch down with it: the loosening may be a
+    /// transient `chmod`, and a dead watcher would freeze the daemon on the
+    /// last-good set forever while looking healthy. Repairing the mode and editing
+    /// again must be adopted without a restart.
+    #[test]
+    fn repairing_the_mode_lets_the_watcher_adopt_the_next_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = dir.path().join("p.cedar");
+        std::fs::write(&policy, POLICY).unwrap();
+        let schema = crate::cedar::schema::load().unwrap();
+        let engine = Arc::new(
+            crate::cedar::engine::Engine::bootstrap(schema, dir.path().to_path_buf()).unwrap(),
+        );
+        let capture = crate::test_log::capture();
+        let _watcher = spawn(Arc::clone(&engine)).unwrap();
+
+        chmod(dir.path(), 0o770);
+        std::fs::write(&policy, r#"forbid (principal, action, resource);"#).unwrap();
+        // Wait until the refusal is on the record, so the repair below is provably
+        // a recovery from it and not a race that never saw the loose mode.
+        assert!(
+            within(Duration::from_secs(5), || capture.text().contains("ERROR")),
+            "no refusal was ever logged: {:?}",
+            capture.text()
+        );
+
+        chmod(dir.path(), 0o700);
+        std::fs::write(&policy, r#"forbid (principal, action, resource);"#).unwrap();
+        assert!(
+            within(Duration::from_secs(5), || engine.snapshot().generation >= 2),
+            "the watcher stopped watching after the refusal; generation {}",
+            engine.snapshot().generation
+        );
+        assert!(
+            !engine.evaluate(&git_status()).allow,
+            "the repaired edit must be the one deciding"
         );
     }
 }

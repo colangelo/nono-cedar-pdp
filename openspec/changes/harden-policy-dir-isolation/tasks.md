@@ -17,9 +17,9 @@ and filtered (`cargo test --lib isolation`, `cargo test --lib watcher`) — see
 ## 2. Refusal core shared with the reload path
 
 - [x] 2.1 Factor the refusal core (directory + loadable files + ancestors, no cwd warnings) into a function both `check` and the watcher call (D5); startup behaviour unchanged — existing isolation tests all still pass unmodified
-- [ ] 2.2 Failing test (watcher): with the daemon watching, make the policy directory group-writable and touch a policy file — the active set and generation must remain, decisions must keep flowing from the last-good set, and the captured log must contain an ERROR line naming the path and mode
-- [ ] 2.3 Failing test (watcher): after repairing the mode, a subsequent edit is adopted (generation advances) — the watch survived the refusal
-- [ ] 2.4 Implement: watcher runs the refusal core after the debounce drain, before `Engine::reload`; refusal branch logs at ERROR and skips the reload; comment states the TOCTOU window and the other-local-users scope honestly (D3/D4)
+- [x] 2.2 Failing test (watcher): with the daemon watching, make the policy directory group-writable and touch a policy file — the active set and generation must remain, decisions must keep flowing from the last-good set, and the captured log must contain an ERROR line naming the path and mode
+- [x] 2.3 Failing test (watcher): after repairing the mode, a subsequent edit is adopted (generation advances) — the watch survived the refusal
+- [x] 2.4 Implement: watcher runs the refusal core after the debounce drain, before `Engine::reload`; refusal branch logs at ERROR and skips the reload; comment states the TOCTOU window and the other-local-users scope honestly (D3/D4). (One enabling change: the watch thread now inherits its spawner's tracing dispatcher — identical in production, where `main` installs the global subscriber, but without it the thread-local captures of `src/test_log.rs` could never observe what the watch thread logs)
 
 ## 3. Documentation
 
