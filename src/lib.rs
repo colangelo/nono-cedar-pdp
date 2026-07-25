@@ -6,4 +6,5 @@ pub mod decision;
 pub mod query;
 pub mod sanitize;
 pub mod server;
+pub mod watcher;
 pub mod wire;

@@ -110,6 +110,10 @@ async fn run_serve(config_path: &std::path::Path) -> Result<(), String> {
         cedar::engine::Engine::bootstrap(schema, config.policy_dir.clone())
             .map_err(|e| e.to_string())?,
     );
+    // Bound to `_watcher`, not `_`: dropping it here would silently stop the
+    // watch and every later policy edit would be ignored until a restart.
+    let _watcher = nono_cedar_pdp::watcher::spawn(Arc::clone(&engine))
+        .map_err(|e| format!("starting policy watcher: {e}"))?;
     let audit = Arc::new(AuditLog::open(&config.audit_log).map_err(|e| e.to_string())?);
     let bind = config.bind;
     let state = server::AppState {

@@ -67,11 +67,11 @@ Global gate for every group: `just lint && just test` must pass before the group
 
 ## 9. Policy hot-reload
 
-- [ ] 9.1 Write failing reload tests in `src/cedar/engine.rs`: a valid edit advances the generation and changes the decision; a syntax-error edit keeps the last-good set and does not advance the generation; a schema-violating edit likewise. Verify: `cargo test --lib cedar::engine::tests::reload` → these three are the D7 contract and must pass
-- [ ] 9.2 Write a failing `src/watcher.rs` test: an edit to a policy file causes a reload within 5 s. Verify: `cargo test --lib watcher` → fails
-- [ ] 9.3 Implement `watcher::spawn(engine)` — `notify` watcher on the policy dir, 150 ms debounce draining the editor's event burst, reload errors logged without replacing the active set. Verify: `cargo test --lib watcher` → passes
-- [ ] 9.4 Wire the watcher into `serve`, bound to `_watcher` so it is not dropped immediately. Verify manually: `/healthz` shows generation 1, append a valid policy → generation 2, append broken Cedar → still generation 2
-- [ ] 9.5 Commit: `feat: policy hot-reload keeping last-good set on failure`
+- [x] 9.1 Write failing reload tests in `src/cedar/engine.rs`: a valid edit advances the generation and changes the decision; a syntax-error edit keeps the last-good set and does not advance the generation; a schema-violating edit likewise. Verify: `cargo test --lib cedar::engine::tests::reload` → these three are the D7 contract and must pass
+- [x] 9.2 Write a failing `src/watcher.rs` test: an edit to a policy file causes a reload within 5 s. Verify: `cargo test --lib watcher` → fails
+- [x] 9.3 Implement `watcher::spawn(engine)` — `notify` watcher on the policy dir, 150 ms debounce draining the editor's event burst, reload errors logged without replacing the active set. Verify: `cargo test --lib watcher` → passes
+- [x] 9.4 Wire the watcher into `serve`, bound to `_watcher` so it is not dropped immediately. Verify manually: `/healthz` shows generation 1, append a valid policy → generation 2, append broken Cedar → still generation 2
+- [x] 9.5 Commit: `feat: policy hot-reload keeping last-good set on failure`
 
 ## 10. Starter policies, nono wiring, and end-to-end proof
 

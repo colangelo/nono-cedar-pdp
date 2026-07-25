@@ -630,4 +630,79 @@ when { resource.arg_count + 9223372036854775807 > 0 };
             decision.reason
         );
     }
+
+    #[test]
+    fn reload_picks_up_edits_and_bumps_generation() {
+        let schema = crate::cedar::schema::load().unwrap();
+        let d = dir_with(&[("p.cedar", MATRIX)]);
+        let engine = Engine::bootstrap(schema, d.path().to_path_buf()).unwrap();
+        assert!(
+            engine
+                .evaluate(&command_query("session", "git", &["git", "status"]))
+                .allow
+        );
+
+        std::fs::write(
+            d.path().join("p.cedar"),
+            r#"forbid (principal, action, resource);"#,
+        )
+        .unwrap();
+        let generation = engine.reload().unwrap();
+        assert_eq!(generation, 2);
+        assert!(
+            !engine
+                .evaluate(&command_query("session", "git", &["git", "status"]))
+                .allow
+        );
+    }
+
+    #[test]
+    fn failed_reload_keeps_last_good_policies() {
+        let schema = crate::cedar::schema::load().unwrap();
+        let d = dir_with(&[("p.cedar", MATRIX)]);
+        let engine = Engine::bootstrap(schema, d.path().to_path_buf()).unwrap();
+
+        std::fs::write(d.path().join("p.cedar"), "permit (this is not cedar").unwrap();
+        assert!(engine.reload().is_err());
+
+        assert_eq!(
+            engine.snapshot().generation,
+            1,
+            "generation must not advance"
+        );
+        assert!(
+            engine
+                .evaluate(&command_query("session", "git", &["git", "status"]))
+                .allow,
+            "a broken edit must not brick a running agent"
+        );
+    }
+
+    #[test]
+    fn failed_reload_on_schema_violation_keeps_last_good() {
+        let schema = crate::cedar::schema::load().unwrap();
+        let d = dir_with(&[("p.cedar", MATRIX)]);
+        let engine = Engine::bootstrap(schema, d.path().to_path_buf()).unwrap();
+
+        std::fs::write(
+            d.path().join("p.cedar"),
+            r#"permit (principal, action == Nono::Action::"launchCommand", resource)
+               when { resource.cwd == "/tmp" };"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            engine.reload(),
+            Err(PolicyLoadError::Validation { .. })
+        ));
+        assert_eq!(
+            engine.snapshot().generation,
+            1,
+            "generation must not advance"
+        );
+        assert!(
+            engine
+                .evaluate(&command_query("session", "git", &["git", "status"]))
+                .allow
+        );
+    }
 }
