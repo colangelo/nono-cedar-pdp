@@ -243,8 +243,9 @@ suspicious allow is traceable.
 - **Design spec:** [`docs/superpowers/specs/2026-07-25-nono-cedar-pdp-design.md`](docs/superpowers/specs/2026-07-25-nono-cedar-pdp-design.md)
 - **Implementation plan:** [`docs/superpowers/plans/2026-07-25-nono-cedar-pdp-v1.md`](docs/superpowers/plans/2026-07-25-nono-cedar-pdp-v1.md)
 - **ADR-001 — Rust + embedded `cedar-policy`:** [`docs/adr/ADR-001-rust-and-cedar-crate.md`](docs/adr/ADR-001-rust-and-cedar-crate.md)
-- **Research:** [`docs/research/00-groundwork.md`](docs/research/00-groundwork.md) (upstream contract),
-  [`docs/research/01-landscape.md`](docs/research/01-landscape.md) (prior art)
+- **Research:** [`docs/research/00-groundwork.md`](docs/research/00-groundwork.md) — groundwork
+  from inspecting the upstream nono tree; [`docs/research/01-landscape.md`](docs/research/01-landscape.md)
+  — landscape of self-hostable agent sandboxes and their policy-engine integration points
 - **Change proposal & requirements:** [`openspec/changes/add-cedar-pdp-v1/`](openspec/changes/add-cedar-pdp-v1/)
 
 ## License
