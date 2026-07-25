@@ -114,14 +114,19 @@ async fn run_serve(config_path: &std::path::Path) -> Result<(), String> {
     // watch and every later policy edit would be ignored until a restart.
     let _watcher = nono_cedar_pdp::watcher::spawn(Arc::clone(&engine))
         .map_err(|e| format!("starting policy watcher: {e}"))?;
-    let audit = Arc::new(AuditLog::open(&config.audit_log).map_err(|e| e.to_string())?);
+    let audit = Arc::new(
+        AuditLog::open(&config.audit_log)
+            .map_err(|e| format!("opening audit log {}: {e}", config.audit_log.display()))?,
+    );
     let bind = config.bind;
     let state = server::AppState {
         engine,
         config: Arc::new(config),
         audit,
     };
-    server::serve(state, bind).await.map_err(|e| e.to_string())
+    server::serve(state, bind)
+        .await
+        .map_err(|e| format!("serving on {bind}: {e}"))
 }
 
 fn run_check(
@@ -138,7 +143,10 @@ fn run_check(
     let decision = engine.evaluate(&query);
     match nono_cedar_pdp::audit::AuditLog::open(&config.audit_log) {
         Ok(log) => log.record(&query, &decision),
-        Err(e) => eprintln!("warning: audit log unavailable: {e}"),
+        Err(e) => eprintln!(
+            "warning: audit log {} unavailable: {e}",
+            config.audit_log.display()
+        ),
     }
     Ok(decision)
 }
