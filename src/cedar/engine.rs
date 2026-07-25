@@ -299,20 +299,41 @@ pub fn load_dir(
     schema: &Schema,
     generation: u64,
 ) -> Result<LoadedPolicies, PolicyLoadError> {
-    let candidates = std::fs::read_dir(dir)
-        .map_err(|source| PolicyLoadError::Io {
+    let listing = std::fs::read_dir(dir).map_err(|source| PolicyLoadError::Io {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    load_entries(dir, listing.map(|e| e.map(|e| e.path())), schema, generation)
+}
+
+/// The whole load, from a directory listing already in hand. Split from
+/// [`load_dir`] so a unit test can inject an `Err` entry — the enumeration
+/// failure `read_dir` can yield on a real filesystem but no hermetic test can
+/// produce (same seam style as `audit::ByteSink`); the production call site
+/// above stays one line.
+fn load_entries(
+    dir: &Path,
+    listing: impl IntoIterator<Item = std::io::Result<PathBuf>>,
+    schema: &Schema,
+    generation: u64,
+) -> Result<LoadedPolicies, PolicyLoadError> {
+    // A skip is announced, never silent — and a skip is only ever a *classified*
+    // file. An entry the listing itself fails to yield is refused outright: the
+    // loader cannot classify what it could not read, so it cannot know the entry
+    // was not a policy, and an unreadable entry in a policy directory is the
+    // shape of a tampering symptom. The failure belongs to enumerating `dir`,
+    // not to any named file, hence `Io` rather than `ReadFile`.
+    let mut entries: Vec<PathBuf> = Vec::new();
+    for entry in listing {
+        let path = entry.map_err(|source| PolicyLoadError::Io {
             path: dir.to_path_buf(),
             source,
-        })?
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "cedar"));
-
-    // A skip is announced, never silent: the file is a policy the operator wrote
-    // and this daemon will not enforce, and the log is the only place they can
-    // find that out.
-    let mut entries: Vec<PathBuf> = Vec::new();
-    for path in candidates {
+        })?;
+        if !path.extension().is_some_and(|e| e == "cedar") {
+            continue;
+        }
+        // The file is a policy the operator wrote and this daemon will not
+        // enforce, and the log is the only place they can find that out.
         match policy_file_skip_reason(&path) {
             Some(reason) => tracing::warn!(
                 path = %path.display(),
@@ -735,6 +756,39 @@ when { resource.args.contains("--force") };
         assert!(
             !log.contains("10-git.cedar"),
             "a file that WAS loaded must not be reported as skipped: {log:?}"
+        );
+    }
+
+    /// An entry the listing itself fails to yield must fail the load, never be
+    /// silently dropped: the loader cannot classify what it could not read, so it
+    /// cannot know the entry was not a policy — and an unreadable entry in a
+    /// policy directory is the shape of a tampering symptom. Injected through the
+    /// seam because a real `read_dir` entry error cannot be produced hermetically;
+    /// the error is the *directory's* (enumeration), distinguishable from the
+    /// per-file `ReadFile` error, or the operator debugs the wrong thing.
+    #[test]
+    fn an_unenumerable_directory_entry_fails_the_load_naming_the_directory() {
+        let schema = crate::cedar::schema::load().unwrap();
+        let d = dir_with(&[("git.cedar", GOOD)]);
+        let listing = [
+            Ok(d.path().join("git.cedar")),
+            Err(std::io::Error::other("Input/output error")),
+        ];
+
+        let err = load_entries(d.path(), listing, &schema, 1).unwrap_err();
+        assert!(matches!(err, PolicyLoadError::Io { .. }), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("reading policy dir"),
+            "the failure belongs to enumeration, not to a named file: {text}"
+        );
+        assert!(
+            text.contains(&d.path().display().to_string()),
+            "the directory must be named: {text}"
+        );
+        assert!(
+            !text.contains("reading policy file"),
+            "an enumeration failure must not read as a per-file one: {text}"
         );
     }
 
@@ -1393,6 +1447,50 @@ when { resource.arg_count + 9223372036854775807 > 0 };
                 ))
                 .allow,
             "a broken edit must not brick a running agent"
+        );
+    }
+
+    /// The directory-level shape of the enumeration failure — the only one a
+    /// hermetic test can produce at reload, since a per-entry error needs the
+    /// injection seam above. Retention is the existing machinery: `reload`
+    /// returns the error, the last-good set keeps deciding, and the error names
+    /// the directory so the operator debugs enumeration, not a file.
+    #[test]
+    fn a_reload_that_cannot_enumerate_the_directory_keeps_the_last_good_set() {
+        use std::os::unix::fs::PermissionsExt;
+        let schema = crate::cedar::schema::load().unwrap();
+        let d = dir_with(&[("p.cedar", MATRIX)]);
+        let engine = Engine::bootstrap(schema, d.path().to_path_buf()).unwrap();
+
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = engine.reload().unwrap_err();
+        // Restore before asserting so the tempdir can clean up after itself.
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(matches!(err, PolicyLoadError::Io { .. }), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("reading policy dir"),
+            "an enumeration failure, not a per-file one: {text}"
+        );
+        assert!(
+            text.contains(&d.path().display().to_string()),
+            "the directory must be named: {text}"
+        );
+        assert_eq!(
+            engine.snapshot().generation,
+            1,
+            "generation must not advance"
+        );
+        assert!(
+            engine
+                .evaluate(&command_query(
+                    "session",
+                    "git",
+                    &[crate::wire::EXAMPLE_SHIM_ARGV0, "status"]
+                ))
+                .allow,
+            "the last-good set must keep deciding"
         );
     }
 

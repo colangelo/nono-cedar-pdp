@@ -17,9 +17,9 @@ filtered test runs must both pass.
 
 ## 3. load_dir silent drop (#26)
 
-- [ ] 3.1 Refactor the directory-entry iteration behind a seam that accepts `io::Result` entries (production call site unchanged in behaviour); all existing loader tests still pass
-- [ ] 3.2 Failing test: an injected `Err` entry fails the load with an error naming the directory — never a silent drop; message distinguishes enumeration failure from per-file read failure
-- [ ] 3.3 Test: at reload, the enumeration failure retains the last-known-good set (existing retention machinery; assert the ERROR log names the directory)
+- [x] 3.1 Refactor the directory-entry iteration behind a seam that accepts `io::Result` entries (production call site unchanged in behaviour); all existing loader tests still pass
+- [x] 3.2 Failing test: an injected `Err` entry fails the load with an error naming the directory — never a silent drop; message distinguishes enumeration failure from per-file read failure
+- [x] 3.3 Test: at reload, the enumeration failure retains the last-known-good set (existing retention machinery; assert the ERROR log names the directory)
 
 ## 4. Endpoint-path guard bypass (#27)
 

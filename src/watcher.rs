@@ -261,6 +261,58 @@ mod tests {
         );
     }
 
+    /// The reload half of "an unenumerable listing is never a silent drop", from
+    /// the operator's chair: the policy directory stops being listable
+    /// mid-session. The last-good set must keep deciding and the refusal must be
+    /// on the log at ERROR naming the directory. In the serve path the pre-reload
+    /// trust re-check reads the same listing and refuses first, so that is the
+    /// branch that usually fires here; retention on the reload error itself is
+    /// pinned at the engine level
+    /// (`a_reload_that_cannot_enumerate_the_directory_keeps_the_last_good_set`).
+    #[test]
+    fn an_unlistable_policy_dir_mid_session_keeps_last_good_and_logs_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = dir.path().join("p.cedar");
+        std::fs::write(&policy, POLICY).unwrap();
+        let schema = crate::cedar::schema::load().unwrap();
+        let engine = Arc::new(
+            crate::cedar::engine::Engine::bootstrap(schema, dir.path().to_path_buf()).unwrap(),
+        );
+        let capture = crate::test_log::capture();
+        let _watcher = spawn(Arc::clone(&engine)).unwrap();
+
+        // Write+execute, no read: a new file can still be created (the watch
+        // event), but the listing fails with EACCES — the closest hermetic
+        // stand-in for an enumeration failure at reload time. The new file is
+        // deliberately not valid Cedar, so even a straggling event after the
+        // repair below cannot advance the generation and race the assertions.
+        chmod(dir.path(), 0o300);
+        std::fs::write(dir.path().join("q.cedar"), "not cedar at all").unwrap();
+
+        assert!(
+            within(Duration::from_secs(5), || capture.text().contains("ERROR")),
+            "the refusal must reach the log at ERROR, not a level an operator \
+             filters out: {:?}",
+            capture.text()
+        );
+        chmod(dir.path(), 0o700);
+
+        let log = capture.text();
+        assert!(
+            log.contains(&dir.path().display().to_string()),
+            "the ERROR must name the directory: {log:?}"
+        );
+        assert_eq!(
+            engine.snapshot().generation,
+            1,
+            "the last-good set must stay active: {log:?}"
+        );
+        assert!(
+            engine.evaluate(&git_status()).allow,
+            "the last-good set must keep deciding"
+        );
+    }
+
     /// A refusal must not take the watch down with it: the loosening may be a
     /// transient `chmod`, and a dead watcher would freeze the daemon on the
     /// last-good set forever while looking healthy. Repairing the mode and editing
