@@ -157,8 +157,10 @@ are the ones in the note at the top of this file.
 ## Post-audit remediation
 
 Groups 1–10 are v1 as planned: implemented, 95 tests, committed, nothing audited yet.
-Everything after them is remediation, and the order matters — three of the five
-findings that produced them were **wrong-allows in shipped code**, not gaps in a plan.
+Everything after them is remediation, and the order matters, because four of those
+findings were **wrong-allows in code that had already shipped** — not gaps in a plan:
+D12's fail-open `forbid`, D13's agent-writable policy directory, D14's
+`git -c core.fsmonitor=<cmd> status`, D15's `/repos/../user/keys`.
 
 | Group | Triggered by | What it changed |
 |---|---|---|
