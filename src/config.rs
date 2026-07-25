@@ -16,6 +16,12 @@ pub enum ConfigError {
     },
     #[error("parsing config: {0}")]
     Parse(#[from] toml::de::Error),
+    #[error(
+        "bind = \"{bind}\" is not a loopback address — nono sends no credential \
+         and cannot authenticate the decider, so an unauthenticated PDP must not \
+         be reachable from other hosts; use 127.0.0.1 or [::1]"
+    )]
+    NonLoopbackBind { bind: SocketAddr },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -67,7 +73,15 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
-        Ok(toml::from_str(&text)?)
+        let config: Config = toml::from_str(&text)?;
+        // The one setting that can remove the daemon's only access control. A
+        // hard error, not a warning: nothing legitimate needs the PDP reachable
+        // from another host, and the mistake is invisible until someone else
+        // decides your approvals.
+        if !config.bind.ip().is_loopback() {
+            return Err(ConfigError::NonLoopbackBind { bind: config.bind });
+        }
+        Ok(config)
     }
 
     /// Resolve the Cedar `Agent` identity for a nono approval-backend name.
@@ -119,6 +133,36 @@ cedar = "claude-code"
     fn rejects_unknown_config_keys() {
         let f = write_config("policy_dir = \"/tmp/p\"\nplicy_dir = \"typo\"\n");
         assert!(matches!(Config::load(f.path()), Err(ConfigError::Parse(_))));
+    }
+
+    /// nono sends no credential and cannot authenticate the decider, so the only
+    /// access control this daemon has is being unreachable from other hosts. A
+    /// config that removes it must not load.
+    #[test]
+    fn rejects_a_non_loopback_bind() {
+        for bind in ["0.0.0.0:18182", "192.168.4.200:8181", "[::]:8181"] {
+            let f = write_config(&format!("policy_dir = \"/tmp/p\"\nbind = \"{bind}\"\n"));
+            let err = Config::load(f.path()).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::NonLoopbackBind { .. }),
+                "{bind}: {err}"
+            );
+            let text = err.to_string();
+            assert!(text.contains("loopback"), "{text}");
+            assert!(
+                text.contains(bind),
+                "the message must name the bind: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_loopback_binds() {
+        for bind in ["127.0.0.1:8181", "127.0.0.2:9000", "[::1]:8181"] {
+            let f = write_config(&format!("policy_dir = \"/tmp/p\"\nbind = \"{bind}\"\n"));
+            let c = Config::load(f.path()).unwrap();
+            assert!(c.bind.ip().is_loopback(), "{bind}");
+        }
     }
 
     #[test]
