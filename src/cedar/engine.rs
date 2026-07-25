@@ -136,6 +136,26 @@ impl Engine {
         &self.policy_dir
     }
 
+    /// Evaluate a query. Never returns an error: every failure path is a deny
+    /// with a reason, because nono is waiting on a decision.
+    pub fn evaluate(&self, q: &crate::query::PolicyQuery) -> crate::decision::Decision {
+        use crate::decision::Decision;
+
+        let started = std::time::Instant::now();
+        let (request, entities) = match crate::cedar::entities::build(q, &self.schema) {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to build cedar request; denying");
+                return Decision::deny(format!("could not build policy request: {e}"));
+            }
+        };
+
+        let snapshot = self.snapshot();
+        let response =
+            cedar_policy::Authorizer::new().is_authorized(&request, &snapshot.set, &entities);
+        Decision::from_response(&response, started.elapsed().as_micros())
+    }
+
     /// Swap in a freshly loaded set. On any error the current set is retained
     /// (spec D7: a bad edit mid-session must not brick a running agent).
     pub fn reload(&self) -> Result<u64, PolicyLoadError> {
@@ -248,5 +268,173 @@ when { resource.command == "gh" };
         let engine = Engine::bootstrap(schema, d.path().to_path_buf()).unwrap();
         assert_eq!(engine.snapshot().generation, 1);
         assert_eq!(engine.snapshot().set.num_of_policies(), 2);
+    }
+
+    use crate::query::{CallerKind, PolicyQuery, Target};
+
+    fn command_query(caller: &str, command: &str, args: &[&str]) -> PolicyQuery {
+        PolicyQuery {
+            agent: "claude-code".to_string(),
+            session_id: "s1".to_string(),
+            caller: caller.to_string(),
+            caller_kind: if caller == "session" {
+                CallerKind::Session
+            } else {
+                CallerKind::Command
+            },
+            request_id: "r1".to_string(),
+            backend: "cedar".to_string(),
+            reason: None,
+            target: Target::Command {
+                command: command.to_string(),
+                args: args.iter().map(|a| a.to_string()).collect(),
+                intercept_rule: "rule".to_string(),
+                child_pid: 42,
+            },
+        }
+    }
+
+    fn endpoint_query(method: &str, path: &str) -> PolicyQuery {
+        PolicyQuery {
+            agent: "claude-code".to_string(),
+            session_id: "proxy".to_string(),
+            caller: "proxy".to_string(),
+            caller_kind: CallerKind::Session,
+            request_id: "p1".to_string(),
+            backend: "cedar".to_string(),
+            reason: None,
+            target: Target::Endpoint {
+                route_id: "github-api".to_string(),
+                upstream: "https://api.github.com".to_string(),
+                method: method.to_string(),
+                path: path.to_string(),
+                rule_label: "rl".to_string(),
+            },
+        }
+    }
+
+    const MATRIX: &str = r#"
+@id("allow-git")
+permit (
+  principal in Nono::Agent::"claude-code",
+  action == Nono::Action::"launchCommand",
+  resource
+) when { resource.command == "git" && !resource.args.contains("--force") };
+
+@id("session-only")
+forbid (principal, action == Nono::Action::"launchCommand", resource)
+unless { principal == Nono::Caller::"session" };
+
+@id("allow-github-reads")
+permit (
+  principal in Nono::Agent::"claude-code",
+  action == Nono::Action::"httpRequest",
+  resource
+) when { resource.method == "GET" && resource.path like "/repos/*" };
+"#;
+
+    fn matrix_engine() -> (Engine, tempfile::TempDir) {
+        let schema = crate::cedar::schema::load().unwrap();
+        let d = dir_with(&[("matrix.cedar", MATRIX)]);
+        let engine = Engine::bootstrap(schema, d.path().to_path_buf()).unwrap();
+        (engine, d)
+    }
+
+    #[test]
+    fn allows_a_permitted_command() {
+        let (engine, _d) = matrix_engine();
+        let decision = engine.evaluate(&command_query("session", "git", &["git", "status"]));
+        assert!(decision.allow, "{decision:?}");
+        assert_eq!(decision.matched, vec!["matrix:allow-git".to_string()]);
+        assert!(
+            decision.reason.contains("matrix:allow-git"),
+            "{}",
+            decision.reason
+        );
+    }
+
+    #[test]
+    fn denies_when_a_forbid_matches() {
+        let (engine, _d) = matrix_engine();
+        let decision = engine.evaluate(&command_query("npm", "git", &["git", "status"]));
+        assert!(!decision.allow);
+        assert!(decision.matched.iter().any(|m| m.ends_with("session-only")));
+        assert!(
+            decision.reason.contains("session-only"),
+            "{}",
+            decision.reason
+        );
+    }
+
+    #[test]
+    fn denies_with_default_deny_reason_when_nothing_matches() {
+        let (engine, _d) = matrix_engine();
+        let decision =
+            engine.evaluate(&command_query("session", "curl", &["curl", "evil.example"]));
+        assert!(!decision.allow);
+        assert!(decision.matched.is_empty());
+        assert!(
+            decision.reason.contains("no policy"),
+            "empty reason set needs explicit default-deny text, got {}",
+            decision.reason
+        );
+    }
+
+    #[test]
+    fn unmapped_agent_is_denied() {
+        let (engine, _d) = matrix_engine();
+        let mut q = command_query("session", "git", &["git", "status"]);
+        q.agent = "unknown".to_string();
+        assert!(!engine.evaluate(&q).allow);
+    }
+
+    #[test]
+    fn evaluates_endpoint_requests() {
+        let (engine, _d) = matrix_engine();
+        assert!(
+            engine
+                .evaluate(&endpoint_query("GET", "/repos/foo/bar"))
+                .allow
+        );
+        assert!(
+            !engine
+                .evaluate(&endpoint_query("DELETE", "/repos/foo/bar"))
+                .allow
+        );
+    }
+
+    #[test]
+    fn records_evaluation_time() {
+        let (engine, _d) = matrix_engine();
+        let decision = engine.evaluate(&command_query("session", "git", &["git", "status"]));
+        assert!(decision.eval_us > 0);
+    }
+
+    /// A `forbid` that errors at evaluation time is skipped by Cedar, so the
+    /// remaining `permit` yields Allow. We must not trust that Allow.
+    #[test]
+    fn evaluation_errors_force_a_deny_even_when_cedar_says_allow() {
+        let schema = crate::cedar::schema::load().unwrap();
+        let body = r#"
+@id("permit-git")
+permit (principal, action == Nono::Action::"launchCommand", resource)
+when { resource.command == "git" };
+
+@id("overflowing-forbid")
+forbid (principal, action == Nono::Action::"launchCommand", resource)
+when { resource.arg_count + 9223372036854775807 > 0 };
+"#;
+        let d = dir_with(&[("boom.cedar", body)]);
+        let engine = Engine::bootstrap(schema, d.path().to_path_buf()).unwrap();
+        let decision = engine.evaluate(&command_query("session", "git", &["git", "status"]));
+        assert!(
+            !decision.allow,
+            "an errored forbid must not be silently skipped: {decision:?}"
+        );
+        assert!(
+            decision.reason.contains("evaluation error"),
+            "{}",
+            decision.reason
+        );
     }
 }

@@ -21,6 +21,13 @@ enum Command {
         #[arg(long, default_value = "./nono-cedar-pdp.toml")]
         config: PathBuf,
     },
+    /// Evaluate a saved webhook payload against the configured policies.
+    Check {
+        #[arg(long, default_value = "./nono-cedar-pdp.toml")]
+        config: PathBuf,
+        /// Path to a JSON file containing a nono webhook envelope.
+        fixture: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -42,6 +49,25 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::Check { config, fixture } => match run_check(&config, &fixture) {
+            Ok(decision) => {
+                println!(
+                    "{}: {} ({} µs)",
+                    if decision.allow { "ALLOW" } else { "DENY" },
+                    decision.reason,
+                    decision.eval_us
+                );
+                if decision.allow {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            }
+            Err(message) => {
+                eprintln!("FAIL: {message}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 
@@ -51,4 +77,18 @@ fn run_validate(config_path: &std::path::Path) -> Result<usize, String> {
     let loaded =
         cedar::engine::load_dir(&config.policy_dir, &schema, 1).map_err(|e| e.to_string())?;
     Ok(loaded.set.num_of_policies())
+}
+
+fn run_check(
+    config_path: &std::path::Path,
+    fixture: &std::path::Path,
+) -> Result<nono_cedar_pdp::decision::Decision, String> {
+    let config = Config::load(config_path).map_err(|e| e.to_string())?;
+    let schema = cedar::schema::load().map_err(|e| e.to_string())?;
+    let engine = cedar::engine::Engine::bootstrap(schema, config.policy_dir.clone())
+        .map_err(|e| e.to_string())?;
+    let body = std::fs::read(fixture).map_err(|e| e.to_string())?;
+    let query =
+        nono_cedar_pdp::adapter::nono_webhook::parse(&body, &config).map_err(|e| e.to_string())?;
+    Ok(engine.evaluate(&query))
 }

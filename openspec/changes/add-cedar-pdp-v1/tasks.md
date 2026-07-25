@@ -43,12 +43,12 @@ Global gate for every group: `just lint && just test` must pass before the group
 
 ## 6. Entity building, decisions, and the check CLI
 
-- [ ] 6.1 Write failing evaluation tests in `src/cedar/engine.rs`: allow names the permitting policy (`matrix:allow-git`), forbid names the forbidding policy, nothing-matched gives an empty matched list and a "no policy" reason, unmapped agent denied, endpoint GET allowed and DELETE denied, `eval_us > 0`. Verify: `cargo test --lib cedar::engine` → fails
-- [ ] 6.2 Implement `src/decision.rs`: `Decision{allow, matched, reason, eval_us}`, `deny()`, `from_response()` (sorted matched ids; **evaluation errors force deny even on Allow**), `to_wire()`
-- [ ] 6.3 Implement `src/cedar/entities.rs`: `build(query, schema) -> (Request, Entities)` with the `Caller in Session in Agent` slice, resource attributes, context pairs (omitting `reason` when absent), and identifier escaping of `\` and `"`
-- [ ] 6.4 Implement `Engine::evaluate` — never returns an error; entity-build failure becomes a logged deny. Verify: `cargo test --lib` → all pass
-- [ ] 6.5 Add the `check <fixture>` subcommand; create `tests/fixtures/git-status.json`. Verify: `cargo run -- check --config ./nono-cedar-pdp.toml tests/fixtures/git-status.json` → `ALLOW: permitted by …`
-- [ ] 6.6 Commit: `feat: cedar entity building, decisions, and check CLI`
+- [x] 6.1 Write failing evaluation tests in `src/cedar/engine.rs`: allow names the permitting policy (`matrix:allow-git`), forbid names the forbidding policy, nothing-matched gives an empty matched list and a "no policy" reason, unmapped agent denied, endpoint GET allowed and DELETE denied, `eval_us > 0`. Verify: `cargo test --lib cedar::engine` → fails
+- [x] 6.2 Implement `src/decision.rs`: `Decision{allow, matched, reason, eval_us}`, `deny()`, `from_response()` (sorted matched ids; **evaluation errors force deny even on Allow**), `to_wire()`
+- [x] 6.3 Implement `src/cedar/entities.rs`: `build(query, schema) -> (Request, Entities)` with the `Caller in Session in Agent` slice, resource attributes, context pairs (omitting `reason` when absent), and identifier escaping of `\` and `"`
+- [x] 6.4 Implement `Engine::evaluate` — never returns an error; entity-build failure becomes a logged deny. Verify: `cargo test --lib` → all pass
+- [x] 6.5 Add the `check <fixture>` subcommand; create `tests/fixtures/git-status.json`. Verify: `cargo run -- check --config ./nono-cedar-pdp.toml tests/fixtures/git-status.json` → `ALLOW: permitted by …`
+- [x] 6.6 Commit: `feat: cedar entity building, decisions, and check CLI`
 
 ## 7. Decision audit log
 
