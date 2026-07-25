@@ -1,3 +1,11 @@
+---
+type: reference
+title: "Landscape: OSS self-hostable macOS agent sandboxes and policy-engine integration points"
+description: "Deep survey establishing the gap this project fills — no OSS local kernel-enforced sandbox embeds Cedar; the decide-externally/enforce-at-a-choke-point pattern exists only one tier up at MCP gateways."
+tags: [research, landscape, cedar, sandboxes, mcp]
+timestamp: 2026-07-25
+---
+
 # nono-cedar-pdp — Landscape: OSS Self-Hostable macOS Agent Sandboxes and Policy-Engine Integration Points
 
 **Document:** docs/research/01-landscape.md · **Date:** 2026-07-25 · **Status:** Research draft

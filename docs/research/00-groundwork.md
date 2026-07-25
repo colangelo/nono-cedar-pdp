@@ -1,3 +1,11 @@
+---
+type: reference
+title: "nono-cedar-pdp — groundwork research"
+description: "Pre-design pass: the PEP/PDP thesis, the initial landscape scan, nono's upstream issue trail, and the discovery that the shipped WebhookApproval backend is already the integration seam."
+tags: [research, nono, cedar, landscape]
+timestamp: 2026-07-25
+---
+
 # nono-cedar-pdp — Groundwork Research
 
 *Date: 2026-07-25. Compiled from web research and inspection of the upstream repo (nolabs-ai/nono @ main, shallow clone).*

@@ -1,3 +1,11 @@
+---
+type: design
+title: "nono-cedar-pdp v1 design"
+description: "The authoritative design: verified upstream contract, decisions D1-D13 with alternatives considered, the Cedar schema and its three caveats, the fail-closed error matrix, and the post-audit args[0]-is-a-shim-path correction."
+tags: [design, cedar, nono, security, fail-closed]
+timestamp: 2026-07-25
+---
+
 # nono-cedar-pdp — v1 Design
 
 **Date:** 2026-07-25 · **Status:** Approved (design review passed; second review pass folded in)

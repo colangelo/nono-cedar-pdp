@@ -1,3 +1,11 @@
+---
+type: design
+title: "ADR-001: Rust, embedding cedar-policy; nono as dev-dependency only"
+description: "Why the PDP is Rust with the cedar-policy crate embedded in-process, and why the nono crate is a dev-dependency guarding wire drift rather than a runtime dependency."
+tags: [adr, rust, cedar, dependencies]
+timestamp: 2026-07-25
+---
+
 # ADR-001: Rust, embedding the `cedar-policy` crate; `nono` as dev-dependency only
 
 **Date:** 2026-07-25 · **Status:** Accepted

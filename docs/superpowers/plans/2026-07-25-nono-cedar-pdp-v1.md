@@ -1,3 +1,11 @@
+---
+type: plan
+title: "nono-cedar-pdp v1 implementation plan"
+description: "Ten task groups, TDD throughout, with spike-verified Cedar API signatures and the upstream wire contract captured as ground truth. Superseded in part by the post-audit args[0] correction it carries a marked block for."
+tags: [plan, implementation, tdd, cedar]
+timestamp: 2026-07-25
+---
+
 # nono-cedar-pdp v1 Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
