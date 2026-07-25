@@ -135,10 +135,19 @@ it SHALL deny an endpoint request whose path's meaning depends on normalisation 
 **before any policy is consulted**, with a deny reason naming the ambiguity and the path
 as sent. Unambiguous paths SHALL continue to be evaluated with the raw path value.
 
-A path SHALL be treated as ambiguous when, over the part of the target before any `?` or
-`#`:
+The examined part of the target SHALL be everything before the first raw `?`, and no
+other truncation SHALL be applied. RFC 3986 §5.2.4 defines `remove_dot_segments` over the
+path component alone, so excluding the query is a specified boundary rather than an
+assumption about the upstream. In particular a raw `#` SHALL NOT end the scan: an
+origin-form request target carries no fragment (RFC 9112 §3.2.1), so whether an upstream
+treats a raw `#` as a delimiter is exactly the kind of upstream-dependent meaning this
+requirement refuses to guess at.
 
-1. a segment is `.` or `..` after stripping `;`-parameters, at **any** percent-decode
+A path SHALL be treated as ambiguous when, over that part of the target:
+
+1. a segment is `.` or `..` after stripping `;`-parameters — where segments are separated
+   by `/` **or `\`**, the WHATWG URL standard folding a backslash onto a forward slash for
+   http(s) — at **any** percent-decode
    depth up to a bound the service SHALL declare — not merely the first, because the
    service cannot know how many decode hops sit between it and the origin, so
    `%252e%252e` is refused for the same reason as `%2e%2e`;
@@ -150,9 +159,29 @@ A path SHALL be treated as ambiguous when, over the part of the target before an
 
 Ambiguity SHALL NOT be inferred from the query string (a `..` in a query value cannot
 change which resource the origin routes to, and `?path=../x` is an ordinary API
-parameter), from dots inside a segment (`/repos/foo..bar`), or from an undecodable escape
-that appears only *after* the first decode pass — `/x/50%25-done` legitimately decodes to
-`50%-done`, whose stray `%` is data.
+parameter), from dots inside a segment (`/repos/foo..bar`), from a `#` or `\` that is not
+part of a `.`/`..` segment (`/issues/issue#5`, `/repos/foo\bar`), or from an undecodable
+escape that appears only *after* the first decode pass — `/x/50%25-done` legitimately
+decodes to `50%-done`, whose stray `%` is data.
+
+#### Scenario: A traversal after a raw `#` is denied
+
+- **WHEN** an endpoint request carries `path` `/repos/x#/../user/keys` and the policy set contains a permit guarded by `resource.path like "/repos/*"`
+- **THEN** the decision is deny with the ambiguous-path reason, because a raw `#` does not end the examined target
+- **AND WHEN** the path is `/issues/issue#5`, which contains no `.`/`..` segment
+- **THEN** the request is decided by policy as normal
+
+#### Scenario: A traversal built from backslash separators is denied
+
+- **WHEN** an endpoint request carries `path` `/repos/..\..\user/keys`, or its encoded form `/repos/%5c..%5c/user/keys`
+- **THEN** the decision is deny with the ambiguous-path reason
+- **AND WHEN** the path is `/repos/foo\bar`, where no segment is `.` or `..`
+- **THEN** the request is decided by policy as normal
+
+#### Scenario: A traversal inside the query string is not denied
+
+- **WHEN** an endpoint request carries `path` `/repos/foo/bar?path=../x`
+- **THEN** the request is decided by policy as normal, because the query is outside the path component `remove_dot_segments` is defined over
 
 #### Scenario: A literal traversal segment is denied without policy evaluation
 

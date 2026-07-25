@@ -299,9 +299,14 @@ oversights.
    is refused **before any policy is consulted**, with a reason naming the ambiguity:
    a `.`/`..` segment at any percent-decode depth (so `%2e%2e`, `%252e%252e` and
    `..;/` are covered), a malformed percent-escape, a decode that yields non-UTF-8
-   bytes (overlong encodings can hide a `.`), or encoding nested more than 8 deep. A
-   `..` inside the *query* is not ambiguous — it cannot move which resource the origin
-   routes to. Unambiguous paths reach policy exactly as nono sent them.
+   bytes (overlong encodings can hide a `.`), or encoding nested more than 8 deep.
+   Segments are separated by `/` **or `\`** — the WHATWG URL standard folds a backslash
+   onto a slash for http(s), so `..\..\` is traversal too. The scan stops at the first
+   raw `?` and nowhere else: a `..` inside the *query* is not ambiguous, because
+   RFC 3986 defines path normalisation over the path component alone and `?path=../x`
+   is an ordinary API parameter. A raw `#` does **not** stop it — an origin-form request
+   target carries no fragment, so `/repos/x#/../user/keys` is denied while a plain
+   `/issues/issue#5` is not. Unambiguous paths reach policy exactly as nono sent them.
 6. **Endpoint requests carry no session identity.** nono's proxy hardcodes
    `session_id: "proxy"` and `child_pid: 0`. Rather than echo whatever the payload
    claims, the daemon *pins* `Nono::Caller::"proxy"` in `Nono::Session::"proxy"`, so a

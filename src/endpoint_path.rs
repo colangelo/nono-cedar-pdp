@@ -76,11 +76,23 @@ impl Ambiguity {
 pub fn ambiguity(path: &str) -> Option<Ambiguity> {
     // Only the routing part of the target: nono sends the raw request line's target,
     // query string included. A `..` inside a query *value* cannot change which
-    // resource the origin routes to, so treating one as traversal would reject
-    // legitimate calls (`?path=../x` is an ordinary API parameter). A `?` that
-    // arrives percent-encoded is deliberately NOT treated as a separator, because
-    // the upstream will not either — it stays in the analysed path below.
-    let routing = path.split(['?', '#']).next().unwrap_or(path);
+    // resource the origin routes to — RFC 3986 §5.2.4 defines `remove_dot_segments`
+    // over the path component alone — so treating one as traversal would reject
+    // legitimate calls (`?path=../x` is an ordinary API parameter). That makes `?`
+    // a *specified* boundary rather than a guess about the upstream, which is why it
+    // is the only truncation here. A `?` that arrives percent-encoded is deliberately
+    // NOT a separator, because the upstream will not treat it as one either — it
+    // stays in the analysed path below.
+    //
+    // `#` is deliberately NOT a separator, unlike `?`. An origin-form request target
+    // carries no fragment (RFC 9112 §3.2.1) — a conforming client percent-encodes it
+    // as `%23` — so a raw `#` reaching us is either a literal path character or
+    // something a proxy reconstructed, and whether the upstream splits on it is
+    // exactly the upstream-dependent meaning this guard refuses to guess at.
+    // Truncating there hid `/repos/x#/../user/keys`; reading through it denies that
+    // while leaving a harmless `/issues/issue#5` alone. Removing a guess, not adding
+    // one — which is why this is a scan-through rather than a blanket deny on `#`.
+    let routing = path.split('?').next().unwrap_or(path);
 
     let mut current = routing.to_string();
     for passes in 0..=MAX_DECODE_PASSES {
@@ -111,8 +123,13 @@ pub fn ambiguity(path: &str) -> Option<Ambiguity> {
 /// friends) strip `;jsessionid=…` style parameters before resolving the path, which
 /// makes `/repos/..;/user/keys` a traversal there and a literal segment elsewhere —
 /// exactly the kind of divergence that makes the path's meaning unknowable from here.
+/// Segments split on `/` **and `\`**. The WHATWG URL standard folds a backslash onto a
+/// forward slash for special schemes (http/https), so browsers and a good deal of
+/// server-side URL handling read `..\..` as traversal. Covering the `;`-parameter quirk
+/// while omitting this one would be inconsistent rather than principled — both are cases
+/// where the upstream may see a segment boundary we would not.
 fn dot_segment(path: &str) -> Option<String> {
-    path.split('/')
+    path.split(['/', '\\'])
         .map(|segment| segment.split(';').next().unwrap_or(segment))
         .find(|segment| *segment == "." || *segment == "..")
         .map(str::to_string)
@@ -189,6 +206,15 @@ mod tests {
             "/repos/./user/keys",     // single-dot segment
             "/repos/foo/..",          // trailing traversal
             "..",                     // nothing but a traversal
+            // A raw `#` does not end the scan: an origin-form target carries no
+            // fragment (RFC 9112 §3.2.1), so whether the upstream splits there is its
+            // business, not something to assume. Truncating hid this one.
+            "/repos/x#/../user/keys",
+            "/repos/x#/%2e%2e/user/keys", // ...and still after a decode pass
+            // Backslash separators: WHATWG folds `\` onto `/` for http(s).
+            "/repos/..\\..\\user/keys",
+            "/repos/foo\\../user/keys",
+            "/repos/%5c..%5c/user/keys", // encoded backslash, caught after decoding
         ] {
             let found = ambiguity(path);
             assert!(
@@ -232,7 +258,10 @@ mod tests {
             "/repos/.hidden",            // leading dot is a name
             "/repos/foo/bar?ref=..",     // a `..` in the query cannot move the route
             "/repos/foo/bar?path=../x",  // ditto, the common API-parameter shape
-            "/repos/foo/bar#..",         // fragments are not even sent upstream
+            "/repos/foo/bar?q=..\\..",   // backslashes in a query are data too
+            "/repos/foo/bar#..",         // `bar#..` is one segment, not a `..` segment
+            "/issues/issue#5",           // a raw `#` alone is not traversal
+            "/repos/foo/bar\\baz",       // a backslash alone is not traversal either
             "/repos/50%25-done",         // legitimately encoded `%`, decodes to `50%-done`
             "/repos/foo%2Fbar/contents", // encoded separator, no traversal
             "/repos/caf%C3%A9",          // ordinary UTF-8 escape
