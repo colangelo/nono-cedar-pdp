@@ -45,7 +45,6 @@ fn state(dir: &tempfile::TempDir) -> server::AppState {
         policy_dir: dir.path().to_path_buf(),
         audit_log: dir.path().join("decisions.jsonl"),
         agents,
-        unknown_agent: "unknown".to_string(),
     };
     let schema = cedar::schema::load().unwrap();
     let engine = cedar::engine::Engine::bootstrap(schema, config.policy_dir.clone()).unwrap();

@@ -575,7 +575,6 @@ mod tests {
             policy_dir: dir.path().to_path_buf(),
             audit_log: dir.path().join("unused.jsonl"),
             agents,
-            unknown_agent: "unknown".to_string(),
         };
         // Zero bytes of space: every record fails, and there is nothing to roll back.
         let full = FullDisk::with_budget(0);

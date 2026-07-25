@@ -177,7 +177,6 @@ mod tests {
             policy_dir: dir.path().to_path_buf(),
             audit_log: dir.path().join("decisions.jsonl"),
             agents,
-            unknown_agent: "unknown".to_string(),
         };
         let empty = crate::cedar::engine::LoadedPolicies {
             set: cedar_policy::PolicySet::new(),

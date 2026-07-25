@@ -4,10 +4,10 @@ TDD throughout: failing test first, watched failing for the right reason.
 
 ## 1. Constant and config removal
 
-- [ ] 1.1 Failing test: a config setting `unknown_agent = "anything"` fails to load and the error text names `unknown_agent` (pin the serde deny_unknown_fields message for this key)
-- [ ] 1.2 Failing test: the shipped `policies/00-baseline.cedar` `no-unknown-agents` forbid names exactly `Nono::Agent::"<config::UNKNOWN_AGENT>"` — the constant and the shipped pack cannot drift apart
-- [ ] 1.3 Implement: add `pub const UNKNOWN_AGENT: &str = "unknown"` to `config`; remove the `unknown_agent` field, its serde default fn, and its default-value assertion; `agent_for` falls back to the constant
-- [ ] 1.4 Update every `Config { .. }` struct literal in tests (`adapter/nono_webhook.rs`, `server.rs`, `audit.rs`) — the compiler enumerates them; no test may re-introduce the field
+- [x] 1.1 Failing test: a config setting `unknown_agent = "anything"` fails to load and the error text names `unknown_agent` (pin the serde deny_unknown_fields message for this key)
+- [x] 1.2 Failing test: the shipped `policies/00-baseline.cedar` `no-unknown-agents` forbid names exactly `Nono::Agent::"<config::UNKNOWN_AGENT>"` — the constant and the shipped pack cannot drift apart
+- [x] 1.3 Implement: add `pub const UNKNOWN_AGENT: &str = "unknown"` to `config`; remove the `unknown_agent` field, its serde default fn, and its default-value assertion; `agent_for` falls back to the constant
+- [x] 1.4 Update every `Config { .. }` struct literal in tests (`adapter/nono_webhook.rs`, `server.rs`, `audit.rs`) — the compiler enumerates them; no test may re-introduce the field (it also enumerated `tests/server.rs` and `tests/policies.rs`)
 
 ## 2. Documentation
 

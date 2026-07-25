@@ -7,6 +7,13 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+/// The identity an unmapped approval-backend name resolves to. Deliberately not
+/// configurable: the shipped baseline pack forbids `Nono::Agent::"unknown"` by
+/// exactly this name, and a knob that renames the fallback silently disables
+/// that deny (issue #25). `tests/policies.rs` asserts the shipped
+/// `00-baseline.cedar` names this constant, so the two cannot drift apart.
+pub const UNKNOWN_AGENT: &str = "unknown";
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("reading config {path}: {source}")]
@@ -35,8 +42,6 @@ pub struct Config {
     pub audit_log: PathBuf,
     #[serde(default)]
     pub agents: BTreeMap<String, String>,
-    #[serde(default = "default_unknown_agent")]
-    pub unknown_agent: String,
 }
 
 fn default_bind() -> SocketAddr {
@@ -45,10 +50,6 @@ fn default_bind() -> SocketAddr {
 
 fn default_audit_log() -> PathBuf {
     expand_tilde("~/.local/state/nono-cedar-pdp/decisions.jsonl")
-}
-
-fn default_unknown_agent() -> String {
-    "unknown".to_string()
 }
 
 fn de_path<'de, D: serde::Deserializer<'de>>(d: D) -> Result<PathBuf, D::Error> {
@@ -85,11 +86,13 @@ impl Config {
     }
 
     /// Resolve the Cedar `Agent` identity for a nono approval-backend name.
+    /// An unmapped name falls back to the fixed [`UNKNOWN_AGENT`] identity the
+    /// shipped baseline denies, so a missing `[agents]` entry is a loud deny.
     pub fn agent_for(&self, backend: &str) -> &str {
         self.agents
             .get(backend)
             .map(String::as_str)
-            .unwrap_or(&self.unknown_agent)
+            .unwrap_or(UNKNOWN_AGENT)
     }
 }
 
@@ -111,7 +114,6 @@ mod tests {
         let c = Config::load(f.path()).unwrap();
         assert_eq!(c.bind.to_string(), "127.0.0.1:8181");
         assert_eq!(c.policy_dir, std::path::Path::new("/tmp/policies"));
-        assert_eq!(c.unknown_agent, "unknown");
         assert!(c.agents.is_empty());
     }
 
@@ -126,7 +128,7 @@ cedar = "claude-code"
         );
         let c = Config::load(f.path()).unwrap();
         assert_eq!(c.agent_for("cedar"), "claude-code");
-        assert_eq!(c.agent_for("something-else"), "unknown");
+        assert_eq!(c.agent_for("something-else"), UNKNOWN_AGENT);
     }
 
     /// The point of a strict schema is that a typo is loud. "Loud" is the message,
@@ -145,6 +147,28 @@ cedar = "claude-code"
         assert!(
             text.contains("policy_dir"),
             "and the keys that do exist: {text}"
+        );
+    }
+
+    /// `unknown_agent` used to rename the fallback identity an unmapped backend
+    /// resolves to — which silently disabled the shipped baseline's
+    /// `no-unknown-agents` forbid, because that forbid names `Agent::"unknown"`
+    /// literally (issue #25). The knob is gone; a config still carrying it must
+    /// fail loudly with a message that names the key, so the operator learns the
+    /// setting was removed rather than having it silently ignored.
+    #[test]
+    fn rejects_the_removed_unknown_agent_knob() {
+        let f = write_config("policy_dir = \"/tmp/p\"\nunknown_agent = \"anything\"\n");
+        let err = Config::load(f.path()).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("unknown field `unknown_agent`"),
+            "the message must name the removed key: {text}"
+        );
+        assert!(
+            text.contains("policy_dir"),
+            "and the keys that still exist: {text}"
         );
     }
 

@@ -154,7 +154,6 @@ mod tests {
             policy_dir: "/tmp/p".into(),
             audit_log: "/tmp/a.jsonl".into(),
             agents,
-            unknown_agent: "unknown".to_string(),
         }
     }
 

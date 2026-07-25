@@ -23,7 +23,6 @@ fn config() -> Config {
         policy_dir: PathBuf::from(POLICY_DIR),
         audit_log: PathBuf::from("/dev/null"),
         agents,
-        unknown_agent: "unknown".to_string(),
     }
 }
 
@@ -305,6 +304,32 @@ fn an_unmapped_approval_backend_is_denied() {
             .matched
             .contains(&"00-baseline:no-unknown-agents".to_string()),
         "{decision:?}"
+    );
+}
+
+/// The resolver's fallback and the baseline forbid are the same exported
+/// constant, so "unmapped backend ⇒ denied by the baseline" is structural, not a
+/// coincidence of two defaults agreeing. The guard reads the pack that ships —
+/// `policies/00-baseline.cedar`, the artifact `just install-policies` copies —
+/// so neither side can drift silently (same spirit as `tests/docs.rs` guarding
+/// the README).
+#[test]
+fn the_baseline_forbid_names_the_exported_fallback_constant() {
+    let baseline =
+        std::fs::read_to_string(Path::new(POLICY_DIR).join("00-baseline.cedar")).unwrap();
+    let set = cedar_policy::PolicySet::from_str(&baseline).unwrap();
+    let forbid = set
+        .policies()
+        .find(|p| p.annotation("id").map(AsRef::as_ref) == Some("no-unknown-agents"))
+        .unwrap_or_else(|| panic!("the shipped baseline lost its no-unknown-agents forbid"));
+    assert_eq!(forbid.effect(), cedar_policy::Effect::Forbid, "{forbid}");
+    let needle = format!(
+        "Nono::Agent::\"{}\"",
+        nono_cedar_pdp::config::UNKNOWN_AGENT
+    );
+    assert!(
+        forbid.to_string().contains(&needle),
+        "the forbid must name the resolver's fallback {needle}: {forbid}"
     );
 }
 
