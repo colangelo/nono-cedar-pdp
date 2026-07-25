@@ -1090,6 +1090,7 @@ when { resource.command == "gh" };
                 method: method.to_string(),
                 path: path.to_string(),
                 rule_label: "rl".to_string(),
+                child_pid: 0,
             },
         }
     }

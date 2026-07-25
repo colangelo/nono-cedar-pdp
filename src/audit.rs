@@ -26,9 +26,11 @@ pub struct AuditRecord<'a> {
     pub principal: Option<String>,
     pub action: Option<&'a str>,
     pub resource: Option<String>,
-    /// The pid of the intercepted child, as sent. Upstream hardcodes 0 for its
-    /// proxy's endpoint requests; null only on a rejected line, where no request
-    /// was ever parsed.
+    /// The pid of the intercepted child, as sent — echoed from the wire for both
+    /// request variants. Real nono hardcodes 0 for its proxy's endpoint requests;
+    /// a sender claiming otherwise leaves its claim on the record rather than
+    /// having it silently rewritten. Null only on a rejected line, where no
+    /// request was ever parsed.
     pub child_pid: Option<u32>,
     /// The intercept rule that routed a *command* request here — the matched
     /// rule's args joined with spaces (`"status"`, `"push --force"`),
@@ -260,8 +262,12 @@ impl AuditLog {
                 Some(crate::sanitize::control_escape(intercept_rule)),
                 None,
             ),
-            crate::query::Target::Endpoint { rule_label, .. } => (
-                Some(0),
+            crate::query::Target::Endpoint {
+                rule_label,
+                child_pid,
+                ..
+            } => (
+                Some(*child_pid),
                 None,
                 Some(crate::sanitize::control_escape(rule_label)),
             ),
@@ -477,6 +483,7 @@ mod tests {
                 method: "GET".to_string(),
                 path: "/repos/foo/bar".to_string(),
                 rule_label: "endpoint_policy.approve[GET /repos/*]".to_string(),
+                child_pid: 0,
             },
         }
     }
@@ -517,8 +524,8 @@ mod tests {
     }
 
     /// The endpoint half of the same requirement: the route rule label exactly as
-    /// sent, the pid upstream hardcodes to 0 for its proxy, and an explicitly null
-    /// `intercept_rule`.
+    /// sent, the pid as the wire carried it (real nono sends 0 for its proxy),
+    /// and an explicitly null `intercept_rule`.
     #[test]
     fn a_decided_endpoint_line_carries_the_rule_label_and_the_proxys_pid() {
         let dir = tempfile::tempdir().unwrap();

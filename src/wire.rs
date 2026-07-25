@@ -62,7 +62,9 @@ pub struct EndpointRequest {
     pub rule_label: String,
     #[serde(default)]
     pub reason: Option<String>,
-    /// Always 0 — the proxy has no child pid.
+    /// Real nono always sends 0 — the proxy has no child pid. Recorded on the
+    /// audit line as sent, so a sender claiming otherwise leaves its claim on
+    /// the record.
     pub child_pid: u32,
     /// Always `"proxy"` — endpoint requests carry no session identity.
     pub session_id: String,

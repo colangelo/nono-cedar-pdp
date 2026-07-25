@@ -133,6 +133,10 @@ pub fn parse(body: &[u8], config: &Config) -> Result<PolicyQuery, AdaptError> {
                 method: e.method,
                 path: e.path,
                 rule_label: e.rule_label,
+                // Unlike the session identity above, the pid is echoed, not
+                // pinned: it feeds nothing but the audit line, whose job is to
+                // record what was sent (real nono sends 0).
+                child_pid: e.child_pid,
             },
         }),
         ApprovalRequest::Unsupported => Err(AdaptError::UnsupportedVariant),

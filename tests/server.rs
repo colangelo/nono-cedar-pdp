@@ -513,8 +513,9 @@ async fn an_endpoint_envelope_is_decided_and_audited_over_http() {
         "{line:#?}"
     );
     // What routed the request here: the route rule label exactly as sent, the pid
-    // upstream hardcodes to 0 for its proxy, and an explicitly null intercept_rule
-    // — the key set is identical on every line kind.
+    // exactly as the wire carried it (this body sends the 0 real nono hardcodes
+    // for its proxy), and an explicitly null intercept_rule — the key set is
+    // identical on every line kind.
     assert_eq!(
         line["rule_label"], "endpoint_policy.approve[GET /repos/*]",
         "the label must survive as sent: {line:#?}"
@@ -556,6 +557,45 @@ async fn an_endpoint_envelope_is_decided_and_audited_over_http() {
         serde_json::json!([]),
         "{:#?}",
         lines[1]
+    );
+}
+
+/// Fidelity, not paraphrase: real nono hardcodes `child_pid: 0` for its proxy's
+/// endpoint requests, but the audit line records what the wire actually carried.
+/// The first implementation pinned `Some(0)` for endpoints, which *rewrote* the
+/// claim rather than recording it — a sender asserting a pid must leave that
+/// assertion on the record, where an investigator can see it (and see that it is
+/// not what real nono sends).
+#[tokio::test]
+async fn an_endpoint_child_pid_is_recorded_as_sent_not_rewritten_to_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = serde_json::json!({
+        "backend": "cedar",
+        "request": {
+            "capability_type": "endpoint",
+            "request_id": "claimed-pid",
+            "route_id": "github-api",
+            "upstream": "https://api.github.com",
+            "method": "GET",
+            "path": "/repos/foo/bar",
+            "rule_label": "endpoint_policy.approve[GET /repos/*]",
+            "reason": "route requires approval",
+            "child_pid": 7,
+            "session_id": "proxy"
+        }
+    })
+    .to_string();
+
+    let (status, _) = post(&dir, &body).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let lines = audit_lines(&dir);
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert_eq!(
+        lines[0]["child_pid"], 7,
+        "the wire claimed pid 7, so the line must record 7 — recording the claim, \
+         not rewriting it to the 0 real nono would have sent: {:#?}",
+        lines[0]
     );
 }
 

@@ -135,6 +135,11 @@ pub(crate) fn build(q: &PolicyQuery, schema: &Schema) -> Result<(Request, Entiti
             method,
             path,
             rule_label,
+            // Deliberately not an entity attribute or context value: the schema
+            // has no endpoint child_pid, because the wire value is an unverified
+            // claim (real nono sends 0) that exists for audit fidelity, not for
+            // policy to lean on.
+            child_pid: _,
         } => {
             let resource_uid = uid(&format!(
                 "Nono::HttpEndpoint::\"{}\"",
@@ -225,6 +230,7 @@ mod tests {
                 method: "GET".to_string(),
                 path: "/repos/foo/bar".to_string(),
                 rule_label: "rl".to_string(),
+                child_pid: 0,
             },
         }
     }

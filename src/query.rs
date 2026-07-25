@@ -31,6 +31,12 @@ pub enum Target {
         method: String,
         path: String,
         rule_label: String,
+        /// Echoed from the wire for audit fidelity only — real nono's proxy
+        /// sends 0, and a sender claiming otherwise leaves its claim on the
+        /// record. Deliberately absent from the Cedar entity slice: the schema
+        /// has no endpoint `child_pid` attribute, so no policy can lean on an
+        /// unverifiable claim.
+        child_pid: u32,
     },
 }
 
