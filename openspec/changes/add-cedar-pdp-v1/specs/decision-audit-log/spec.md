@@ -40,3 +40,31 @@ A failure to serialize or write an audit record SHALL be logged as an error and 
 
 - **WHEN** the audit log cannot be written
 - **THEN** the error is logged and the decision already computed is still returned to nono unchanged
+
+### Requirement: Keep recording at the configured path across a rotation
+
+An append handle survives a `rename` or `unlink` of the file it was opened on, and
+writes to the detached inode keep succeeding, so a rotated log silently stops
+recording anything an operator can read at the configured path while `/healthz`
+stays green. Before every record the service SHALL check that the handle still
+refers to the configured path — comparing the `st_dev`/`st_ino` of the path against
+the open handle — and SHALL reopen it when it does not, applying the same
+owner-only permissions as a first-time open. A reopen that itself fails SHALL be
+logged as an error and SHALL keep the record on the handle already held, since
+appending to the previous file loses less than dropping the line. Neither the check
+nor a failed reopen SHALL change a decision.
+
+#### Scenario: A renamed log is reopened
+
+- **WHEN** the audit log is renamed while the daemon is running and a further approval request is decided
+- **THEN** the decision is returned unchanged, a file at the configured path holds the record of that decision with `0600` permissions, and the renamed file receives nothing further
+
+#### Scenario: A deleted log is recreated
+
+- **WHEN** the audit log is deleted while the daemon is running and a further approval request is decided
+- **THEN** a file at the configured path is created and holds the record of that decision
+
+#### Scenario: A truncated log is reported
+
+- **WHEN** the audit log is truncated in place — the same inode, fewer bytes — and a further approval request is decided
+- **THEN** the record is written at the configured path and the shrink is logged as a warning, because an append-only log cannot shrink by itself

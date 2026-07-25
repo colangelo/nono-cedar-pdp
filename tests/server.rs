@@ -81,8 +81,14 @@ fn unavailable_state(dir: &tempfile::TempDir) -> server::AppState {
 }
 
 async fn post(dir: &tempfile::TempDir, body: &str) -> (StatusCode, serde_json::Value) {
-    let app = server::router(state(dir));
+    post_to(&server::router(state(dir)), body).await
+}
+
+/// Post to an existing router, so a test can send two requests to *one* daemon
+/// — the only way to observe what happens to long-lived state between decisions.
+async fn post_to(app: &axum::Router, body: &str) -> (StatusCode, serde_json::Value) {
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -282,6 +288,56 @@ async fn every_decision_is_audited() {
     let text = std::fs::read_to_string(dir.path().join("decisions.jsonl")).unwrap();
     assert_eq!(text.lines().count(), 1, "{text}");
     assert!(text.contains("\"decision\":\"allow\""));
+}
+
+/// Rotation happens to a *running* daemon: `logrotate` or an operator renames the
+/// log while the process holds it open. Writes to the renamed inode keep
+/// succeeding, so nothing errors — every later decision is answered and recorded
+/// nowhere an operator can read, while `/healthz` stays green. One daemon, two
+/// requests, a rename in between.
+#[tokio::test]
+async fn decisions_after_a_log_rotation_still_land_at_the_configured_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = server::router(state(&dir));
+    let path = dir.path().join("decisions.jsonl");
+    let rotated = dir.path().join("decisions.jsonl.1");
+
+    let (status, body) = post_to(
+        &app,
+        &command_body_with_request_id("before-rotation", "git", &[SHIM_GIT, "status"]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["decision"], "allow");
+
+    std::fs::rename(&path, &rotated).unwrap();
+
+    let (status, body) = post_to(
+        &app,
+        &command_body_with_request_id("after-rotation", "git", &[SHIM_GIT, "status"]),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an audit failure never changes a decision"
+    );
+    assert_eq!(body["decision"], "allow");
+
+    let lines = audit_lines(&dir);
+    assert_eq!(
+        lines.len(),
+        1,
+        "the reopened log holds exactly the decision made after the rotation: {lines:#?}"
+    );
+    assert_eq!(lines[0]["request_id"], "after-rotation");
+
+    let archived = std::fs::read_to_string(&rotated).unwrap();
+    assert!(archived.contains("before-rotation"), "{archived:?}");
+    assert!(
+        !archived.contains("after-rotation"),
+        "nothing may be appended to the detached inode: {archived:?}"
+    );
 }
 
 /// An oversized body must be refused the same way every other unusable input is:

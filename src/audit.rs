@@ -6,8 +6,8 @@ use crate::query::PolicyQuery;
 use serde::Serialize;
 use std::fs::{File, OpenOptions, Permissions};
 use std::io::Write;
-use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// One audit line.
@@ -33,40 +33,52 @@ pub struct AuditRecord<'a> {
 }
 
 /// Where audit lines go. A trait so the partial-write recovery path can be
-/// tested without an out-of-space filesystem; `File` is the only production impl.
+/// tested without an out-of-space filesystem; [`LogFile`] is the only production
+/// impl.
 trait ByteSink: Send {
     fn append(&mut self, buf: &[u8]) -> std::io::Result<()>;
     fn size(&self) -> std::io::Result<u64>;
     fn truncate(&mut self, len: u64) -> std::io::Result<()>;
-}
-
-impl ByteSink for File {
-    fn append(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        self.write_all(buf)
-    }
-
-    fn size(&self) -> std::io::Result<u64> {
-        Ok(self.metadata()?.len())
-    }
-
-    fn truncate(&mut self, len: u64) -> std::io::Result<()> {
-        self.set_len(len)
+    /// Check that this sink still writes to the place the operator configured, and
+    /// re-point it if it does not. Called before every record.
+    ///
+    /// Default: nothing to check. A sink with no path — the in-memory test sink —
+    /// cannot be detached from one.
+    fn reattach(&mut self) -> Reattach {
+        Reattach::Unchanged
     }
 }
 
-struct Sink {
-    bytes: Box<dyn ByteSink>,
-    /// The last record did not make it out whole, so the file ends mid-line.
-    /// The next record closes that line before starting its own.
-    unterminated: bool,
+/// What [`ByteSink::reattach`] found.
+enum Reattach {
+    /// The sink still writes where it was configured to.
+    Unchanged,
+    /// A fresh handle was opened. `ends_mid_line` describes the file now held, and
+    /// the caller's byte accounting for the previous one no longer applies.
+    Reopened { ends_mid_line: bool },
 }
 
-pub struct AuditLog {
-    sink: Mutex<Sink>,
+/// The production sink: an append handle plus the identity of the inode it was
+/// opened on.
+///
+/// The identity is the whole point. A `rename` — `logrotate`, an operator
+/// archiving the trail — leaves this handle attached to an inode that no longer
+/// has the configured name, and an `unlink` leaves it attached to one with no name
+/// at all. Writes keep succeeding, so nothing surfaces as an error: every later
+/// decision is answered and recorded nowhere an operator will look. Since the
+/// audit log is the compensating control for an unauthenticated webhook, a
+/// silently detached trail is the failure that matters most here.
+struct LogFile {
+    path: PathBuf,
+    file: File,
+    /// `(st_dev, st_ino)` of the inode `file` refers to.
+    inode: (u64, u64),
 }
 
-impl AuditLog {
-    pub fn open(path: &Path) -> std::io::Result<Self> {
+impl LogFile {
+    /// Open (creating if needed) the log at `path`. Returns the handle and whether
+    /// the file it found ends mid-record.
+    fn open(path: &Path) -> std::io::Result<(Self, bool)> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -95,6 +107,101 @@ impl AuditLog {
                 false
             }
         };
+        let metadata = file.metadata()?;
+        Ok((
+            Self {
+                path: path.to_path_buf(),
+                file,
+                inode: (metadata.dev(), metadata.ino()),
+            },
+            unterminated,
+        ))
+    }
+
+    /// The name-to-inode binding we opened on, re-read from the filesystem.
+    fn still_attached(&self) -> std::io::Result<bool> {
+        let metadata = std::fs::metadata(&self.path)?;
+        Ok((metadata.dev(), metadata.ino()) == self.inode)
+    }
+}
+
+impl ByteSink for LogFile {
+    fn append(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.file.write_all(buf)
+    }
+
+    fn size(&self) -> std::io::Result<u64> {
+        Ok(self.file.metadata()?.len())
+    }
+
+    fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+        self.file.set_len(len)
+    }
+
+    fn reattach(&mut self) -> Reattach {
+        let detached = match self.still_attached() {
+            Ok(true) => return Reattach::Unchanged,
+            Ok(false) => "the configured path now names a different file",
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                "the configured path no longer exists"
+            }
+            Err(e) => {
+                // Cannot tell. Keep the handle we have — it is the only place a
+                // record can still go — and say so rather than reopening blindly.
+                tracing::warn!(
+                    path = %self.path.display(),
+                    error = %e,
+                    "could not check whether the audit log is still at the configured path"
+                );
+                return Reattach::Unchanged;
+            }
+        };
+        match Self::open(&self.path) {
+            Ok((reopened, ends_mid_line)) => {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    reason = detached,
+                    previous_inode = self.inode.1,
+                    inode = reopened.inode.1,
+                    "audit log was rotated or replaced; reopened at the configured path"
+                );
+                *self = reopened;
+                Reattach::Reopened { ends_mid_line }
+            }
+            Err(e) => {
+                // Appending to the handle we still hold keeps the record; dropping
+                // it would not. Either way the decision is unaffected.
+                tracing::error!(
+                    path = %self.path.display(),
+                    reason = detached,
+                    error = %e,
+                    "audit log is detached and could not be reopened; \
+                     still appending to the previous file"
+                );
+                Reattach::Unchanged
+            }
+        }
+    }
+}
+
+struct Sink {
+    bytes: Box<dyn ByteSink>,
+    /// The last record did not make it out whole, so the file ends mid-line.
+    /// The next record closes that line before starting its own.
+    unterminated: bool,
+    /// Size of the sink after the last record this process wrote, when known. A
+    /// smaller size later means something outside removed lines — rotation by
+    /// truncation (`logrotate copytruncate`), or tampering.
+    last_size: Option<u64>,
+}
+
+pub struct AuditLog {
+    sink: Mutex<Sink>,
+}
+
+impl AuditLog {
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        let (file, unterminated) = LogFile::open(path)?;
         if unterminated {
             tracing::warn!(
                 path = %path.display(),
@@ -109,6 +216,7 @@ impl AuditLog {
             sink: Mutex::new(Sink {
                 bytes,
                 unterminated,
+                last_size: None,
             }),
         }
     }
@@ -171,6 +279,16 @@ impl AuditLog {
             Err(poisoned) => poisoned.into_inner(),
         };
 
+        // Before every record, not periodically: one `stat` is nothing next to the
+        // Cedar evaluation that produced this record (milliseconds), and "periodic"
+        // means a window in which decisions are answered but recorded nowhere at the
+        // configured path. A reopened file is a different file, so both the
+        // mid-record state and the byte accounting start over.
+        if let Reattach::Reopened { ends_mid_line } = sink.bytes.reattach() {
+            sink.unterminated = ends_mid_line;
+            sink.last_size = None;
+        }
+
         // One write per record, newline included: nothing else can interleave, and
         // a short write is visible as a single failure to react to.
         let mut buf = Vec::with_capacity(line.len() + 2);
@@ -181,6 +299,18 @@ impl AuditLog {
         buf.push(b'\n');
 
         let size_before = sink.bytes.size().ok();
+        // Same inode, fewer bytes: nothing this daemon did can shrink an append-only
+        // log, so lines were removed from underneath it.
+        if let (Some(before), Some(last)) = (size_before, sink.last_size) {
+            if before < last {
+                tracing::warn!(
+                    bytes_removed = last - before,
+                    size = before,
+                    "audit log shrank since the last record; \
+                     it was truncated or rewritten by something else"
+                );
+            }
+        }
         match sink.bytes.append(&buf) {
             Ok(()) => sink.unterminated = false,
             Err(e) => {
@@ -196,6 +326,7 @@ impl AuditLog {
                 sink.unterminated = !rolled_back;
             }
         }
+        sink.last_size = sink.bytes.size().ok();
     }
 }
 
@@ -453,5 +584,201 @@ mod tests {
             panic!("the record after recovery must parse: {e}: {:?}", lines[1])
         });
         assert_eq!(recovered["reason"], "after recovery");
+    }
+
+    /// `tracing` output captured in memory, so a test can assert what an operator
+    /// tailing the daemon's log would actually see.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn text(&self) -> String {
+            let guard = match self.0.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            String::from_utf8_lossy(&guard).to_string()
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut guard = match self.0.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `body` with every `tracing` event captured.
+    fn with_captured_log<T>(body: impl FnOnce() -> T) -> (T, String) {
+        let sink = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(sink.clone())
+            .finish();
+        let out = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            body()
+        };
+        (out, sink.text())
+    }
+
+    /// Rotation — `logrotate`, an operator archiving the trail — renames the file
+    /// out from under the open handle. Appending to the renamed (or unlinked) inode
+    /// answers decisions that nothing at the configured path records: the audit
+    /// trail silently detaches, and `/healthz` stays green. Subsequent decisions
+    /// must land in a readable file at the configured path.
+    #[test]
+    fn a_rotated_log_is_reopened_at_the_configured_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decisions.jsonl");
+        let rotated = dir.path().join("decisions.jsonl.1");
+
+        let (_, log_text) = with_captured_log(|| {
+            let log = AuditLog::open(&path).unwrap();
+            log.record(
+                &query(),
+                &crate::decision::Decision::deny("before rotation"),
+            );
+            std::fs::rename(&path, &rotated).unwrap();
+            log.record(&query(), &crate::decision::Decision::deny("after rotation"));
+        });
+
+        let current = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("nothing readable at the configured path: {e}"));
+        assert!(
+            current.contains("after rotation"),
+            "the decision after the rotation must be recorded at the configured path: {current:?}"
+        );
+        assert!(
+            !current.contains("before rotation"),
+            "the reopened file must not replay the archived records: {current:?}"
+        );
+        for line in current.lines() {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|e| panic!("unparseable audit line {line:?}: {e}"));
+        }
+
+        let archived = std::fs::read_to_string(&rotated).unwrap();
+        assert!(
+            archived.contains("before rotation"),
+            "the archived file keeps what it already had: {archived:?}"
+        );
+        assert!(
+            !archived.contains("after rotation"),
+            "nothing may be appended to the detached inode: {archived:?}"
+        );
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the reopened log must not be world readable");
+
+        assert!(
+            log_text.contains("reopened"),
+            "the operator must see that the log was replaced: {log_text:?}"
+        );
+        assert!(
+            log_text.contains("decisions.jsonl"),
+            "the warning must name the path: {log_text:?}"
+        );
+    }
+
+    /// The same detachment, one step further: the file is gone rather than renamed.
+    /// Every later decision would be written to an inode with no name at all.
+    #[test]
+    fn a_deleted_log_is_recreated_at_the_configured_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decisions.jsonl");
+
+        let log = AuditLog::open(&path).unwrap();
+        log.record(&query(), &crate::decision::Decision::deny("before delete"));
+        std::fs::remove_file(&path).unwrap();
+        log.record(&query(), &crate::decision::Decision::deny("after delete"));
+
+        let current = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("nothing readable at the configured path: {e}"));
+        assert_eq!(current.lines().count(), 1, "{current:?}");
+        assert!(current.contains("after delete"), "{current:?}");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the recreated log must not be world readable");
+    }
+
+    /// A rotation the daemon cannot follow — the directory is no longer writable —
+    /// must not lose the record and must not change a decision. Appending to the
+    /// handle we still hold is strictly better than dropping the line, so long as
+    /// the operator is told the trail is no longer at the configured path.
+    #[test]
+    fn a_reopen_that_fails_keeps_recording_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decisions.jsonl");
+        let rotated = dir.path().join("decisions.jsonl.1");
+
+        let (_, log_text) = with_captured_log(|| {
+            let log = AuditLog::open(&path).unwrap();
+            log.record(
+                &query(),
+                &crate::decision::Decision::deny("before rotation"),
+            );
+            std::fs::rename(&path, &rotated).unwrap();
+            // Owner-execute only: the directory can be traversed but nothing new
+            // created in it, so the reopen cannot succeed.
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+            log.record(&query(), &crate::decision::Decision::deny("after rotation"));
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        });
+
+        assert!(
+            !path.exists(),
+            "the test premise is that the reopen could not create the file"
+        );
+        let archived = std::fs::read_to_string(&rotated).unwrap();
+        assert!(
+            archived.contains("after rotation"),
+            "a record must never be dropped just because the reopen failed: {archived:?}"
+        );
+        assert!(
+            log_text.contains("could not"),
+            "the operator must be told the trail is detached: {log_text:?}"
+        );
+    }
+
+    /// Rotation by truncation (`logrotate copytruncate`) keeps the same inode, so
+    /// there is nothing to reopen — but records vanished from under us, and an
+    /// operator reading a short log needs to know it was cut rather than quiet.
+    #[test]
+    fn an_externally_truncated_log_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decisions.jsonl");
+
+        let (_, log_text) = with_captured_log(|| {
+            let log = AuditLog::open(&path).unwrap();
+            log.record(
+                &query(),
+                &crate::decision::Decision::deny("before truncate"),
+            );
+            File::create(&path).unwrap(); // O_TRUNC on the same inode
+            log.record(&query(), &crate::decision::Decision::deny("after truncate"));
+        });
+
+        let current = std::fs::read_to_string(&path).unwrap();
+        assert!(current.contains("after truncate"), "{current:?}");
+        assert!(
+            log_text.contains("shrank"),
+            "the operator must see that lines were removed: {log_text:?}"
+        );
     }
 }
