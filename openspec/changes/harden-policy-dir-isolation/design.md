@@ -135,7 +135,13 @@ daemon will ever read. A symlink already pointing into an attacker-owned tree at
 startup is caught by D6 on the resolved components. Alternative considered —
 walking the lexical chain as well — rejected: it duplicates the check surface
 forever, while resolve-once removes the divergence that made the lexical chain
-matter at all.
+matter at all. Named residual (module docs + epic #1 trail, not silently
+accepted): an attacker who can write a lexical component's holding directory can
+still, *before startup*, point the link at a stale tree the daemon's user owns —
+every resolved-chain check passes because the tree really is ours. That needs an
+unusual configured path (the home-anchored defaults have no foreign-writable
+lexical components) and a useful stale tree to exist; the complete answer is the
+profile-derived check and policy signing under epic #1.
 
 ## Risks / Trade-offs
 
