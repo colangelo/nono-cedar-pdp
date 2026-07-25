@@ -181,6 +181,94 @@ fn audit_lines(dir: &tempfile::TempDir) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// One HTTP/1.1 exchange over a real socket, `Connection: close` so the read ends
+/// at the response. Synchronous on purpose: the test that uses it runs on a
+/// multi-threaded runtime, so `serve` keeps making progress on another worker while
+/// this blocks.
+fn http(addr: std::net::SocketAddr, request: &str) -> String {
+    use std::io::{Read, Write};
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5)).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    stream.flush().unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    String::from_utf8_lossy(&response).to_string()
+}
+
+/// `server::serve` — the function that actually binds — has no other test caller:
+/// every HTTP test here drives the `Router` through `oneshot`, which never creates
+/// a socket, never runs `axum::serve`, and would keep passing if the listener were
+/// removed entirely.
+///
+/// An ephemeral port, not the documented default `127.0.0.1:8181`: 8181 is where an
+/// operator runs their own daemon, so a test that claimed it would fail on a
+/// developer's machine. What matters here is that the address `serve` is handed is
+/// the address that answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_real_listener_answers_a_posted_envelope() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(&dir);
+
+    // Take an ephemeral port and release it, so `serve` does its own bind.
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    let serving = tokio::spawn(async move { server::serve(state, addr).await });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200))
+        .is_err()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "serve never accepted a connection on {addr}"
+        );
+        assert!(!serving.is_finished(), "serve returned instead of serving");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let body = command_body("git", &[SHIM_GIT, "status"]);
+    let response = tokio::task::spawn_blocking(move || {
+        let health = http(
+            addr,
+            &format!("GET /healthz HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"),
+        );
+        let approve = http(
+            addr,
+            &format!(
+                "POST /v1/approve HTTP/1.1\r\nHost: {addr}\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        (health, approve)
+    })
+    .await
+    .unwrap();
+    let (health, approve) = response;
+
+    serving.abort();
+
+    assert!(health.starts_with("HTTP/1.1 200 OK"), "{health:?}");
+    assert!(health.contains("\"generation\":1"), "{health:?}");
+    assert!(approve.starts_with("HTTP/1.1 200 OK"), "{approve:?}");
+    assert!(
+        approve.ends_with("{\"decision\":\"allow\"}"),
+        "the decision must survive the real wire, not just the Router: {approve:?}"
+    );
+
+    // And the decision a socket produced is on the record.
+    let lines = audit_lines(&dir);
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert_eq!(lines[0]["decision"], "allow");
+}
+
 #[tokio::test]
 async fn permitted_command_gets_allow() {
     let dir = tempfile::tempdir().unwrap();
@@ -288,6 +376,141 @@ async fn every_decision_is_audited() {
     let text = std::fs::read_to_string(dir.path().join("decisions.jsonl")).unwrap();
     assert_eq!(text.lines().count(), 1, "{text}");
     assert!(text.contains("\"decision\":\"allow\""));
+}
+
+/// "Which rule decided it" is the question the audit trail exists to answer, and
+/// `eval_us` is the other half of the same line. Both are absent from every other
+/// audit assertion in this repo: the unit test feeds a synthetic `Decision::deny`,
+/// whose `matched` is empty and `eval_us` zero by construction, and the rejection
+/// tests only ever see an empty `matched`. Dropping `matched` from `AuditRecord`
+/// entirely would leave every one of those green.
+#[tokio::test]
+async fn the_audit_line_names_the_rule_that_decided_and_the_evaluation_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, body) = post(
+        &dir,
+        &command_body_with_request_id("decided", "git", &[SHIM_GIT, "status"]),
+    )
+    .await;
+    assert_eq!(body, serde_json::json!({"decision": "allow"}));
+
+    let lines = audit_lines(&dir);
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    let line = &lines[0];
+    assert_eq!(line["request_id"], "decided");
+    assert_eq!(line["decision"], "allow");
+    assert_eq!(
+        line["matched"],
+        serde_json::json!(["p:allow-git-status"]),
+        "the line must name the policy that permitted it: {line:#?}"
+    );
+    assert!(
+        line["reason"]
+            .as_str()
+            .unwrap()
+            .contains("p:allow-git-status"),
+        "{line:#?}"
+    );
+    assert!(
+        line["eval_us"].as_u64().is_some_and(|us| us > 0),
+        "a real evaluation takes measurable time: {line:#?}"
+    );
+    assert_eq!(line["action"], "launchCommand");
+    assert_eq!(line["principal"], "Nono::Caller::\"session\"");
+
+    // A default deny is the other shape of the same field: nothing matched, so the
+    // list is empty rather than missing, and the reason says why.
+    let (_, body) = post(
+        &dir,
+        &command_body_with_request_id("undecided", "curl", &[SHIM_CURL, "evil.example"]),
+    )
+    .await;
+    assert_eq!(body["decision"], "deny");
+    let lines = audit_lines(&dir);
+    assert_eq!(lines.len(), 2, "{lines:#?}");
+    assert_eq!(
+        lines[1]["matched"],
+        serde_json::json!([]),
+        "{:#?}",
+        lines[1]
+    );
+    assert!(
+        lines[1]["eval_us"].as_u64().is_some_and(|us| us > 0),
+        "{:#?}",
+        lines[1]
+    );
+}
+
+/// The endpoint half of the wire had no end-to-end coverage at all: the adapter and
+/// the engine each had a unit test, but nothing posted an `endpoint` envelope to
+/// `/v1/approve` and looked at what was recorded. `httpRequest` is the whole L7
+/// surface — the credential proxy's decisions — so a break anywhere between the
+/// router and the audit line would have gone unnoticed.
+#[tokio::test]
+async fn an_endpoint_envelope_is_decided_and_audited_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let (status, body) = post(&dir, &endpoint_body("proxy-1", "/repos/foo/bar")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, serde_json::json!({"decision": "allow"}), "{body}");
+
+    let lines = audit_lines(&dir);
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    let line = &lines[0];
+    assert_eq!(line["request_id"], "proxy-1");
+    assert_eq!(line["action"], "httpRequest");
+    assert_eq!(line["decision"], "allow");
+    assert_eq!(
+        line["matched"],
+        serde_json::json!(["p:allow-github-repo-reads"]),
+        "{line:#?}"
+    );
+    // nono sends no session identity for an endpoint request, so the daemon pins
+    // the proxy identity itself — and the audit line has to show that, not a
+    // borrowed session.
+    assert_eq!(line["session_id"], "proxy");
+    assert_eq!(line["principal"], "Nono::Caller::\"proxy\"");
+    assert_eq!(line["backend"], "cedar");
+    assert_eq!(line["agent"], "claude-code");
+    assert_eq!(
+        line["resource"], "GET https://api.github.com/repos/foo/bar",
+        "the line must say what was asked: {line:#?}"
+    );
+    assert!(
+        line["eval_us"].as_u64().is_some_and(|us| us > 0),
+        "{line:#?}"
+    );
+
+    // A method the permit does not cover is denied, so the permit is not a
+    // blanket endpoint allow.
+    let denied = serde_json::json!({
+        "backend": "cedar",
+        "request": {
+            "capability_type": "endpoint",
+            "request_id": "proxy-2",
+            "route_id": "github-api",
+            "upstream": "https://api.github.com",
+            "method": "DELETE",
+            "path": "/repos/foo/bar",
+            "rule_label": "endpoint_policy.approve[DELETE /repos/*]",
+            "reason": "route requires approval",
+            "child_pid": 0,
+            "session_id": "proxy"
+        }
+    })
+    .to_string();
+    let (status, body) = post(&dir, &denied).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["decision"], "deny", "{body}");
+    let lines = audit_lines(&dir);
+    assert_eq!(lines.len(), 2, "{lines:#?}");
+    assert_eq!(lines[1]["action"], "httpRequest");
+    assert_eq!(lines[1]["decision"], "deny");
+    assert_eq!(
+        lines[1]["matched"],
+        serde_json::json!([]),
+        "{:#?}",
+        lines[1]
+    );
 }
 
 /// Rotation happens to a *running* daemon: `logrotate` or an operator renames the
