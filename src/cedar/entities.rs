@@ -345,6 +345,46 @@ mod tests {
         ));
     }
 
+    /// The chained-launch half of the identity contract. It was only ever asserted
+    /// as a Rust enum value (`CallerKind::Command`), and the enum is not what a
+    /// policy reads: `context.caller_kind` is, and it is a string. Swapping the two
+    /// arms of `CallerKind::as_str` would have failed nothing.
+    #[test]
+    fn a_chained_launch_is_command_in_the_caller_kind_a_policy_reads() {
+        let s = schema();
+
+        let (request, _e) = build(
+            &command_query("npm", "git", &[crate::wire::EXAMPLE_SHIM_ARGV0, "status"]),
+            &s,
+        )
+        .unwrap();
+        assert_eq!(request.principal().unwrap().id().unescaped(), "npm");
+        assert!(
+            matches!(
+                request.context().unwrap().get("caller_kind").unwrap(),
+                EvalResult::String(ref v) if v == "command"
+            ),
+            "a chained launch must present as \"command\": {:?}",
+            request.context().unwrap().get("caller_kind")
+        );
+
+        // The other arm, from the same helper, so a swap cannot pass both.
+        let (request, _e) = build(
+            &command_query(
+                "session",
+                "git",
+                &[crate::wire::EXAMPLE_SHIM_ARGV0, "status"],
+            ),
+            &s,
+        )
+        .unwrap();
+        assert_eq!(request.principal().unwrap().id().unescaped(), "session");
+        assert!(matches!(
+            request.context().unwrap().get("caller_kind").unwrap(),
+            EvalResult::String(ref v) if v == "session"
+        ));
+    }
+
     #[test]
     fn builds_proxy_identity_for_an_endpoint_request() {
         let s = schema();

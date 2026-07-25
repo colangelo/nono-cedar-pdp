@@ -824,6 +824,15 @@ when { resource.command == "gh" };
         let d = dir_with(&[("dup.cedar", body)]);
         let err = load_dir(d.path(), &schema, 1).unwrap_err();
         assert!(matches!(err, PolicyLoadError::Duplicate { .. }), "{err}");
+        // The variant is not the requirement: the operator has to be told which file
+        // to go and edit, so the message itself is asserted. Dropping `path` from the
+        // Display impl would otherwise keep this test green.
+        let text = err.to_string();
+        assert!(text.contains("dup.cedar"), "must name the file: {text}");
+        assert!(
+            text.contains("dup:same"),
+            "must name the duplicated id: {text}"
+        );
     }
 
     #[test]
@@ -1038,6 +1047,45 @@ permit (
         );
     }
 
+    /// `caller_kind` exists so a policy can tell a direct agent launch from one
+    /// chained through another intercepted command. The shipped pack expresses that
+    /// through the principal, so this is the test that the *context* string is
+    /// usable — a policy reads `"session"`/`"command"`, not a Rust enum.
+    #[test]
+    fn a_policy_can_decide_on_the_caller_kind_context() {
+        let schema = crate::cedar::schema::load().unwrap();
+        let body = r#"
+@id("direct-launches-only")
+permit (principal, action == Nono::Action::"launchCommand", resource)
+when { context.caller_kind == "session" && resource.command == "git" };
+"#;
+        let d = dir_with(&[("kind.cedar", body)]);
+        let engine = Engine::bootstrap(schema, d.path().to_path_buf()).unwrap();
+
+        let direct = engine.evaluate(&command_query(
+            "session",
+            "git",
+            &[crate::wire::EXAMPLE_SHIM_ARGV0, "status"],
+        ));
+        assert!(direct.allow, "{direct:?}");
+        assert_eq!(
+            direct.matched,
+            vec!["kind:direct-launches-only".to_string()]
+        );
+
+        let chained = engine.evaluate(&command_query(
+            "npm",
+            "git",
+            &[crate::wire::EXAMPLE_SHIM_ARGV0, "status"],
+        ));
+        assert!(
+            !chained.allow,
+            "a chained launch presents caller_kind \"command\", so the permit must \
+             not fire: {chained:?}"
+        );
+        assert!(chained.matched.is_empty(), "{chained:?}");
+    }
+
     #[test]
     fn records_evaluation_time() {
         let (engine, _d) = matrix_engine();
@@ -1073,6 +1121,12 @@ permit (
 
     /// A `forbid` that errors at evaluation time is skipped by Cedar, so the
     /// remaining `permit` yields Allow. We must not trust that Allow.
+    ///
+    /// The setup is pinned as well as the outcome: Cedar's own decision here has to
+    /// *be* `Allow`, otherwise the test degenerates into observing an ordinary deny
+    /// and stops covering the override at all — which is what would happen if a
+    /// later Cedar release stopped evaluating the permit, or if the overflow moved
+    /// into the permit instead.
     #[test]
     fn evaluation_errors_force_a_deny_even_when_cedar_says_allow() {
         let schema = crate::cedar::schema::load().unwrap();
@@ -1087,11 +1141,32 @@ when { resource.arg_count + 9223372036854775807 > 0 };
 "#;
         let d = dir_with(&[("boom.cedar", body)]);
         let engine = Engine::bootstrap(schema, d.path().to_path_buf()).unwrap();
-        let decision = engine.evaluate(&command_query(
+        let query = command_query(
             "session",
             "git",
             &[crate::wire::EXAMPLE_SHIM_ARGV0, "status"],
-        ));
+        );
+
+        // What Cedar itself says about this request, before our fail-closed rule.
+        let (request, entities) = crate::cedar::entities::build(&query, engine.schema()).unwrap();
+        let raw = cedar_policy::Authorizer::new().is_authorized(
+            &request,
+            &engine.snapshot().set,
+            &entities,
+        );
+        assert_eq!(
+            raw.decision(),
+            cedar_policy::Decision::Allow,
+            "the WHEN of this scenario is an allow *with* errors; Cedar no longer \
+             produces one, so this test would otherwise pass on a plain deny"
+        );
+        let errors: Vec<String> = raw.diagnostics().errors().map(|e| e.to_string()).collect();
+        assert!(
+            errors.iter().any(|e| e.contains("overflowing-forbid")),
+            "the skipped policy must be the forbid: {errors:?}"
+        );
+
+        let decision = engine.evaluate(&query);
         assert!(
             !decision.allow,
             "an errored forbid must not be silently skipped: {decision:?}"
@@ -1100,6 +1175,12 @@ when { resource.arg_count + 9223372036854775807 > 0 };
             decision.reason.contains("evaluation error"),
             "{}",
             decision.reason
+        );
+        assert_eq!(
+            decision.matched,
+            vec!["boom:permit-git".to_string()],
+            "the overridden allow is still on the record, so an operator can see \
+             which permit would have fired: {decision:?}"
         );
     }
 

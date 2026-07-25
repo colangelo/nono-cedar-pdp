@@ -544,6 +544,106 @@ mod tests {
         );
     }
 
+    /// The guarantee is about the *response*, not about the log: nono is waiting on
+    /// a decision, and a full disk is not a reason to change it or to withhold it.
+    /// Nothing asserted that before — `record` returning `()` made it true by
+    /// construction, so a future `record` that returned a `Result` and got
+    /// `?`-propagated out of the handler would have broken the scenario silently
+    /// (and turned every decision into a 500, which nono records as a bare HTTP
+    /// status rather than a reason).
+    ///
+    /// Driven through the real HTTP handler because that is where the decision is
+    /// returned from; the failing sink is only reachable from inside this module.
+    #[tokio::test]
+    async fn a_write_failure_changes_neither_the_decision_nor_the_response() {
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("p.cedar"),
+            "@id(\"allow-git\")\npermit (principal, action == Nono::Action::\"launchCommand\", \
+             resource) when { resource.command == \"git\" };",
+        )
+        .unwrap();
+        let schema = crate::cedar::schema::load().unwrap();
+        let engine =
+            crate::cedar::engine::Engine::bootstrap(schema, dir.path().to_path_buf()).unwrap();
+        let mut agents = std::collections::BTreeMap::new();
+        agents.insert("cedar".to_string(), "claude-code".to_string());
+        let config = crate::config::Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            policy_dir: dir.path().to_path_buf(),
+            audit_log: dir.path().join("unused.jsonl"),
+            agents,
+            unknown_agent: "unknown".to_string(),
+        };
+        // Zero bytes of space: every record fails, and there is nothing to roll back.
+        let full = FullDisk::with_budget(0);
+        let state = crate::server::AppState {
+            engine: Arc::new(engine),
+            config: Arc::new(config),
+            audit: Arc::new(AuditLog::with_sink(Box::new(full.clone()), false)),
+        };
+
+        let body = serde_json::json!({
+            "backend": "cedar",
+            "request": {
+                "capability_type": "command",
+                "request_id": "r1",
+                "command": "git",
+                "args": [crate::wire::EXAMPLE_SHIM_ARGV0, "status"],
+                "caller": "session",
+                "intercept_rule": "status",
+                "reason": null,
+                "child_pid": 42,
+                "session_id": "s1"
+            }
+        })
+        .to_string();
+
+        let (response, log_text) = {
+            let sink = CapturedLog::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(sink.clone())
+                .finish();
+            let guard = tracing::subscriber::set_default(subscriber);
+            let response = crate::server::router(state)
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/approve")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            drop(guard);
+            (response, sink.text())
+        };
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::OK,
+            "an unwritable audit log must not become an HTTP failure"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"decision": "allow"}),
+            "the decision already computed must reach nono unchanged"
+        );
+        assert_eq!(full.text(), "", "the premise is that nothing was written");
+        assert!(
+            log_text.contains("failed to write audit record"),
+            "the operator must be told the trail is not being written: {log_text:?}"
+        );
+    }
+
     /// Reading the last byte needs read access, but an append-only log is a
     /// legitimate setup. A log we can write but not read must still open — a
     /// daemon that refuses to start cannot decide anything.

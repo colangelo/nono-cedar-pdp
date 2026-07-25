@@ -744,6 +744,91 @@ async fn logged_identifiers_carry_no_raw_control_bytes() {
     );
 }
 
+/// "Internal construction failure is denied" was covered only incidentally, by a
+/// test written and named for ANSI injection: it asserted a deny and the absence of
+/// control bytes, so the coverage rested on Cedar's uid escaping rather than on any
+/// intention, and nothing asserted the *reason* names a construction failure or that
+/// the error is logged. A well-formed payload the entity builder cannot use has to
+/// deny like everything else it cannot evaluate — with our reason, on the record, and
+/// visible to the operator.
+#[tokio::test]
+async fn a_payload_that_cannot_become_a_cedar_request_is_denied_and_logged() {
+    // Well-formed JSON, valid wire shape, but a raw CR cannot appear in the Cedar
+    // string literal the session entity's uid is built from.
+    let body = serde_json::json!({
+        "backend": "cedar",
+        "request": {
+            "capability_type": "command",
+            "request_id": "unbuildable",
+            "command": "git",
+            "args": [SHIM_GIT, "status"],
+            "caller": "session",
+            "intercept_rule": "status",
+            "reason": null,
+            "child_pid": 42,
+            "session_id": "s1\rINFO forged allow=true"
+        }
+    })
+    .to_string();
+
+    let sink = CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(sink.clone())
+        .finish();
+
+    let dir = tempfile::tempdir().unwrap();
+    let (status, response) = {
+        let _guard = tracing::subscriber::set_default(subscriber);
+        post(&dir, &body).await
+    };
+    let logs = sink.text();
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an internal failure must not propagate as an error to nono: {response}"
+    );
+    assert_eq!(response["decision"], "deny", "{response}");
+    let reason = response["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("could not build policy request"),
+        "the reason must say the request could not be built, not imply a policy \
+         refused it: {reason}"
+    );
+    assert!(
+        !reason.chars().any(char::is_control),
+        "the reason travels into nono's audit trail: {reason:?}"
+    );
+    assert!(
+        logs.contains("failed to build cedar request"),
+        "the operator must see the error that caused the deny: {logs:?}"
+    );
+    assert!(
+        !logs.contains('\r'),
+        "raw CR reached the operator log: {logs:?}"
+    );
+
+    let lines = audit_lines(&dir);
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert_eq!(lines[0]["request_id"], "unbuildable");
+    assert_eq!(lines[0]["decision"], "deny");
+    assert_eq!(
+        lines[0]["matched"],
+        serde_json::json!([]),
+        "{:#?}",
+        lines[0]
+    );
+    assert!(
+        lines[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("could not build policy request"),
+        "{:#?}",
+        lines[0]
+    );
+}
+
 /// A denial says "policy refused this". A 503 says "the decider is broken, do not
 /// treat my answer as a policy decision". Collapsing the second into the first is
 /// how a misconfigured PDP silently becomes a deny-everything one.

@@ -129,10 +129,23 @@ cedar = "claude-code"
         assert_eq!(c.agent_for("something-else"), "unknown");
     }
 
+    /// The point of a strict schema is that a typo is loud. "Loud" is the message,
+    /// not the variant: an operator who mistypes `policy_dir` needs to be told which
+    /// key was rejected and which ones exist, so the text is asserted too.
     #[test]
     fn rejects_unknown_config_keys() {
         let f = write_config("policy_dir = \"/tmp/p\"\nplicy_dir = \"typo\"\n");
-        assert!(matches!(Config::load(f.path()), Err(ConfigError::Parse(_))));
+        let err = Config::load(f.path()).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("plicy_dir"),
+            "the message must name the offending key: {text}"
+        );
+        assert!(
+            text.contains("policy_dir"),
+            "and the keys that do exist: {text}"
+        );
     }
 
     /// nono sends no credential and cannot authenticate the decider, so the only
