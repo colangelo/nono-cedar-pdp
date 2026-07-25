@@ -1,0 +1,80 @@
+{
+  "meta": {
+    "name": "cedar-pdp-smoke"
+  },
+  "groups": {
+    "include": []
+  },
+  "workdir": {
+    "access": "readwrite"
+  },
+  "filesystem": {
+    "allow": [],
+    "read": []
+  },
+  "command_policies": {
+    "approval_backends": {
+      "cedar": {
+        "type": "webhook",
+        "url": "http://127.0.0.1:8181/v1/approve",
+        "timeout_secs": 5
+      },
+      "cedar-or-ask": {
+        "type": "chain",
+        "mode": "any",
+        "backends": [
+          "cedar",
+          "terminal"
+        ]
+      },
+      "terminal": {
+        "type": "terminal"
+      }
+    },
+    "approval_defaults": {
+      "backend": "cedar",
+      "timeout_secs": 5
+    },
+    "commands": {
+      "git": {
+        "from": {
+          "session": {
+            "sandbox": {
+              "fs_read": [
+                ".",
+                "/opt/homebrew",
+                "~/.config/git"
+              ],
+              "fs_write": [
+                "."
+              ],
+              "fs_read_file": [
+                "~/.gitconfig"
+              ]
+            }
+          }
+        },
+        "intercept": [
+          {
+            "args": [
+              "status"
+            ],
+            "action": {
+              "type": "approve",
+              "timeout_secs": 5
+            }
+          },
+          {
+            "args": [
+              "push"
+            ],
+            "action": {
+              "type": "approve",
+              "timeout_secs": 5
+            }
+          }
+        ]
+      }
+    }
+  }
+}
