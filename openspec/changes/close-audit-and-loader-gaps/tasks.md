@@ -28,6 +28,6 @@ filtered test runs must both pass.
 
 ## 5. Verification
 
-- [ ] 5.1 `just test` full and filtered (`cargo test --lib audit`, `cargo test --lib engine`, `cargo test --test server`, `cargo test --test policies`) green; `just lint` clean
-- [ ] 5.2 `just smoke` still green (audit-line shape change must not break the smoke recipe's assertions)
-- [ ] 5.3 `openspec validate --changes close-audit-and-loader-gaps` passes
+- [x] 5.1 `just test` full and filtered (`cargo test --lib audit`, `cargo test --lib engine`, `cargo test --test server`, `cargo test --test policies`) green; `just lint` clean
+- [x] 5.2 `just smoke` still green (audit-line shape change must not break the smoke recipe's assertions)
+- [x] 5.3 `openspec validate --changes close-audit-and-loader-gaps` passes
