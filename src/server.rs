@@ -18,6 +18,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::catch_panic::CatchPanicLayer;
 
+/// Placeholder for a log field the refused body did not carry. `tracing` has no
+/// null, and an empty value reads as "we forgot to log it".
+const UNKNOWN: &str = "-";
+
 #[derive(Clone)]
 pub struct AppState {
     pub engine: Arc<Engine>,
@@ -49,8 +53,20 @@ async fn approve(State(state): State<AppState>, body: Bytes) -> Response {
     let query = match crate::adapter::nono_webhook::parse(&body, &state.config) {
         Ok(query) => query,
         Err(e) => {
-            tracing::warn!(error = %e, "rejecting approval request");
+            // A denial the caller acts on is a decision, so it goes on the record
+            // with whatever context the refused body still yields.
+            let context = crate::adapter::nono_webhook::scrape_context(&body, &state.config);
             let decision = Decision::deny(e.deny_reason());
+            state.audit.record_rejected(&context, &decision);
+            tracing::warn!(
+                // Cedar and serde error text can quote request-supplied values.
+                error = %crate::sanitize::control_escape(&e.to_string()),
+                request_id = context.request_id.as_deref().unwrap_or(UNKNOWN),
+                session_id = context.session_id.as_deref().unwrap_or(UNKNOWN),
+                backend = context.backend.as_deref().unwrap_or(UNKNOWN),
+                capability_type = context.capability_type.as_deref().unwrap_or(UNKNOWN),
+                "rejecting approval request"
+            );
             return (StatusCode::OK, Json(decision.to_wire())).into_response();
         }
     };
@@ -58,7 +74,12 @@ async fn approve(State(state): State<AppState>, body: Bytes) -> Response {
     let decision = state.engine.evaluate(&query);
     state.audit.record(&query, &decision);
     tracing::info!(
-        request_id = %query.request_id,
+        // Upstream builds `request_id` from the intercepted command name, so an
+        // agent chooses part of it: escape before it reaches an operator's
+        // terminal, where a raw ESC/CR would rewrite the line being read.
+        request_id = %crate::sanitize::control_escape(&query.request_id),
+        session_id = %crate::sanitize::control_escape(&query.session_id),
+        backend = %crate::sanitize::control_escape(&query.backend),
         action = query.action_name(),
         resource = %query.resource_summary(),
         allow = decision.allow,

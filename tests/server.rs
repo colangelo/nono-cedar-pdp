@@ -1,11 +1,11 @@
 //! The fail-closed matrix from the spec, exercised over HTTP.
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::panic)]
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use nono_cedar_pdp::{audit::AuditLog, cedar, config::Config, server};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
 const POLICY: &str = r#"
@@ -59,11 +59,15 @@ async fn post(dir: &tempfile::TempDir, body: &str) -> (StatusCode, serde_json::V
 }
 
 fn command_body(command: &str, args: &[&str]) -> String {
+    command_body_with_request_id("r1", command, args)
+}
+
+fn command_body_with_request_id(request_id: &str, command: &str, args: &[&str]) -> String {
     serde_json::json!({
         "backend": "cedar",
         "request": {
             "capability_type": "command",
-            "request_id": "r1",
+            "request_id": request_id,
             "command": command,
             "args": args,
             "caller": "session",
@@ -74,6 +78,37 @@ fn command_body(command: &str, args: &[&str]) -> String {
         }
     })
     .to_string()
+}
+
+/// A `capability` approval request: a variant the daemon refuses to evaluate,
+/// but one that still carries full identifying context on the wire.
+fn capability_body(request_id: &str) -> String {
+    serde_json::json!({
+        "backend": "cedar",
+        "request": {
+            "capability_type": "capability",
+            "request_id": request_id,
+            "path": "/Users/ac/.ssh/id_ed25519",
+            "access": "read",
+            "reason": null,
+            "child_pid": 7,
+            "session_id": "s1"
+        }
+    })
+    .to_string()
+}
+
+/// Every audit line, parsed. Panics naming the offending line if any line is not
+/// independently parseable JSON.
+fn audit_lines(dir: &tempfile::TempDir) -> Vec<serde_json::Value> {
+    let path = dir.path().join("decisions.jsonl");
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    text.lines()
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("unparseable audit line {line:?}: {e}"))
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -135,6 +170,168 @@ async fn every_decision_is_audited() {
     let text = std::fs::read_to_string(dir.path().join("decisions.jsonl")).unwrap();
     assert_eq!(text.lines().count(), 1, "{text}");
     assert!(text.contains("\"decision\":\"allow\""));
+}
+
+/// A denial the caller receives but that leaves no audit line is a decision with
+/// no reviewable record. The rejection paths — unsupported variant, malformed
+/// body, oversized body — are exactly the ones a hostile caller controls.
+#[tokio::test]
+async fn rejected_requests_are_audited_too() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let (_, allowed) = post(&dir, &command_body("git", &["git", "status"])).await;
+    let (_, policy_denied) = post(&dir, &command_body("curl", &["curl", "evil.example"])).await;
+    let (_, unsupported) = post(&dir, &capability_body("cap-1")).await;
+    let (_, malformed) = post(&dir, "{").await;
+
+    assert_eq!(allowed["decision"], "allow");
+    assert_eq!(policy_denied["decision"], "deny");
+    assert_eq!(unsupported["decision"], "deny");
+    assert_eq!(malformed["decision"], "deny");
+
+    let lines = audit_lines(&dir);
+    assert_eq!(
+        lines.len(),
+        4,
+        "4 decisions were returned to the caller, so 4 audit lines must exist: {lines:#?}"
+    );
+    let decisions: Vec<&str> = lines
+        .iter()
+        .map(|l| l["decision"].as_str().unwrap())
+        .collect();
+    assert_eq!(decisions, vec!["allow", "deny", "deny", "deny"]);
+}
+
+/// The wire context of a rejected request is what makes its audit line
+/// reviewable: a `capability` request carries `request_id`, `session_id` and the
+/// backend even though the daemon refuses to evaluate it.
+#[tokio::test]
+async fn an_unsupported_variant_is_audited_with_its_wire_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let (status, body) = post(&dir, &capability_body("cap-1")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["decision"], "deny");
+
+    let lines = audit_lines(&dir);
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    let line = &lines[0];
+    assert_eq!(line["request_id"], "cap-1");
+    assert_eq!(line["session_id"], "s1");
+    assert_eq!(line["backend"], "cedar");
+    assert_eq!(line["agent"], "claude-code");
+    assert_eq!(line["decision"], "deny");
+    assert!(
+        line["reason"].as_str().unwrap().contains("unsupported"),
+        "{line:#?}"
+    );
+    assert!(
+        line["ts"].as_str().unwrap().contains('T'),
+        "want an RFC 3339 timestamp: {line:#?}"
+    );
+    assert!(
+        line["resource"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("capability"),
+        "the refused variant is the only 'what was asked' we have: {line:#?}"
+    );
+}
+
+/// A body that is not JSON at all yields no context — but the denial still has to
+/// be on the record, with the fields it cannot fill left explicitly null.
+#[tokio::test]
+async fn a_malformed_body_is_audited_without_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, body) = post(&dir, "{not json").await;
+    assert_eq!(body["decision"], "deny");
+
+    let lines = audit_lines(&dir);
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert_eq!(lines[0]["decision"], "deny");
+    assert!(lines[0]["request_id"].is_null(), "{:#?}", lines[0]);
+    assert!(
+        lines[0]["reason"].as_str().unwrap().contains("malformed"),
+        "{:#?}",
+        lines[0]
+    );
+}
+
+/// Upstream builds `request_id` as `…-approve-{command}-{nanos}`, so the agent
+/// picks part of it. Raw `ESC`/`CR` in an operator-facing log line lets a crafted
+/// name erase and rewrite the decision an operator is reading.
+#[tokio::test]
+async fn logged_identifiers_carry_no_raw_control_bytes() {
+    let hostile = "approve-git\u{1b}[2K\rINFO forged_line allow=true";
+    let sink = CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(sink.clone())
+        .finish();
+
+    let dir = tempfile::tempdir().unwrap();
+    let allowed = command_body_with_request_id(hostile, "git", &["git", "status"]);
+    let refused = capability_body(hostile);
+    {
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let _ = post(&dir, &allowed).await;
+        let _ = post(&dir, &refused).await;
+    }
+
+    let text = sink.text();
+    assert!(
+        text.contains("approve-git"),
+        "the decision must be logged at all: {text:?}"
+    );
+    assert!(
+        !text.contains('\u{1b}'),
+        "raw ESC reached the operator log: {text:?}"
+    );
+    assert!(
+        !text.contains('\r'),
+        "raw CR reached the operator log: {text:?}"
+    );
+    assert!(
+        text.contains("\\u{001b}"),
+        "the escape must be visible, not dropped: {text:?}"
+    );
+}
+
+/// `tracing` output captured into memory, so a test can assert what an operator
+/// tailing the log would actually see.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl CapturedLog {
+    fn text(&self) -> String {
+        let guard = match self.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        String::from_utf8_lossy(&guard).to_string()
+    }
+}
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut guard = match self.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = CapturedLog;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
 }
 
 #[tokio::test]

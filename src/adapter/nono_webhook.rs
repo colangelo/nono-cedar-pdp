@@ -30,6 +30,56 @@ impl AdaptError {
     }
 }
 
+/// What is still known about a request the daemon refused to evaluate.
+///
+/// A denial produced by a malformed or unsupported body is still a decision the
+/// caller acts on, so it needs an audit line (`decision-audit-log`: "including
+/// denials produced by malformed or unsupported input where a request context is
+/// available"). `ApprovalRequest::Unsupported` cannot carry that context —
+/// serde's `#[serde(other)]` only accepts a unit variant — so it is scraped
+/// separately. Every field is optional: the body may be truncated, oversized, or
+/// not JSON at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RejectedContext {
+    pub backend: Option<String>,
+    /// Resolved from `backend` through the config's agent map, so a rejected
+    /// line names the same agent a decided line would.
+    pub agent: Option<String>,
+    pub capability_type: Option<String>,
+    pub request_id: Option<String>,
+    pub session_id: Option<String>,
+}
+
+/// Best-effort scrape of the identifying fields of a body we would not evaluate.
+///
+/// Never fails and never partially parses into something a policy could see:
+/// the result is audit-and-log material only. Values are control-escaped here,
+/// at the single point they enter the daemon, because everything downstream
+/// (log lines, the JSONL trail) is read by an operator.
+pub fn scrape_context(body: &[u8], config: &Config) -> RejectedContext {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return RejectedContext::default();
+    };
+    let text = |parent: &serde_json::Value, key: &str| -> Option<String> {
+        parent
+            .get(key)?
+            .as_str()
+            .map(crate::sanitize::control_escape)
+    };
+    let backend = text(&value, "backend");
+    let agent = backend
+        .as_deref()
+        .map(|backend| config.agent_for(backend).to_string());
+    let request = value.get("request");
+    RejectedContext {
+        backend,
+        agent,
+        capability_type: request.and_then(|r| text(r, "capability_type")),
+        request_id: request.and_then(|r| text(r, "request_id")),
+        session_id: request.and_then(|r| text(r, "session_id")),
+    }
+}
+
 pub fn parse(body: &[u8], config: &Config) -> Result<PolicyQuery, AdaptError> {
     let envelope: WebhookEnvelope = serde_json::from_slice(body)?;
     let agent = config.agent_for(&envelope.backend).to_string();
@@ -209,5 +259,60 @@ mod tests {
         let err = parse(b"{not json", &config()).unwrap_err();
         assert!(matches!(err, AdaptError::Malformed(_)));
         assert!(err.deny_reason().contains("malformed"));
+    }
+
+    /// A refused request still carries the context that makes its denial
+    /// reviewable: which backend asked, which request id, which session.
+    #[test]
+    fn scrapes_the_context_of_a_refused_request() {
+        let body = r#"{"backend":"cedar","request":{"capability_type":"capability",
+            "request_id":"cap-1","path":"/Users/ac/.ssh/id_ed25519","access":"read",
+            "reason":null,"child_pid":7,"session_id":"s1"}}"#;
+        let ctx = scrape_context(body.as_bytes(), &config());
+        assert_eq!(ctx.backend.as_deref(), Some("cedar"));
+        assert_eq!(ctx.agent.as_deref(), Some("claude-code"));
+        assert_eq!(ctx.capability_type.as_deref(), Some("capability"));
+        assert_eq!(ctx.request_id.as_deref(), Some("cap-1"));
+        assert_eq!(ctx.session_id.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn scraping_a_body_that_is_not_json_yields_an_empty_context() {
+        assert_eq!(
+            scrape_context(b"{not json", &config()),
+            RejectedContext::default()
+        );
+        // Valid JSON of the wrong shape must not panic or half-fill either.
+        assert_eq!(
+            scrape_context(br#"{"backend":42,"request":"nope"}"#, &config()),
+            RejectedContext::default()
+        );
+    }
+
+    /// The scraped values go straight into log lines and the audit trail, so
+    /// control bytes are escaped at this boundary.
+    #[test]
+    fn scraped_context_is_control_escaped() {
+        let body = serde_json::json!({
+            "backend": "cedar",
+            "request": {
+                "capability_type": "capability",
+                "request_id": "cap\u{1b}[2K\rINFO forged allow=true",
+                "session_id": "s1",
+            }
+        })
+        .to_string();
+        let ctx = scrape_context(body.as_bytes(), &config());
+        let request_id = ctx.request_id.unwrap();
+        assert!(!request_id.chars().any(char::is_control), "{request_id:?}");
+        assert!(request_id.contains("\\u{001b}"), "{request_id}");
+    }
+
+    #[test]
+    fn an_unmapped_backend_scrapes_to_the_unknown_agent() {
+        let body = r#"{"backend":"rogue","request":{"capability_type":"network"}}"#;
+        let ctx = scrape_context(body.as_bytes(), &config());
+        assert_eq!(ctx.backend.as_deref(), Some("rogue"));
+        assert_eq!(ctx.agent.as_deref(), Some("unknown"));
     }
 }
