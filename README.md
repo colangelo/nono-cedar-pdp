@@ -239,9 +239,12 @@ oversights.
    --force this"` satisfies `resource.argv_tail like "*--force*"`, and no joined
    string can distinguish `["push --force"]` from `["push", "--force"]`. Over-matching
    is fail-safe in a `forbid` and unsound in a `permit`, so the loader **warns about a
-   `permit` whose `argv_tail` test is not a positional pin** (an anchored pattern or
-   an `==` is a pin; anything else is not). Two hazards, then: anchoring is now
-   structurally impossible, flattening is still a rule you have to follow.
+   `permit` whose `argv_tail` test does not pin a whole token**. A pin is `== "status"`,
+   a wildcard-free `like`, or a pattern anchored at the start whose literal ends at the
+   separating space (`like "status *"`); `like "diff*"` is *not* — it stops mid-token and
+   so also approves `git difftool --extcmd=<cmd>`, which executes `<cmd>`. Two hazards,
+   then: anchoring is now structurally impossible, flattening is still a rule you have to
+   follow.
 5. **Endpoint paths arrive raw, and an ambiguous one is denied outright.** nono's proxy
    forwards the request target verbatim — unnormalised, still percent-encoded, query
    string included — so `resource.path like "/repos/*"` used to be satisfied by

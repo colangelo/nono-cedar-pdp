@@ -89,12 +89,15 @@ its file), advisory rather than fatal:
 1. **Flattening.** `argv_tail` is still a joined string, so it cannot distinguish
    `["push --force"]` from `["push", "--force"]`, and `git commit -m "do not --force this"`
    still matches `*--force*`. Over-matching is fail-safe in a `forbid` and unsound in a
-   `permit`. An **anchored** test is not affected: because `argv_tail` omits `args[0]`, a
-   pattern anchored at the start (`like "status *"`) or an equality test (`== "status"`)
-   pins the first token of `args[1..]` — the subcommand — which is the one thing set
-   membership cannot express, and is therefore the sound shape for a `permit`. The loader
-   SHALL report a `permit` whose `resource.argv_tail` test is **not** such a positional
-   pin, and SHALL NOT report one that is.
+   `permit`. A test that **pins a whole token** is not affected: because `argv_tail` omits
+   `args[0]`, a pattern anchored at the start whose literal ends at the separating space
+   (`like "status *"`), a pattern with no wildcard at all, or an equality test
+   (`== "status"`) all pin the first token of `args[1..]` — the subcommand — which is the
+   one thing set membership cannot express, and is therefore the sound shape for a
+   `permit`. The loader SHALL report a `permit` whose `resource.argv_tail` test is **not**
+   such a pin, and SHALL NOT report one that is. A pattern that is anchored but stops
+   mid-token SHALL be reported, because `like "diff*"` also matches
+   `difftool --extcmd=<cmd>`, which executes `<cmd>`.
 2. **Unmatchable `args` literals.** `args` still holds the per-run shim path, so an `args`
    membership test against a value containing a path separator can never match the
    program — fail-open when it appears in a `forbid`. The loader SHALL report such a test
@@ -111,6 +114,8 @@ its file), advisory rather than fatal:
 - **THEN** no lint is reported, because the test pins the subcommand rather than searching the joined string
 - **AND WHEN** the same `permit` also contains an unanchored test such as `resource.argv_tail like "*--porcelain*"`
 - **THEN** the lint is reported, because the unanchored half is what can over-match into an approval
+- **AND WHEN** a `permit` tests `resource.argv_tail like "diff*"`, which is anchored but stops mid-token
+- **THEN** the lint is reported and names the token boundary, because that pattern also approves `git difftool --extcmd=<cmd>`
 
 #### Scenario: An args membership test against a path literal is reported
 

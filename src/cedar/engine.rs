@@ -57,11 +57,13 @@ fn is_loadable_policy_file(path: &Path) -> bool {
 ///    also matches when the text sits *inside* a single argument
 ///    (`-m "do not --force this"`), and it cannot tell `["push --force"]` from
 ///    `["push", "--force"]`. Over-matching is fail-safe in a `forbid` and unsound in
-///    a `permit`. A pattern anchored at the start (`like "status *"`) or an equality
-///    test (`== "status"`) is a different thing: it pins the FIRST token of
-///    `args[1..]`, which is the git-style subcommand, and that is the one thing set
-///    membership cannot express. Those are the sound shape for a `permit` and are
-///    not flagged; only a read that is neither is.
+///    a `permit`. A pattern anchored at the start *and ended at the separating space*
+///    (`like "status *"`), or an equality test (`== "status"`), is a different thing:
+///    it pins the FIRST token of `args[1..]`, which is the git-style subcommand, and
+///    that is the one thing set membership cannot express. Those are the sound shape
+///    for a `permit` and are not flagged. A pin that stops mid-token (`like "diff*"`,
+///    which also matches `difftool --extcmd=<cmd>`) is flagged like an unanchored
+///    glob: it approves more than it names.
 /// 2. **An `args` membership test against a value containing `/`.** `args` stays
 ///    faithful to the payload, so `args[0]` is the per-run shim path
 ///    (`…/nono-tool-sandbox-<pid>-<nanos>-<hex>/shims/<command>`): a literal that
@@ -88,10 +90,12 @@ pub fn lint_arg_matching(set: &PolicySet) -> Vec<String> {
 
         if policy.effect() == Effect::Permit && unpinned_argv_tail_reads(&json) > 0 {
             lints.push(format!(
-                "policy {} is a permit that reads resource.argv_tail without pinning \
-                 a position; a glob that starts with a wildcard over-matches text \
-                 inside a single argument, so it belongs in forbid only — anchor the \
-                 pattern at the start (like \"status *\") or compare it exactly \
+                "policy {} is a permit whose resource.argv_tail test does not pin a \
+                 whole token; a glob that starts with a wildcard over-matches text \
+                 inside a single argument, and one that stops mid-token (like \
+                 \"diff*\") also matches a longer subcommand (difftool), so either \
+                 belongs in forbid only — anchor the pattern and end it at the \
+                 separating space (like \"status *\"), or compare it exactly \
                  (== \"status\"), and use resource.args.contains(..) for flags",
                 policy.id()
             ));
@@ -116,11 +120,12 @@ pub fn lint_arg_matching(set: &PolicySet) -> Vec<String> {
 /// comment mentioning the attribute is not a read of it.
 ///
 /// A read is a pin when it is the left side of a `like` whose pattern starts with a
-/// literal (`like "status *"` — the join can only satisfy it by starting with that
-/// token, i.e. by having that subcommand first), or either side of an `==` (an exact
-/// whole-string test). Every other read — a pattern starting with `*`, a negation, an
-/// argv_tail buried in some other operator — can be satisfied by text sitting inside
-/// a single argument, which is what makes it unsound in a `permit`.
+/// literal and ends that literal at the separating space (`like "status *"` — the join
+/// can only satisfy it by having that whole token first), or either side of an `==` (an
+/// exact whole-string test). Every other read — a pattern starting with `*`, one that
+/// stops mid-token (`"diff*"` also matches `difftool`), a negation, an argv_tail buried
+/// in some other operator — can be satisfied by text the author did not name, which is
+/// what makes it unsound in a `permit`.
 fn unpinned_argv_tail_reads(json: &serde_json::Value) -> usize {
     fn is_argv_tail(node: &serde_json::Value) -> bool {
         node.get(".")
@@ -130,11 +135,30 @@ fn unpinned_argv_tail_reads(json: &serde_json::Value) -> usize {
     }
 
     /// A `like` pattern is a list of `{"Literal": "c"}` and `"Wildcard"` elements. It
-    /// is anchored when it does not begin with a wildcard.
-    fn is_anchored(pattern: &serde_json::Value) -> bool {
-        pattern
-            .as_array()
-            .is_some_and(|elements| elements.first().and_then(|e| e.as_str()) != Some("Wildcard"))
+    /// pins a token when it starts with a literal AND that literal run ends where the
+    /// argument ends — either the pattern has no wildcard at all (an exact test) or the
+    /// first wildcard is preceded by the space that separates joined arguments.
+    ///
+    /// `like "diff*"` is anchored but stops mid-token, so it also matches `difftool
+    /// --extcmd=<cmd>`, which executes `<cmd>`: pinning half a token is the same
+    /// over-match the lint exists for.
+    fn pins_a_token(pattern: &serde_json::Value) -> bool {
+        let Some(elements) = pattern.as_array() else {
+            return false;
+        };
+        let is_wildcard = |e: &serde_json::Value| e.as_str() == Some("Wildcard");
+        match elements.iter().position(is_wildcard) {
+            // A pure literal pattern is an exact test.
+            None => true,
+            // A leading wildcard is a search, not a pin.
+            Some(0) => false,
+            Some(first) => {
+                elements[first - 1]
+                    .get("Literal")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(" ")
+            }
+        }
     }
 
     fn walk(node: &serde_json::Value, out: &mut usize) {
@@ -142,7 +166,7 @@ fn unpinned_argv_tail_reads(json: &serde_json::Value) -> usize {
             serde_json::Value::Object(map) => {
                 if let Some(like) = map.get("like") {
                     if like.get("left").is_some_and(is_argv_tail) {
-                        if !like.get("pattern").is_some_and(is_anchored) {
+                        if !like.get("pattern").is_some_and(pins_a_token) {
                             *out += 1;
                         }
                         // The read is accounted for; the pattern holds no expressions.
@@ -652,6 +676,33 @@ when { resource.argv_tail != "push" };"#;
             lint_arg_matching(&PolicySet::from_str(negated).unwrap()).len(),
             1
         );
+    }
+
+    /// Anchoring is not enough on its own: the literal has to end where the token
+    /// ends. `like "diff*"` pins position but not the *whole* subcommand, so it also
+    /// approves `git difftool --extcmd=<cmd>` — which executes `<cmd>`. A pin that
+    /// stops mid-token is the same class of over-match the lint exists for.
+    #[test]
+    fn an_anchored_permit_that_stops_mid_token_is_linted() {
+        for body in [
+            r#"@id("diff-prefix")
+permit (principal, action == Nono::Action::"launchCommand", resource)
+when { resource.argv_tail like "diff*" };"#,
+            r#"@id("status-prefix")
+permit (principal, action == Nono::Action::"launchCommand", resource)
+when { resource.argv_tail like "status--*" };"#,
+        ] {
+            let lints = lint_arg_matching(&PolicySet::from_str(body).unwrap());
+            assert_eq!(lints.len(), 1, "{body}\ngot {lints:?}");
+            assert!(lints[0].contains("token"), "{lints:?}");
+        }
+
+        // A pattern with no wildcard at all is an exact test, so it pins the token by
+        // construction and is not flagged.
+        let exact = r#"@id("exact")
+permit (principal, action == Nono::Action::"launchCommand", resource)
+when { resource.argv_tail like "status" };"#;
+        assert!(lint_arg_matching(&PolicySet::from_str(exact).unwrap()).is_empty());
     }
 
     /// The residual form of the fail-open bug: `args` still holds the per-run shim
