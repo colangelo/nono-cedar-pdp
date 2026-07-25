@@ -21,10 +21,10 @@ Global gate for every group: `just lint && just test` must pass before the group
 
 ## 3. PolicyQuery boundary and webhook adapter
 
-- [ ] 3.1 Write failing `src/adapter/nono_webhook.rs` tests: command mapping, `caller_kind` derivation for a chained launch, unmapped backend falls back to unknown agent, endpoint mapping with proxy identity, unsupported variant errors with a deny reason, malformed body errors with a deny reason. Verify: `cargo test --lib adapter` → fails
-- [ ] 3.2 Implement `src/query.rs`: `PolicyQuery`, `Target`, `CallerKind`, `action_name()`, `resource_summary()`
-- [ ] 3.3 Implement `parse(body, config) -> Result<PolicyQuery, AdaptError>` and `AdaptError::deny_reason()`. Verify: `cargo test --lib` → all pass, including 6 adapter tests
-- [ ] 3.4 Commit: `feat: PolicyQuery boundary and nono webhook adapter`
+- [x] 3.1 Write failing `src/adapter/nono_webhook.rs` tests: command mapping, `caller_kind` derivation for a chained launch, unmapped backend falls back to unknown agent, endpoint mapping with proxy identity, unsupported variant errors with a deny reason, malformed body errors with a deny reason. Verify: `cargo test --lib adapter` → fails
+- [x] 3.2 Implement `src/query.rs`: `PolicyQuery`, `Target`, `CallerKind`, `action_name()`, `resource_summary()`
+- [x] 3.3 Implement `parse(body, config) -> Result<PolicyQuery, AdaptError>` and `AdaptError::deny_reason()`. Verify: `cargo test --lib` → all pass, including 6 adapter tests
+- [x] 3.4 Commit: `feat: PolicyQuery boundary and nono webhook adapter`
 
 ## 4. Cedar schema
 
