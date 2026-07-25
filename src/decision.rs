@@ -13,11 +13,14 @@ pub struct Decision {
 }
 
 impl Decision {
+    /// Reasons are sanitized on the way in: they carry request-derived text (a
+    /// command name, a Cedar error quoting an attribute) into nono's audit trail
+    /// and our own logs, so control characters must never survive.
     pub fn deny(reason: impl Into<String>) -> Self {
         Self {
             allow: false,
             matched: Vec::new(),
-            reason: reason.into(),
+            reason: crate::sanitize::control_escape(&reason.into()),
             eval_us: 0,
         }
     }
@@ -41,13 +44,14 @@ impl Decision {
             .collect();
 
         if !errors.is_empty() {
+            // Cedar error text can quote request-supplied values.
             return Self {
                 allow: false,
                 matched,
-                reason: format!(
+                reason: crate::sanitize::control_escape(&format!(
                     "cedar evaluation errors, failing closed: {}",
                     errors.join("; ")
-                ),
+                )),
                 eval_us,
             };
         }
@@ -55,7 +59,10 @@ impl Decision {
         match response.decision() {
             cedar_policy::Decision::Allow => Self {
                 allow: true,
-                reason: format!("permitted by {}", matched.join(", ")),
+                reason: crate::sanitize::control_escape(&format!(
+                    "permitted by {}",
+                    matched.join(", ")
+                )),
                 matched,
                 eval_us,
             },
@@ -63,7 +70,7 @@ impl Decision {
                 let reason = if matched.is_empty() {
                     "no policy permitted this request (default deny)".to_string()
                 } else {
-                    format!("denied by {}", matched.join(", "))
+                    crate::sanitize::control_escape(&format!("denied by {}", matched.join(", ")))
                 };
                 Self {
                     allow: false,
@@ -102,6 +109,23 @@ mod tests {
             WebhookResponse::Deny {
                 reason: "nope".to_string()
             }
+        );
+    }
+
+    /// The deny reason is echoed to nono and written to the audit log, so bytes
+    /// an attacker chose (a command named with an ANSI erase-line sequence) must
+    /// not travel in it verbatim.
+    #[test]
+    fn deny_reasons_carry_no_raw_control_bytes() {
+        let d = Decision::deny("could not build request: git\u{1b}[2K\rDENY OVERRIDDEN");
+        assert!(!d.reason.chars().any(char::is_control), "{:?}", d.reason);
+        assert!(d.reason.contains("\\u{001b}"), "{}", d.reason);
+        assert_eq!(
+            d.to_wire(),
+            WebhookResponse::Deny {
+                reason: d.reason.clone()
+            },
+            "the sanitized reason is what reaches nono"
         );
     }
 

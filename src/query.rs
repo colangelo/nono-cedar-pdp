@@ -55,9 +55,11 @@ impl PolicyQuery {
         }
     }
 
-    /// Short human-readable resource description for audit lines.
+    /// Short human-readable resource description for audit lines. Control
+    /// characters are escaped: this text is request-derived and ends up in the
+    /// audit trail and in operator-facing log lines.
     pub fn resource_summary(&self) -> String {
-        match &self.target {
+        let raw = match &self.target {
             Target::Command { command, args, .. } => {
                 format!("{command} [{}]", args.join(" "))
             }
@@ -69,6 +71,41 @@ impl PolicyQuery {
             } => {
                 format!("{method} {upstream}{path}")
             }
-        }
+        };
+        crate::sanitize::control_escape(&raw)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_summary_escapes_control_bytes_from_the_command_line() {
+        let q = PolicyQuery {
+            agent: "claude-code".to_string(),
+            session_id: "s1".to_string(),
+            caller: "session".to_string(),
+            caller_kind: CallerKind::Session,
+            request_id: "r1".to_string(),
+            backend: "cedar".to_string(),
+            reason: None,
+            target: Target::Command {
+                command: "git".to_string(),
+                args: vec![
+                    "git".to_string(),
+                    "commit\u{1b}[2K\r-m".to_string(),
+                    "ok".to_string(),
+                ],
+                intercept_rule: "commit".to_string(),
+                child_pid: 1,
+            },
+        };
+        let summary = q.resource_summary();
+        assert!(
+            !summary.chars().any(char::is_control),
+            "audit text must not carry raw control bytes: {summary:?}"
+        );
+        assert!(summary.contains("\\u{001b}"), "{summary}");
     }
 }

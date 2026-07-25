@@ -22,10 +22,17 @@ pub enum BuildError {
     Request(String),
 }
 
+/// Build failures are reported to nono and logged, and the text they carry comes
+/// from the intercepted command (upstream puts the command name in `request_id`).
+/// Escape control characters so a crafted name cannot rewrite a log line.
+fn clean(text: &str) -> String {
+    crate::sanitize::control_escape(text)
+}
+
 fn uid(text: &str) -> Result<EntityUid, BuildError> {
     EntityUid::from_str(text).map_err(|e| BuildError::Uid {
-        uid: text.to_string(),
-        message: e.to_string(),
+        uid: clean(text),
+        message: clean(&e.to_string()),
     })
 }
 
@@ -72,7 +79,7 @@ pub fn build(q: &PolicyQuery, schema: &Schema) -> Result<(Request, Entities), Bu
                 ),
             ]);
             let resource = Entity::new(resource_uid.clone(), attrs, HashSet::new())
-                .map_err(|e| BuildError::Entity(e.to_string()))?;
+                .map_err(|e| BuildError::Entity(clean(&e.to_string())))?;
 
             let mut pairs = vec![
                 ("backend".to_string(), s(&q.backend)),
@@ -111,7 +118,7 @@ pub fn build(q: &PolicyQuery, schema: &Schema) -> Result<(Request, Entities), Bu
                 ("path".to_string(), s(path)),
             ]);
             let resource = Entity::new(resource_uid.clone(), attrs, HashSet::new())
-                .map_err(|e| BuildError::Entity(e.to_string()))?;
+                .map_err(|e| BuildError::Entity(clean(&e.to_string())))?;
 
             let mut pairs = vec![
                 ("backend".to_string(), s(&q.backend)),
@@ -130,13 +137,13 @@ pub fn build(q: &PolicyQuery, schema: &Schema) -> Result<(Request, Entities), Bu
 
     let (resource_uid, resource_entity) = resource;
     let entities = Entities::from_entities([agent, session, caller, resource_entity], Some(schema))
-        .map_err(|e| BuildError::Entity(e.to_string()))?;
+        .map_err(|e| BuildError::Entity(clean(&e.to_string())))?;
 
-    let context =
-        Context::from_pairs(context_pairs).map_err(|e| BuildError::Context(e.to_string()))?;
+    let context = Context::from_pairs(context_pairs)
+        .map_err(|e| BuildError::Context(clean(&e.to_string())))?;
 
     let request = Request::new(caller_uid, action, resource_uid, context, Some(schema))
-        .map_err(|e| BuildError::Request(e.to_string()))?;
+        .map_err(|e| BuildError::Request(clean(&e.to_string())))?;
 
     Ok((request, entities))
 }

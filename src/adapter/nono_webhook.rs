@@ -4,6 +4,10 @@ use crate::config::Config;
 use crate::query::{CallerKind, PolicyQuery, Target};
 use crate::wire::{ApprovalRequest, WebhookEnvelope};
 
+/// Caller and session id used for `endpoint` approvals, which carry no session
+/// identity of their own (spec: `Nono::Caller::"proxy"` in `Nono::Session::"proxy"`).
+const PROXY_IDENTITY: &str = "proxy";
+
 #[derive(Debug, thiserror::Error)]
 pub enum AdaptError {
     #[error("malformed approval request: {0}")]
@@ -32,6 +36,13 @@ pub fn parse(body: &[u8], config: &Config) -> Result<PolicyQuery, AdaptError> {
 
     match envelope.request {
         ApprovalRequest::Command(c) => {
+            // nono sends the caller *label*, not a caller kind: `"session"` for a
+            // direct agent launch, otherwise the intercepted command's name
+            // (upstream `caller_label()`). The match is deliberately exact, so no
+            // near-miss label widens into `Session`. Known v1 limitation: a
+            // profile that intercepts a command literally named `session`
+            // produces a payload indistinguishable from a direct launch;
+            // disambiguating needs a distinct kind field upstream.
             let caller_kind = if c.caller == "session" {
                 CallerKind::Session
             } else {
@@ -55,11 +66,13 @@ pub fn parse(body: &[u8], config: &Config) -> Result<PolicyQuery, AdaptError> {
         }
         ApprovalRequest::Endpoint(e) => Ok(PolicyQuery {
             agent,
-            // The proxy hardcodes `session_id: "proxy"`; there is no session
-            // identity for L7 approvals. Mirror it into the caller so policies
-            // can spot proxy traffic structurally.
-            session_id: e.session_id,
-            caller: "proxy".to_string(),
+            // Endpoint approvals carry no session identity: nono's proxy
+            // hardcodes `session_id: "proxy"`. Pin both halves of the identity
+            // rather than echoing the wire value, so a payload claiming a real
+            // session id cannot place the proxy caller inside that session's
+            // hierarchy and satisfy session-scoped policy.
+            session_id: PROXY_IDENTITY.to_string(),
+            caller: PROXY_IDENTITY.to_string(),
             caller_kind: CallerKind::Session,
             request_id: e.request_id,
             backend: envelope.backend,
@@ -149,6 +162,36 @@ mod tests {
         assert_eq!(q.session_id, "proxy");
         assert_eq!(q.action_name(), "httpRequest");
         assert!(matches!(q.target, Target::Endpoint { .. }));
+    }
+
+    /// nono 0.69 always sends `session_id: "proxy"` for endpoint approvals, but a
+    /// payload that claims a real session id must not place the proxy caller
+    /// inside that session's hierarchy: the identity is pinned, not echoed.
+    #[test]
+    fn endpoint_session_identity_is_pinned_not_taken_from_the_wire() {
+        let body = r#"{"backend":"cedar","request":{
+            "capability_type":"endpoint","request_id":"p1","route_id":"github-api",
+            "upstream":"https://api.github.com","method":"GET","path":"/repos/x",
+            "rule_label":"rl","reason":null,"child_pid":0,"session_id":"s1"}}"#;
+        let q = parse(body.as_bytes(), &config()).unwrap();
+        assert_eq!(q.session_id, "proxy");
+        assert_eq!(q.caller, "proxy");
+    }
+
+    /// Documented v1 limitation: the wire carries the caller *label*, not a
+    /// caller *kind* — `"session"` for a direct agent launch, otherwise the
+    /// intercepted command's name. A profile that intercepts a command literally
+    /// named `session` therefore produces a payload indistinguishable from a
+    /// direct launch; disambiguating needs an upstream field. What we can pin is
+    /// that the match is exact, so no near-miss label widens into `Session`.
+    #[test]
+    fn session_caller_kind_requires_an_exact_label_match() {
+        for name in ["session ", " session", "Session", "sessions", "ses"] {
+            let body = COMMAND.replace(r#""caller":"session""#, &format!(r#""caller":"{name}""#));
+            let q = parse(body.as_bytes(), &config()).unwrap();
+            assert_eq!(q.caller, name);
+            assert_eq!(q.caller_kind, CallerKind::Command, "{name:?}");
+        }
     }
 
     #[test]
