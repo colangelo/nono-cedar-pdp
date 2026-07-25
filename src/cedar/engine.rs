@@ -187,6 +187,20 @@ impl Engine {
         })
     }
 
+    /// Build an engine around an already-loaded set.
+    ///
+    /// `bootstrap` is the normal entry point and refuses a zero-policy set. This
+    /// exists so the HTTP layer's "no policies loaded" branch — the only signal
+    /// that separates a broken decider from a policy denial — can be exercised,
+    /// since by construction no loader can produce that state.
+    pub fn from_loaded(schema: Schema, policy_dir: PathBuf, loaded: LoadedPolicies) -> Self {
+        Self {
+            schema,
+            policy_dir,
+            current: ArcSwap::from_pointee(loaded),
+        }
+    }
+
     pub fn snapshot(&self) -> Arc<LoadedPolicies> {
         self.current.load_full()
     }

@@ -37,6 +37,35 @@ fn state(dir: &tempfile::TempDir) -> server::AppState {
     }
 }
 
+/// State whose policy set is empty. `Engine::bootstrap` and `Engine::reload` both
+/// refuse a zero-policy set, so a running daemon cannot reach this — which is
+/// exactly why the branch that answers it needs a test of its own: it is the only
+/// signal that tells nono "the decider is broken" apart from "policy said no".
+fn unavailable_state(dir: &tempfile::TempDir) -> server::AppState {
+    let mut agents = BTreeMap::new();
+    agents.insert("cedar".to_string(), "claude-code".to_string());
+    let config = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        policy_dir: dir.path().to_path_buf(),
+        audit_log: dir.path().join("decisions.jsonl"),
+        agents,
+        unknown_agent: "unknown".to_string(),
+    };
+    let schema = cedar::schema::load().unwrap();
+    let empty = cedar::engine::LoadedPolicies {
+        set: cedar_policy::PolicySet::new(),
+        generation: 0,
+        loaded_at: std::time::SystemTime::now(),
+        files: Vec::new(),
+    };
+    let engine = cedar::engine::Engine::from_loaded(schema, config.policy_dir.clone(), empty);
+    server::AppState {
+        engine: Arc::new(engine),
+        audit: Arc::new(AuditLog::open(&config.audit_log).unwrap()),
+        config: Arc::new(config),
+    }
+}
+
 async fn post(dir: &tempfile::TempDir, body: &str) -> (StatusCode, serde_json::Value) {
     let app = server::router(state(dir));
     let response = app
@@ -350,6 +379,83 @@ async fn logged_identifiers_carry_no_raw_control_bytes() {
     assert!(
         text.contains("\\u{001b}"),
         "the escape must be visible, not dropped: {text:?}"
+    );
+}
+
+/// A denial says "policy refused this". A 503 says "the decider is broken, do not
+/// treat my answer as a policy decision". Collapsing the second into the first is
+/// how a misconfigured PDP silently becomes a deny-everything one.
+#[tokio::test]
+async fn a_daemon_with_no_policies_reports_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let health = server::router(unavailable_state(&dir))
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let bytes = axum::body::to_bytes(health.into_body(), 8 * 1024)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["policies"], 0);
+
+    let approve = server::router(unavailable_state(&dir))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/approve")
+                .header("content-type", "application/json")
+                .body(Body::from(command_body("git", &["git", "status"])))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(approve.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let bytes = axum::body::to_bytes(approve.into_body(), 8 * 1024)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        json["decision"].is_null(),
+        "a broken decider must not look like a policy denial: {json}"
+    );
+}
+
+/// A panic must reach nono as a definite HTTP failure, not as a dropped
+/// connection it can only report as a transport error.
+#[tokio::test]
+async fn a_panicking_handler_becomes_an_error_response() {
+    async fn boom() -> &'static str {
+        panic!("handler panic")
+    }
+
+    let app = server::with_middleware(
+        axum::Router::new()
+            .route("/boom", axum::routing::get(boom))
+            .route("/ok", axum::routing::get(|| async { "fine" })),
+    );
+
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri("/boom").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let after = app
+        .oneshot(Request::builder().uri("/ok").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        after.status(),
+        StatusCode::OK,
+        "the daemon must stay available after a panic"
     );
 }
 
