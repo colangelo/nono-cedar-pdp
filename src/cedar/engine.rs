@@ -31,19 +31,39 @@ pub enum PolicyLoadError {
     Empty { path: PathBuf },
 }
 
-/// A `.cedar` entry we deliberately skip rather than fail on: editor lock files
-/// and backups (`.#10-git.cedar`, `#10-git.cedar#`), and anything that is not a
-/// regular file (a directory named `archive.cedar`, a dangling symlink). Failing
+/// Why a `*.cedar` entry is deliberately skipped rather than failed on: editor lock
+/// files and backups (`.#10-git.cedar`, `#10-git.cedar#`), and anything that is not
+/// a regular file (a directory named `archive.cedar`, a dangling symlink). Failing
 /// on these would block startup — and every hot-reload — for as long as a policy
 /// file is open in an editor.
-pub(crate) fn is_loadable_policy_file(path: &Path) -> bool {
+///
+/// `None` means loadable. The reason is a sentence for the operator, because a
+/// skipped file is a policy they wrote that decides nothing: `load_dir` logs one
+/// WARN per skip naming the path and this reason (a silently ignored
+/// `.baseline.cedar` is a hole with no trace).
+pub(crate) fn policy_file_skip_reason(path: &Path) -> Option<&'static str> {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        return false;
+        return Some("its name is not valid UTF-8");
     };
     if name.starts_with('.') || name.starts_with('#') {
-        return false;
+        return Some(
+            "its name starts with '.' or '#', the shape editors give lock files and \
+             backups — rename it if it is a real policy",
+        );
     }
-    path.is_file()
+    if !path.is_file() {
+        return Some(
+            "it is not a regular file: a directory, a socket, or a symlink whose \
+             target is missing",
+        );
+    }
+    None
+}
+
+/// Whether `load_dir` will load this path. Shared with [`crate::isolation`] so the
+/// startup mode check inspects exactly the files that get a say in decisions.
+pub(crate) fn is_loadable_policy_file(path: &Path) -> bool {
+    policy_file_skip_reason(path).is_none()
 }
 
 /// Operator lints for the two argument-matching hazards that survive the schema.
@@ -279,16 +299,29 @@ pub fn load_dir(
     schema: &Schema,
     generation: u64,
 ) -> Result<LoadedPolicies, PolicyLoadError> {
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+    let candidates = std::fs::read_dir(dir)
         .map_err(|source| PolicyLoadError::Io {
             path: dir.to_path_buf(),
             source,
         })?
         .filter_map(Result::ok)
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "cedar"))
-        .filter(|p| is_loadable_policy_file(p))
-        .collect();
+        .filter(|p| p.extension().is_some_and(|e| e == "cedar"));
+
+    // A skip is announced, never silent: the file is a policy the operator wrote
+    // and this daemon will not enforce, and the log is the only place they can
+    // find that out.
+    let mut entries: Vec<PathBuf> = Vec::new();
+    for path in candidates {
+        match policy_file_skip_reason(&path) {
+            Some(reason) => tracing::warn!(
+                path = %path.display(),
+                reason,
+                "skipping a *.cedar file: it is not loaded and decides nothing"
+            ),
+            None => entries.push(path),
+        }
+    }
     entries.sort();
 
     let mut set = PolicySet::new();
@@ -320,13 +353,30 @@ pub fn load_dir(
         }
     }
 
+    checked(set, schema, dir, generation, entries)
+}
+
+/// The guards every set passes before it can decide anything, wherever the set came
+/// from: non-empty, strict-validated against `schema`, lints logged. `source` names
+/// the directory the set belongs to, for the error message only.
+///
+/// Factored out so no constructor can acquire a policy set without them — the
+/// zero-policy state in particular is the one an `Engine` must never hold (see
+/// [`Engine::from_policy_set`]).
+fn checked(
+    set: PolicySet,
+    schema: &Schema,
+    source: &Path,
+    generation: u64,
+    files: Vec<PathBuf>,
+) -> Result<LoadedPolicies, PolicyLoadError> {
     // Count policies, not files: a directory of `.cedar` files that are all
     // comments, whitespace or templates yields exactly the deny-everything set
     // this guard exists to refuse. A genuine deny-all is written explicitly as
     // `forbid (principal, action, resource);`.
     if set.num_of_policies() == 0 {
         return Err(PolicyLoadError::Empty {
-            path: dir.to_path_buf(),
+            path: source.to_path_buf(),
         });
     }
 
@@ -347,7 +397,7 @@ pub fn load_dir(
         set,
         generation,
         loaded_at: SystemTime::now(),
-        files: entries,
+        files,
     })
 }
 
@@ -369,13 +419,42 @@ impl Engine {
         })
     }
 
-    /// Build an engine around an already-loaded set.
+    /// Build an engine around a policy set assembled in memory — a set derived from
+    /// the shipped pack, say — through the same guards [`load_dir`] applies: a
+    /// zero-policy set is refused, the set is strict-validated against `schema`, and
+    /// the load lints are logged. `policy_dir` is what `/healthz` reports and what
+    /// [`Engine::reload`] will read, so a reload replaces the in-memory set with
+    /// whatever that directory holds.
+    pub fn from_policy_set(
+        schema: Schema,
+        policy_dir: PathBuf,
+        set: PolicySet,
+        generation: u64,
+    ) -> Result<Self, PolicyLoadError> {
+        let loaded = checked(set, &schema, &policy_dir, generation, Vec::new())?;
+        Ok(Self {
+            schema,
+            policy_dir,
+            current: ArcSwap::from_pointee(loaded),
+        })
+    }
+
+    /// Build an engine around an already-loaded set, **skipping every guard**.
     ///
-    /// `bootstrap` is the normal entry point and refuses a zero-policy set. This
-    /// exists so the HTTP layer's "no policies loaded" branch — the only signal
-    /// that separates a broken decider from a policy denial — can be exercised,
-    /// since by construction no loader can produce that state.
-    pub fn from_loaded(schema: Schema, policy_dir: PathBuf, loaded: LoadedPolicies) -> Self {
+    /// `#[cfg(test)]` on purpose: this is the only way to put an engine in the
+    /// zero-policy state, which `bootstrap`, `from_policy_set` and `reload` all
+    /// refuse, and the HTTP layer's "no policies loaded" 503 — the only signal that
+    /// separates a broken decider from a policy denial — cannot be exercised
+    /// otherwise. It was public until the deviations audit pointed out that a
+    /// production caller could then construct the one state the daemon is designed
+    /// never to hold, so the branch's test moved into `crate::server`'s unit tests
+    /// to keep this seam out of the shipped API.
+    #[cfg(test)]
+    pub(crate) fn from_loaded_unchecked(
+        schema: Schema,
+        policy_dir: PathBuf,
+        loaded: LoadedPolicies,
+    ) -> Self {
         Self {
             schema,
             policy_dir,
@@ -509,6 +588,42 @@ when { resource.args.contains("--force") };
         ));
     }
 
+    /// The zero-policy guard has to be a property of *construction*, not of one
+    /// entry point: an `Engine` holding an empty set answers every request from the
+    /// 503 branch, i.e. "the decider is broken", and if that branch were ever
+    /// simplified away it would answer deny-everything while `/healthz` looked fine.
+    /// So the only constructor a caller outside this crate can reach — a set
+    /// assembled in memory rather than read from a directory — runs exactly the
+    /// guards `load_dir` runs: non-empty, and strict-validated against the schema.
+    #[test]
+    fn the_public_in_memory_constructor_applies_the_load_guards() {
+        let schema = crate::cedar::schema::load().unwrap();
+        let dir = PathBuf::from("/nonexistent/policies");
+
+        let refused =
+            Engine::from_policy_set(schema.clone(), dir.clone(), PolicySet::new(), 1).err();
+        assert!(
+            matches!(refused, Some(PolicyLoadError::Empty { .. })),
+            "an empty set denies everything and must be refused, got {refused:?}"
+        );
+
+        let off_schema = PolicySet::from_str(
+            r#"permit (principal, action == Nono::Action::"launchCommand", resource)
+               when { resource.cwd == "/" };"#,
+        )
+        .unwrap();
+        let refused = Engine::from_policy_set(schema.clone(), dir.clone(), off_schema, 1).err();
+        assert!(
+            matches!(refused, Some(PolicyLoadError::Validation { .. })),
+            "a set that does not validate must not become the active one, got {refused:?}"
+        );
+
+        let engine =
+            Engine::from_policy_set(schema, dir, PolicySet::from_str(GOOD).unwrap(), 7).unwrap();
+        assert_eq!(engine.snapshot().generation, 7);
+        assert_eq!(engine.snapshot().set.num_of_policies(), 2);
+    }
+
     /// A directory full of `.cedar` files that yield *no policies* is exactly the
     /// deny-everything set the Empty guard exists to refuse. Counting files
     /// instead of policies lets it through.
@@ -583,6 +698,44 @@ when { resource.args.contains("--force") };
         let loaded = load_dir(d.path(), &schema, 1).unwrap();
         assert_eq!(loaded.files, vec![d.path().join("10-git.cedar")]);
         assert_eq!(loaded.set.num_of_policies(), 2);
+    }
+
+    /// Skipping is right; skipping *silently* is not. A `.cedar` file the loader
+    /// passes over is a policy the operator wrote and the daemon is not enforcing —
+    /// `.baseline.cedar` (a name a dotfile-minded author reaches for, or a partial
+    /// `mv`) governs nothing, and a `forbid` among them is a hole. The operator has
+    /// only the log to learn from, so every skip has to appear in it, at WARN, with
+    /// the path and the reason.
+    #[test]
+    fn every_skipped_cedar_file_is_named_in_the_log() {
+        let schema = crate::cedar::schema::load().unwrap();
+        let d = dir_with(&[("10-git.cedar", GOOD), (".baseline.cedar", GOOD)]);
+        std::fs::create_dir(d.path().join("archive.cedar")).unwrap();
+
+        let (loaded, log) =
+            crate::test_log::with_captured_log(|| load_dir(d.path(), &schema, 1).unwrap());
+
+        assert_eq!(loaded.files, vec![d.path().join("10-git.cedar")]);
+        assert!(
+            log.contains(".baseline.cedar"),
+            "a hidden policy file must be named in the log: {log:?}"
+        );
+        assert!(
+            log.contains("archive.cedar"),
+            "a .cedar path that is not a regular file must be named: {log:?}"
+        );
+        assert!(
+            log.lines().filter(|l| l.contains("WARN")).count() >= 2,
+            "both skips must be WARN, not a level an operator filters out: {log:?}"
+        );
+        assert!(
+            log.contains("not loaded"),
+            "the line must say the file is not in force: {log:?}"
+        );
+        assert!(
+            !log.contains("10-git.cedar"),
+            "a file that WAS loaded must not be reported as skipped: {log:?}"
+        );
     }
 
     /// A per-file read failure is not a directory read failure; the message has

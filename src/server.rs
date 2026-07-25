@@ -155,3 +155,111 @@ pub async fn serve(state: AppState, bind: SocketAddr) -> std::io::Result<()> {
     tracing::info!(%bind, "listening");
     axum::serve(listener, router(state)).await
 }
+
+/// The fail-closed matrix is exercised over HTTP in `tests/server.rs`. What lives
+/// here is the one branch that cannot be driven from outside the crate: the
+/// zero-policy 503. Reaching it needs an `Engine` built past the load guards, and
+/// that constructor is `#[cfg(test)]` precisely so a daemon cannot be built that way
+/// (see [`crate::cedar::engine::Engine::from_loaded_unchecked`]).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    /// A policy set no loader can produce: `bootstrap`, `from_policy_set` and
+    /// `reload` all refuse it.
+    fn unavailable_state(dir: &tempfile::TempDir) -> AppState {
+        let mut agents = std::collections::BTreeMap::new();
+        agents.insert("cedar".to_string(), "claude-code".to_string());
+        let config = Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            policy_dir: dir.path().to_path_buf(),
+            audit_log: dir.path().join("decisions.jsonl"),
+            agents,
+            unknown_agent: "unknown".to_string(),
+        };
+        let empty = crate::cedar::engine::LoadedPolicies {
+            set: cedar_policy::PolicySet::new(),
+            generation: 0,
+            loaded_at: std::time::SystemTime::now(),
+            files: Vec::new(),
+        };
+        let engine = Engine::from_loaded_unchecked(
+            crate::cedar::schema::load().unwrap(),
+            config.policy_dir.clone(),
+            empty,
+        );
+        AppState {
+            engine: Arc::new(engine),
+            audit: Arc::new(AuditLog::open(&config.audit_log).unwrap()),
+            config: Arc::new(config),
+        }
+    }
+
+    fn command_body(command: &str, args: &[&str]) -> String {
+        serde_json::json!({
+            "backend": "cedar",
+            "request": {
+                "capability_type": "command",
+                "request_id": "r1",
+                "command": command,
+                "args": args,
+                "caller": "session",
+                "intercept_rule": "status",
+                "reason": null,
+                "child_pid": 42,
+                "session_id": "s1"
+            }
+        })
+        .to_string()
+    }
+
+    /// A denial says "policy refused this". A 503 says "the decider is broken, do
+    /// not treat my answer as a policy decision". Collapsing the second into the
+    /// first is how a misconfigured PDP silently becomes a deny-everything one.
+    #[tokio::test]
+    async fn a_daemon_with_no_policies_reports_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let health = router(unavailable_state(&dir))
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(health.into_body(), 8 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["policies"], 0);
+
+        let approve = router(unavailable_state(&dir))
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/approve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(command_body(
+                        "git",
+                        &[crate::wire::EXAMPLE_SHIM_ARGV0, "status"],
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(approve.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(approve.into_body(), 8 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            json["decision"].is_null(),
+            "a broken decider must not look like a policy denial: {json}"
+        );
+    }
+}

@@ -74,7 +74,8 @@ fn shipped_pack_without(policy_id: &str) -> cedar::engine::Engine {
         .set
         .remove_static(cedar_policy::PolicyId::new(policy_id))
         .unwrap_or_else(|e| panic!("the shipped pack must contain {policy_id}: {e}"));
-    cedar::engine::Engine::from_loaded(schema, PathBuf::from(POLICY_DIR), loaded)
+    cedar::engine::Engine::from_policy_set(schema, PathBuf::from(POLICY_DIR), loaded.set, 1)
+        .unwrap()
 }
 
 /// The shipped pack with the anchored permit swapped back for the membership-shaped
@@ -102,7 +103,8 @@ fn shipped_pack_with_the_membership_permit_back() -> cedar::engine::Engine {
             .add(policy.new_id(cedar_policy::PolicyId::new("99-legacy:membership-permit")))
             .unwrap();
     }
-    cedar::engine::Engine::from_loaded(schema, PathBuf::from(POLICY_DIR), loaded)
+    cedar::engine::Engine::from_policy_set(schema, PathBuf::from(POLICY_DIR), loaded.set, 1)
+        .unwrap()
 }
 
 /// The wrong-allow the security audit landed: git's `-c` runs the value of

@@ -602,12 +602,8 @@ mod tests {
         .to_string();
 
         let (response, log_text) = {
-            let sink = CapturedLog::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_ansi(false)
-                .with_writer(sink.clone())
-                .finish();
-            let guard = tracing::subscriber::set_default(subscriber);
+            let sink = crate::test_log::CapturedLog::default();
+            let guard = tracing::subscriber::set_default(crate::test_log::subscriber(&sink));
             let response = crate::server::router(state)
                 .oneshot(
                     axum::http::Request::builder()
@@ -686,58 +682,6 @@ mod tests {
         assert_eq!(recovered["reason"], "after recovery");
     }
 
-    /// `tracing` output captured in memory, so a test can assert what an operator
-    /// tailing the daemon's log would actually see.
-    #[derive(Clone, Default)]
-    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
-
-    impl CapturedLog {
-        fn text(&self) -> String {
-            let guard = match self.0.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            String::from_utf8_lossy(&guard).to_string()
-        }
-    }
-
-    impl std::io::Write for CapturedLog {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            let mut guard = match self.0.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            guard.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
-        type Writer = CapturedLog;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    /// Run `body` with every `tracing` event captured.
-    fn with_captured_log<T>(body: impl FnOnce() -> T) -> (T, String) {
-        let sink = CapturedLog::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_writer(sink.clone())
-            .finish();
-        let out = {
-            let _guard = tracing::subscriber::set_default(subscriber);
-            body()
-        };
-        (out, sink.text())
-    }
-
     /// Rotation — `logrotate`, an operator archiving the trail — renames the file
     /// out from under the open handle. Appending to the renamed (or unlinked) inode
     /// answers decisions that nothing at the configured path records: the audit
@@ -749,7 +693,7 @@ mod tests {
         let path = dir.path().join("decisions.jsonl");
         let rotated = dir.path().join("decisions.jsonl.1");
 
-        let (_, log_text) = with_captured_log(|| {
+        let (_, log_text) = crate::test_log::with_captured_log(|| {
             let log = AuditLog::open(&path).unwrap();
             log.record(
                 &query(),
@@ -827,7 +771,7 @@ mod tests {
         let path = dir.path().join("decisions.jsonl");
         let rotated = dir.path().join("decisions.jsonl.1");
 
-        let (_, log_text) = with_captured_log(|| {
+        let (_, log_text) = crate::test_log::with_captured_log(|| {
             let log = AuditLog::open(&path).unwrap();
             log.record(
                 &query(),
@@ -864,7 +808,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("decisions.jsonl");
 
-        let (_, log_text) = with_captured_log(|| {
+        let (_, log_text) = crate::test_log::with_captured_log(|| {
             let log = AuditLog::open(&path).unwrap();
             log.record(
                 &query(),

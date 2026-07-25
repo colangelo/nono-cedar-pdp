@@ -1,4 +1,9 @@
 //! The fail-closed matrix from the spec, exercised over HTTP.
+//!
+//! One row of it is not here: the zero-policy 503. Reaching that state needs an
+//! engine built past the load guards, and that constructor is `#[cfg(test)]` so no
+//! production caller can skip them — so the test lives in `src/server.rs`'s unit
+//! tests (`a_daemon_with_no_policies_reports_unavailable`).
 #![allow(clippy::unwrap_used, clippy::panic)]
 
 use axum::body::Body;
@@ -44,35 +49,6 @@ fn state(dir: &tempfile::TempDir) -> server::AppState {
     };
     let schema = cedar::schema::load().unwrap();
     let engine = cedar::engine::Engine::bootstrap(schema, config.policy_dir.clone()).unwrap();
-    server::AppState {
-        engine: Arc::new(engine),
-        audit: Arc::new(AuditLog::open(&config.audit_log).unwrap()),
-        config: Arc::new(config),
-    }
-}
-
-/// State whose policy set is empty. `Engine::bootstrap` and `Engine::reload` both
-/// refuse a zero-policy set, so a running daemon cannot reach this — which is
-/// exactly why the branch that answers it needs a test of its own: it is the only
-/// signal that tells nono "the decider is broken" apart from "policy said no".
-fn unavailable_state(dir: &tempfile::TempDir) -> server::AppState {
-    let mut agents = BTreeMap::new();
-    agents.insert("cedar".to_string(), "claude-code".to_string());
-    let config = Config {
-        bind: "127.0.0.1:0".parse().unwrap(),
-        policy_dir: dir.path().to_path_buf(),
-        audit_log: dir.path().join("decisions.jsonl"),
-        agents,
-        unknown_agent: "unknown".to_string(),
-    };
-    let schema = cedar::schema::load().unwrap();
-    let empty = cedar::engine::LoadedPolicies {
-        set: cedar_policy::PolicySet::new(),
-        generation: 0,
-        loaded_at: std::time::SystemTime::now(),
-        files: Vec::new(),
-    };
-    let engine = cedar::engine::Engine::from_loaded(schema, config.policy_dir.clone(), empty);
     server::AppState {
         engine: Arc::new(engine),
         audit: Arc::new(AuditLog::open(&config.audit_log).unwrap()),
@@ -826,51 +802,6 @@ async fn a_payload_that_cannot_become_a_cedar_request_is_denied_and_logged() {
             .contains("could not build policy request"),
         "{:#?}",
         lines[0]
-    );
-}
-
-/// A denial says "policy refused this". A 503 says "the decider is broken, do not
-/// treat my answer as a policy decision". Collapsing the second into the first is
-/// how a misconfigured PDP silently becomes a deny-everything one.
-#[tokio::test]
-async fn a_daemon_with_no_policies_reports_unavailable() {
-    let dir = tempfile::tempdir().unwrap();
-
-    let health = server::router(unavailable_state(&dir))
-        .oneshot(
-            Request::builder()
-                .uri("/healthz")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(health.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let bytes = axum::body::to_bytes(health.into_body(), 8 * 1024)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(json["policies"], 0);
-
-    let approve = server::router(unavailable_state(&dir))
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/approve")
-                .header("content-type", "application/json")
-                .body(Body::from(command_body("git", &[SHIM_GIT, "status"])))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(approve.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let bytes = axum::body::to_bytes(approve.into_body(), 8 * 1024)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert!(
-        json["decision"].is_null(),
-        "a broken decider must not look like a policy denial: {json}"
     );
 }
 

@@ -10,3 +10,6 @@ pub mod sanitize;
 pub mod server;
 pub mod watcher;
 pub mod wire;
+
+#[cfg(test)]
+mod test_log;
