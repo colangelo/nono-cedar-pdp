@@ -1,10 +1,14 @@
 //! Filesystem watch on the policy directory.
 //!
 //! Debounces bursts (editors write several events per save), re-checks that the
-//! directory is still trusted (`isolation::refuse_untrusted_policy_dir` — the
-//! serve layer's concern, kept out of `cedar::engine` so the engine can lift
-//! upstream unchanged), and reloads through `Engine::reload`, which keeps the
-//! last-good set on failure.
+//! directory is still trusted (`isolation::refuse_untrusted_policy_dir` — modes
+//! and owner-or-root ownership on the directory, the loadable files and the
+//! ancestor chain alike; the serve layer's concern, kept out of `cedar::engine`
+//! so the engine can lift upstream unchanged), and reloads through
+//! `Engine::reload`, which keeps the last-good set on failure. Sharing the
+//! startup refusal core means a file another user *planted* while the directory
+//! was transiently loose stays refused by ownership even after the mode is
+//! repaired.
 //!
 //! The re-check exists because the startup refusal is only as good as the moment
 //! it ran: a policy directory that becomes group-writable *mid-session* would

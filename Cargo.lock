@@ -1789,6 +1789,7 @@ dependencies = [
  "axum",
  "cedar-policy",
  "clap",
+ "libc",
  "nono",
  "notify",
  "serde",

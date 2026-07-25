@@ -23,6 +23,26 @@
 //! module, the walk defends against other local users only; it says nothing about
 //! the sandboxed agent (point 1 below).
 //!
+//! Modes are not the whole check, because an owner may change them at will:
+//! every checked component — the policy directory, each loadable policy file,
+//! every existing ancestor of both state paths, and the audit log file once it
+//! exists — must also be **owned by the daemon's effective uid or by root**
+//! (D6). A component another local user owns passes every mode test while its
+//! owner keeps the power to chmod, rename or rewrite it; the sticky bit stops
+//! renames of entries you do not own, but it does not stop an attacker
+//! *pre-creating* a then-missing component (the policy directory under a
+//! `/tmp`-style ancestor, the audit log before its first record) and owning it.
+//! Root is trusted deliberately: a root-installed policy pack this daemon
+//! cannot write is *stronger* than a user-owned one, system ancestors (`/`,
+//! `/Users`) are root-owned everywhere, and owner-or-root is the rule OpenSSH's
+//! `StrictModes` applies to `~/.ssh`. Ownership closes pre-creation — it cannot
+//! see in-place history: a file this user owns whose *content* changed while
+//! its mode was loose is adopted once the mode is repaired, which is why the
+//! writability remedy tells the operator to review before tightening (content
+//! provenance beyond that is epic #1's policy-signing child). And like the mode
+//! checks, ownership defends against other local users only — the sandboxed
+//! agent runs as the same uid and owns these paths already.
+//!
 //! **Both checks here are much weaker than they look, and being precise about that
 //! is the point of this module.**
 //!
@@ -48,7 +68,7 @@
 //! for checking a profile against that rule.
 
 use std::ffi::OsString;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
@@ -86,6 +106,22 @@ pub enum IsolationError {
         who: String,
     },
     #[error(
+        "{what} {path} is owned by uid {owner}, which is neither this daemon's user (uid \
+         {euid}) nor root — an owner can loosen, rename or rewrite a path at will, so a mode \
+         that looks tight proves nothing about who controls it (a component another local \
+         user pre-created under a /tmp-style sticky ancestor passes every mode test this \
+         way: sticky stops renames of entries you do not own, not creation), and the daemon \
+         refuses to serve. Recreate the path under a directory this user owns, or have root \
+         take ownership of it. This says nothing about a sandboxed agent, which runs as the \
+         same user as this daemon and is bounded only by its nono profile's write grants"
+    )]
+    ForeignOwner {
+        what: &'static str,
+        path: PathBuf,
+        owner: u32,
+        euid: u32,
+    },
+    #[error(
         "checking {path}: {source} — refusing to serve without knowing who can write the \
          policies"
     )]
@@ -109,12 +145,14 @@ pub fn check(
     audit_log: &Path,
     cwd: Option<&Path>,
 ) -> Result<Vec<String>, IsolationError> {
+    let euid = daemon_euid();
     let base = cwd.map(|c| absolutize(c, None));
     let policy_dir = absolutize(policy_dir, base.as_deref());
     let audit_log = absolutize(audit_log, base.as_deref());
 
-    refuse_untrusted_policy_dir(&policy_dir)?;
-    refuse_on_loose_ancestors("audit log", &audit_log)?;
+    refuse_untrusted_policy_dir_as(&policy_dir, euid)?;
+    refuse_on_untrusted_ancestors("audit log", "ancestor of the audit log", &audit_log, euid)?;
+    refuse_a_foreign_owned_audit_log(&audit_log, euid)?;
 
     let mut warnings = Vec::new();
     if let Some(base) = base {
@@ -129,7 +167,8 @@ pub fn check(
 }
 
 /// The refusal core for the policy directory: the directory itself, every policy
-/// file the loader would load, and the existing ancestor chain.
+/// file the loader would load, and the existing ancestor chain — each judged on
+/// its mode *and* its owner (owner-or-root, D6).
 ///
 /// One implementation, two callers (D5): [`check`] at startup, and the watcher
 /// before every reload — so the startup path and the reload path cannot drift
@@ -139,11 +178,19 @@ pub fn check(
 /// says nothing about the sandboxed agent, which runs as the same user as this
 /// daemon.
 pub(crate) fn refuse_untrusted_policy_dir(policy_dir: &Path) -> Result<(), IsolationError> {
+    refuse_untrusted_policy_dir_as(policy_dir, daemon_euid())
+}
+
+/// [`refuse_untrusted_policy_dir`] with the effective uid passed in: the seam
+/// that lets the foreign-owner rows of the truth table run against real
+/// fixtures, since `chown` needs privileges the test suite does not have —
+/// pretending to be a different euid makes a self-owned fixture foreign.
+fn refuse_untrusted_policy_dir_as(policy_dir: &Path, euid: u32) -> Result<(), IsolationError> {
     // Absolutize so the ancestor walk runs over the real, symlink-resolved chain.
     // Idempotent for the already-absolutized path `check` passes; the watcher
     // hands over the configured (possibly repo-relative) path as-is.
     let policy_dir = absolutize(policy_dir, None);
-    refuse_if_loosely_writable("policy directory", &policy_dir)?;
+    refuse_if_untrusted("policy directory", &policy_dir, euid)?;
     // Every file the loader would actually load. A `.cedar` name it skips — an
     // editor's lock file or backup — decides nothing, and refusing over one would
     // stop the daemon for as long as a policy file is open in an editor.
@@ -165,31 +212,136 @@ pub(crate) fn refuse_untrusted_policy_dir(policy_dir: &Path) -> Result<(), Isola
             continue;
         }
         // Follows symlinks on purpose: the loader reads through them, so the mode
-        // that decides who can change a policy is the target's.
-        refuse_if_loosely_writable("policy file", &path)?;
+        // (and owner) that decides who can change a policy is the target's.
+        refuse_if_untrusted("policy file", &path, euid)?;
     }
-    refuse_on_loose_ancestors("policy directory", &policy_dir)
+    refuse_on_untrusted_ancestors(
+        "policy directory",
+        "ancestor of the policy directory",
+        &policy_dir,
+        euid,
+    )
 }
 
-fn refuse_if_loosely_writable(what: &'static str, path: &Path) -> Result<(), IsolationError> {
+/// The daemon's effective uid: besides root, the one identity whose ownership of
+/// a state-path component is not a refusal.
+fn daemon_euid() -> u32 {
+    // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail —
+    // it only reads this process's credentials from the kernel.
+    unsafe { libc::geteuid() }
+}
+
+/// What the trust decision needs to know about one filesystem component, split
+/// from *reading* it so the refusal truth table can be driven with injected
+/// values: the suite cannot `chown`, so the foreign- and root-owned rows are
+/// unbuildable as real fixtures (same seam style as `cwd` being passed into
+/// [`check`] rather than read from the process).
+#[derive(Debug, Clone, Copy)]
+struct ComponentFacts {
+    owner_uid: u32,
+    /// Permission bits plus setuid/setgid/sticky: `st_mode & 0o7777`.
+    mode: u32,
+    is_dir: bool,
+}
+
+impl ComponentFacts {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            owner_uid: metadata.uid(),
+            mode: metadata.permissions().mode() & 0o7777,
+            is_dir: metadata.is_dir(),
+        }
+    }
+}
+
+fn refuse_if_untrusted(what: &'static str, path: &Path, euid: u32) -> Result<(), IsolationError> {
     let metadata = std::fs::metadata(path).map_err(|source| IsolationError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    let mode = metadata.permissions().mode() & 0o7777;
-    if let Some(who) = loose_writers(mode) {
+    judge_component(what, path, ComponentFacts::of(&metadata), euid)
+}
+
+/// The refusal truth table for a directly-checked component — the policy
+/// directory or a loadable policy file. Ownership is judged first: a foreign
+/// owner can undo at will any mode this check might approve of, so a tight mode
+/// on a foreign-owned path proves nothing.
+fn judge_component(
+    what: &'static str,
+    path: &Path,
+    facts: ComponentFacts,
+    euid: u32,
+) -> Result<(), IsolationError> {
+    if let Some(owner) = foreign_owner(facts.owner_uid, euid) {
+        return Err(IsolationError::ForeignOwner {
+            what,
+            path: path.to_path_buf(),
+            owner,
+            euid,
+        });
+    }
+    if let Some(who) = loose_writers(facts.mode) {
         return Err(IsolationError::Writable {
             what,
             path: path.to_path_buf(),
-            mode: format!("{mode:04o}"),
+            mode: format!("{:04o}", facts.mode),
             who: who.to_string(),
         });
     }
     Ok(())
 }
 
+/// The owning uid when it is neither `euid` nor root — i.e. when someone else
+/// holds the power to chmod, rename or rewrite the component regardless of its
+/// current mode. Root is trusted deliberately (D6): a root-installed, root-owned
+/// policy pack the daemon cannot write is *stronger* than a user-owned one,
+/// system ancestors (`/`, `/Users`, `/tmp`) are root-owned everywhere, and
+/// owner-or-root is the same rule OpenSSH's `StrictModes` applies to `~/.ssh`.
+fn foreign_owner(owner_uid: u32, euid: u32) -> Option<u32> {
+    (owner_uid != euid && owner_uid != 0).then_some(owner_uid)
+}
+
+/// The audit log file itself, once it exists, is a checked component too (D6).
+/// Its *mode* stays a tighten-on-open, not a refusal (`src/audit.rs`: a trail
+/// the daemon cannot keep private is still better recorded than not), but a
+/// foreign *owner* is different — the owner can rewrite or truncate the record
+/// no matter what mode the open tightens it to, and pre-creating the log before
+/// its first record is exactly the attack ownership closes. Startup-only, like
+/// every audit-log check here: mid-session detachment is `src/audit.rs`'s
+/// reattach concern, and the reload gate is about the policy set.
+fn refuse_a_foreign_owned_audit_log(audit_log: &Path, euid: u32) -> Result<(), IsolationError> {
+    match std::fs::metadata(audit_log) {
+        Ok(metadata) => match foreign_owner(metadata.uid(), euid) {
+            Some(owner) => Err(IsolationError::ForeignOwner {
+                what: "audit log",
+                path: audit_log.to_path_buf(),
+                owner,
+                euid,
+            }),
+            None => Ok(()),
+        },
+        // Not created yet: the open creates it 0600 under this uid, and the
+        // ancestor rules above govern who could have created it first. A
+        // non-directory ancestor (`/dev/null/decisions.jsonl`) is the open's
+        // honest ENOTDIR, not this check's business — same posture as the walk.
+        Err(source)
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(())
+        }
+        Err(source) => Err(IsolationError::Io {
+            path: audit_log.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 /// Walk every existing ancestor of `path` — its parent up to the root — and refuse
-/// on one that is group- or world-writable without the sticky bit.
+/// on one that is group- or world-writable without the sticky bit, or owned by
+/// neither the daemon's user nor root.
 ///
 /// `path` is already absolutized, so the chain being walked is the real one, not a
 /// lexical guess through symlinks. An ancestor that does not exist yet (the audit
@@ -197,31 +349,26 @@ fn refuse_if_loosely_writable(what: &'static str, path: &Path) -> Result<(), Iso
 /// anyone and is skipped; an ancestor that exists but cannot be inspected is a
 /// refusal — an unknown mode has to count as a loose one, or the walk is exactly as
 /// good as not having one.
-fn refuse_on_loose_ancestors(what: &'static str, path: &Path) -> Result<(), IsolationError> {
+fn refuse_on_untrusted_ancestors(
+    what: &'static str,
+    ancestor_what: &'static str,
+    path: &Path,
+    euid: u32,
+) -> Result<(), IsolationError> {
     let mut current = path.parent();
     while let Some(ancestor) = current {
         if ancestor.as_os_str().is_empty() {
             break;
         }
         match std::fs::metadata(ancestor) {
-            // Only a directory can host the rename. Mode bits on a file or device
-            // ancestor (`/dev/null/decisions.jsonl` is the config typo that hits
-            // this) grant no power over directory entries, and nothing below one
-            // can ever exist — the audit log's own open fails with an honest "not
-            // a directory" instead of a rename warning that cannot apply.
-            Ok(metadata) if metadata.is_dir() => {
-                let mode = metadata.permissions().mode() & 0o7777;
-                if let Some(who) = loose_ancestor_writers(mode) {
-                    return Err(IsolationError::WritableAncestor {
-                        what,
-                        path: path.to_path_buf(),
-                        ancestor: ancestor.to_path_buf(),
-                        mode: format!("{mode:04o}"),
-                        who: who.to_string(),
-                    });
-                }
-            }
-            Ok(_) => {}
+            Ok(metadata) => judge_ancestor(
+                what,
+                ancestor_what,
+                path,
+                ancestor,
+                ComponentFacts::of(&metadata),
+                euid,
+            )?,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
             Err(source) => {
                 return Err(IsolationError::Io {
@@ -231,6 +378,50 @@ fn refuse_on_loose_ancestors(what: &'static str, path: &Path) -> Result<(), Isol
             }
         }
         current = ancestor.parent();
+    }
+    Ok(())
+}
+
+/// The refusal truth table for one existing *ancestor* of a state path.
+///
+/// Ownership before mode, for the same reason as [`judge_component`] — and with
+/// one difference from the mode rule: the sticky bit exempts an ancestor from
+/// the *writability* refusal (it blocks the rename attack), but it exempts
+/// nothing from the *ownership* one, because a directory's owner may rename any
+/// entry in it and may drop the sticky bit at will.
+fn judge_ancestor(
+    what: &'static str,
+    ancestor_what: &'static str,
+    path: &Path,
+    ancestor: &Path,
+    facts: ComponentFacts,
+    euid: u32,
+) -> Result<(), IsolationError> {
+    // Only a directory can host the rename. Mode bits on a file or device
+    // ancestor (`/dev/null/decisions.jsonl` is the config typo that hits this)
+    // grant no power over directory entries, and nothing below one can ever
+    // exist — the audit log's own open fails with an honest "not a directory"
+    // instead of a rename warning that cannot apply. Ownership is moot for the
+    // same reason: there is nothing below the non-directory to substitute.
+    if !facts.is_dir {
+        return Ok(());
+    }
+    if let Some(owner) = foreign_owner(facts.owner_uid, euid) {
+        return Err(IsolationError::ForeignOwner {
+            what: ancestor_what,
+            path: ancestor.to_path_buf(),
+            owner,
+            euid,
+        });
+    }
+    if let Some(who) = loose_ancestor_writers(facts.mode) {
+        return Err(IsolationError::WritableAncestor {
+            what,
+            path: path.to_path_buf(),
+            ancestor: ancestor.to_path_buf(),
+            mode: format!("{:04o}", facts.mode),
+            who: who.to_string(),
+        });
     }
     Ok(())
 }
@@ -601,6 +792,276 @@ mod tests {
             text.contains("locked/sub"),
             "the uninspectable ancestor must be named: {text}"
         );
+    }
+
+    /// The uids the injected-facts rows run under. Arbitrary values: only the
+    /// same/other/root relationships matter to the truth table.
+    const EUID: u32 = 500;
+    const FOREIGN: u32 = 501;
+
+    /// D6's core row: a component owned by someone else passes every mode test
+    /// while its owner can chmod, rename or rewrite it at will, so a tight mode
+    /// proves nothing and the refusal must fire on ownership alone.
+    #[test]
+    fn a_foreign_owned_component_refuses_no_matter_how_tight_the_mode() {
+        let facts = ComponentFacts {
+            owner_uid: FOREIGN,
+            mode: 0o700,
+            is_dir: true,
+        };
+        let err =
+            judge_component("policy directory", Path::new("/x/policies"), facts, EUID).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            matches!(err, IsolationError::ForeignOwner { .. }),
+            "want an ownership refusal, got {text}"
+        );
+        assert!(
+            text.contains("/x/policies"),
+            "the path must be named: {text}"
+        );
+        assert!(
+            text.contains("501"),
+            "the owning uid must be named: {text}"
+        );
+        assert!(
+            text.contains("root"),
+            "the rule is owner-or-root and the message must say so: {text}"
+        );
+        assert!(
+            text.contains("mode"),
+            "the message must explain why ownership matters when the mode looks tight: {text}"
+        );
+        assert!(
+            text.contains("same user"),
+            "scope honesty: this defends against other local users, not the agent: {text}"
+        );
+
+        // Same row for a policy file: the loader reads through it either way.
+        let file_facts = ComponentFacts {
+            owner_uid: FOREIGN,
+            mode: 0o600,
+            is_dir: false,
+        };
+        let err = judge_component(
+            "policy file",
+            Path::new("/x/policies/p.cedar"),
+            file_facts,
+            EUID,
+        )
+        .unwrap_err();
+        assert!(matches!(err, IsolationError::ForeignOwner { .. }), "{err}");
+    }
+
+    /// The root-owned PASS rows — the reason "or root" is in the rule at all:
+    /// `/`, `/Users` and `/tmp` (1777, sticky) are root-owned on every macOS and
+    /// Linux system, and a root-installed pack the daemon cannot write is
+    /// *stronger* than a user-owned one. The suite cannot create root-owned
+    /// fixtures, so these rows run on injected facts; the real-chain PASS side
+    /// is every other test in this module, whose fixture ancestors are all
+    /// root- or self-owned.
+    #[test]
+    fn root_owned_components_and_ancestors_pass() {
+        judge_component(
+            "policy directory",
+            Path::new("/etc/pdp/policies"),
+            ComponentFacts {
+                owner_uid: 0,
+                mode: 0o755,
+                is_dir: true,
+            },
+            EUID,
+        )
+        .unwrap_or_else(|e| panic!("a root-owned policy directory must pass: {e}"));
+        judge_ancestor(
+            "policy directory",
+            "ancestor of the policy directory",
+            Path::new("/etc/pdp/policies"),
+            Path::new("/"),
+            ComponentFacts {
+                owner_uid: 0,
+                mode: 0o755,
+                is_dir: true,
+            },
+            EUID,
+        )
+        .unwrap_or_else(|e| panic!("a root-owned ancestor must pass: {e}"));
+        // `/tmp` itself: root-owned, world-writable, sticky.
+        judge_ancestor(
+            "audit log",
+            "ancestor of the audit log",
+            Path::new("/tmp/pdp/decisions.jsonl"),
+            Path::new("/tmp"),
+            ComponentFacts {
+                owner_uid: 0,
+                mode: 0o1777,
+                is_dir: true,
+            },
+            EUID,
+        )
+        .unwrap_or_else(|e| panic!("a root-owned sticky 1777 ancestor must pass: {e}"));
+    }
+
+    /// The sticky bit exempts an ancestor from the *writability* refusal only:
+    /// the directory's owner may rename any entry in it, and may drop the sticky
+    /// bit at will, so a foreign-owned sticky ancestor is still a refusal.
+    #[test]
+    fn a_foreign_owned_sticky_ancestor_still_refuses() {
+        let err = judge_ancestor(
+            "policy directory",
+            "ancestor of the policy directory",
+            Path::new("/x/policies"),
+            Path::new("/x"),
+            ComponentFacts {
+                owner_uid: FOREIGN,
+                mode: 0o1777,
+                is_dir: true,
+            },
+            EUID,
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            matches!(err, IsolationError::ForeignOwner { .. }),
+            "sticky must not exempt ownership: {text}"
+        );
+        assert!(
+            text.contains("ancestor of the policy directory"),
+            "the message must say which chain this sits on: {text}"
+        );
+        assert!(text.contains("/x"), "the ancestor must be named: {text}");
+    }
+
+    /// Non-directory ancestors stay out of the walk's business whoever owns
+    /// them: nothing below one can ever exist, so the state path's own open
+    /// fails with the honest ENOTDIR (same rationale as the mode-side skip).
+    #[test]
+    fn a_non_directory_ancestor_is_skipped_whoever_owns_it() {
+        judge_ancestor(
+            "audit log",
+            "ancestor of the audit log",
+            Path::new("/dev/null/decisions.jsonl"),
+            Path::new("/dev/null"),
+            ComponentFacts {
+                owner_uid: FOREIGN,
+                mode: 0o666,
+                is_dir: false,
+            },
+            EUID,
+        )
+        .unwrap_or_else(|e| panic!("a non-directory ancestor is the open's error, not ours: {e}"));
+    }
+
+    /// Passing the ownership test must not shadow the mode test: a self-owned
+    /// but group-writable component is still the original refusal.
+    #[test]
+    fn a_self_owned_component_is_still_judged_by_its_mode() {
+        let err = judge_component(
+            "policy directory",
+            Path::new("/x/policies"),
+            ComponentFacts {
+                owner_uid: EUID,
+                mode: 0o770,
+                is_dir: true,
+            },
+            EUID,
+        )
+        .unwrap_err();
+        assert!(matches!(err, IsolationError::Writable { .. }), "{err}");
+    }
+
+    /// D6 through the real metadata path: the fixture is owned by whoever runs
+    /// the suite, so pretending to be a *different* euid makes it foreign-owned
+    /// without the chown the suite cannot do. The public wrapper supplies the
+    /// real euid; everything below the seam is the same code.
+    #[test]
+    fn a_policy_directory_owned_by_another_uid_refuses_to_serve() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = policy_dir(root.path());
+        let owner = std::fs::metadata(&dir).unwrap().uid();
+
+        let err = refuse_untrusted_policy_dir_as(&dir, owner + 1).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            matches!(err, IsolationError::ForeignOwner { .. }),
+            "want an ownership refusal, got {text}"
+        );
+        assert!(
+            text.contains(&dir.display().to_string()),
+            "the path must be named: {text}"
+        );
+        assert!(
+            text.contains(&owner.to_string()),
+            "the owning uid must be named: {text}"
+        );
+    }
+
+    /// The ancestor half of the same real-metadata proof, driven through the
+    /// walk itself so the refusal provably lands on the ancestor.
+    #[test]
+    fn an_ancestor_owned_by_another_uid_refuses_to_serve() {
+        let root = tempfile::tempdir().unwrap();
+        let holder = root.path().join("holder");
+        std::fs::create_dir(&holder).unwrap();
+        let dir = policy_dir(&holder);
+        let owner = std::fs::metadata(&holder).unwrap().uid();
+
+        let err = refuse_on_untrusted_ancestors(
+            "policy directory",
+            "ancestor of the policy directory",
+            &absolutize(&dir, None),
+            owner + 1,
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            matches!(err, IsolationError::ForeignOwner { .. }),
+            "want an ownership refusal, got {text}"
+        );
+        assert!(
+            text.contains(&holder.display().to_string()),
+            "the ancestor must be named: {text}"
+        );
+    }
+
+    /// The audit log file, once it exists, is a checked component too: its mode
+    /// stays tighten-on-open, but a foreign owner can rewrite the record no
+    /// matter what the open tightens the mode to — the pre-created-file half of
+    /// the attack.
+    #[test]
+    fn an_audit_log_owned_by_another_uid_refuses_to_serve() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("decisions.jsonl");
+        std::fs::write(&log, "").unwrap();
+        let owner = std::fs::metadata(&log).unwrap().uid();
+
+        let err = refuse_a_foreign_owned_audit_log(&log, owner + 1).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            matches!(err, IsolationError::ForeignOwner { .. }),
+            "want an ownership refusal, got {text}"
+        );
+        assert!(text.contains("audit log"), "{text}");
+        assert!(
+            text.contains(&log.display().to_string()),
+            "the path must be named: {text}"
+        );
+    }
+
+    /// Before the first record there is nothing to own — the open creates the
+    /// log 0600 under this uid, and the ancestor rules govern who could have
+    /// created it first. And a non-directory ancestor stays the open's honest
+    /// ENOTDIR, not an ownership refusal.
+    #[test]
+    fn a_missing_audit_log_is_not_an_ownership_refusal() {
+        let root = tempfile::tempdir().unwrap();
+        refuse_a_foreign_owned_audit_log(&root.path().join("decisions.jsonl"), EUID)
+            .unwrap_or_else(|e| panic!("a not-yet-created audit log must pass: {e}"));
+
+        let blocker = root.path().join("blocker.txt");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        refuse_a_foreign_owned_audit_log(&blocker.join("decisions.jsonl"), EUID)
+            .unwrap_or_else(|e| panic!("ENOTDIR is the open's error, not this check's: {e}"));
     }
 
     #[test]
