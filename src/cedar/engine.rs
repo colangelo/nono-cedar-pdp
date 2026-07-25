@@ -52,11 +52,16 @@ fn is_loadable_policy_file(path: &Path) -> bool {
 /// so a policy that reaches for one is refused by strict validation rather than
 /// warned about. What is left needs advice, not a wall:
 ///
-/// 1. **A `permit` that reads `argv_tail`.** `argv_tail` is a joined string, so
-///    `argv_tail like "*--force*"` also matches when the text sits *inside* a
-///    single argument (`-m "do not --force this"`), and it cannot tell
-///    `["push --force"]` from `["push", "--force"]`. Over-matching is fail-safe in
-///    a `forbid` and unsound in a `permit`.
+/// 1. **A `permit` whose `argv_tail` test is not a positional pin.** `argv_tail` is
+///    a joined string, so an unanchored glob such as `argv_tail like "*--force*"`
+///    also matches when the text sits *inside* a single argument
+///    (`-m "do not --force this"`), and it cannot tell `["push --force"]` from
+///    `["push", "--force"]`. Over-matching is fail-safe in a `forbid` and unsound in
+///    a `permit`. A pattern anchored at the start (`like "status *"`) or an equality
+///    test (`== "status"`) is a different thing: it pins the FIRST token of
+///    `args[1..]`, which is the git-style subcommand, and that is the one thing set
+///    membership cannot express. Those are the sound shape for a `permit` and are
+///    not flagged; only a read that is neither is.
 /// 2. **An `args` membership test against a value containing `/`.** `args` stays
 ///    faithful to the payload, so `args[0]` is the per-run shim path
 ///    (`…/nono-tool-sandbox-<pid>-<nanos>-<hex>/shims/<command>`): a literal that
@@ -81,12 +86,13 @@ pub fn lint_arg_matching(set: &PolicySet) -> Vec<String> {
             }
         };
 
-        if policy.effect() == Effect::Permit && json.to_string().contains(r#""attr":"argv_tail""#) {
+        if policy.effect() == Effect::Permit && unpinned_argv_tail_reads(&json) > 0 {
             lints.push(format!(
-                "policy {} is a permit that reads resource.argv_tail; a glob over \
-                 a joined argument string over-matches text inside a single \
-                 argument, so it belongs in forbid only — use \
-                 resource.args.contains(..) for exact tests",
+                "policy {} is a permit that reads resource.argv_tail without pinning \
+                 a position; a glob that starts with a wildcard over-matches text \
+                 inside a single argument, so it belongs in forbid only — anchor the \
+                 pattern at the start (like \"status *\") or compare it exactly \
+                 (== \"status\"), and use resource.args.contains(..) for flags",
                 policy.id()
             ));
         }
@@ -103,6 +109,78 @@ pub fn lint_arg_matching(set: &PolicySet) -> Vec<String> {
         }
     }
     lints
+}
+
+/// How many reads of `resource.argv_tail` in this policy are **not** positional
+/// pins. Walks the policy's JSON (EST) form rather than its source text, so a
+/// comment mentioning the attribute is not a read of it.
+///
+/// A read is a pin when it is the left side of a `like` whose pattern starts with a
+/// literal (`like "status *"` — the join can only satisfy it by starting with that
+/// token, i.e. by having that subcommand first), or either side of an `==` (an exact
+/// whole-string test). Every other read — a pattern starting with `*`, a negation, an
+/// argv_tail buried in some other operator — can be satisfied by text sitting inside
+/// a single argument, which is what makes it unsound in a `permit`.
+fn unpinned_argv_tail_reads(json: &serde_json::Value) -> usize {
+    fn is_argv_tail(node: &serde_json::Value) -> bool {
+        node.get(".")
+            .and_then(|access| access.get("attr"))
+            .and_then(serde_json::Value::as_str)
+            == Some("argv_tail")
+    }
+
+    /// A `like` pattern is a list of `{"Literal": "c"}` and `"Wildcard"` elements. It
+    /// is anchored when it does not begin with a wildcard.
+    fn is_anchored(pattern: &serde_json::Value) -> bool {
+        pattern
+            .as_array()
+            .is_some_and(|elements| elements.first().and_then(|e| e.as_str()) != Some("Wildcard"))
+    }
+
+    fn walk(node: &serde_json::Value, out: &mut usize) {
+        match node {
+            serde_json::Value::Object(map) => {
+                if let Some(like) = map.get("like") {
+                    if like.get("left").is_some_and(is_argv_tail) {
+                        if !like.get("pattern").is_some_and(is_anchored) {
+                            *out += 1;
+                        }
+                        // The read is accounted for; the pattern holds no expressions.
+                        return;
+                    }
+                }
+                if let Some(equality) = map.get("==") {
+                    let sides = [equality.get("left"), equality.get("right")];
+                    if sides.iter().flatten().copied().any(is_argv_tail) {
+                        // Sound: descend only into whatever the other side is.
+                        for side in sides.into_iter().flatten() {
+                            if !is_argv_tail(side) {
+                                walk(side, out);
+                            }
+                        }
+                        return;
+                    }
+                }
+                if is_argv_tail(node) {
+                    *out += 1;
+                    return;
+                }
+                for value in map.values() {
+                    walk(value, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = 0;
+    walk(json, &mut out);
+    out
 }
 
 /// Every string literal a policy compares against `resource.args` membership that
@@ -472,12 +550,13 @@ when { resource.args.contains("--force") };
         assert!(text.contains("bad.cedar"), "{text}");
     }
 
-    /// `argv_tail` is a space-join, so `like` globs over it also match text
-    /// *inside* a single argument. Over-matching is fail-safe in a `forbid` and
-    /// unsound in a `permit`, so a permit that reads it gets flagged. This is the
-    /// hazard that SURVIVES the removal of `argv`: flattening, not anchoring.
+    /// `argv_tail` is a space-join, so an **unanchored** glob over it also matches
+    /// text *inside* a single argument. Over-matching is fail-safe in a `forbid` and
+    /// unsound in a `permit`, so an unanchored pattern in a permit gets flagged.
+    /// This is the hazard that SURVIVES the removal of `argv`: flattening, not
+    /// anchoring.
     #[test]
-    fn a_permit_reading_argv_tail_is_linted_but_a_forbid_is_not() {
+    fn an_unanchored_argv_tail_permit_is_linted_but_a_forbid_is_not() {
         let forbid_tail = r#"@id("no-force")
 forbid (principal, action == Nono::Action::"launchCommand", resource)
 when { resource.argv_tail like "*--force*" };"#;
@@ -485,11 +564,12 @@ when { resource.argv_tail like "*--force*" };"#;
 
         let permit_tail = r#"@id("git-push")
 permit (principal, action == Nono::Action::"launchCommand", resource)
-when { resource.argv_tail like "push*" };"#;
+when { resource.argv_tail like "*push*" };"#;
         let set = PolicySet::from_str(permit_tail).unwrap();
         let lints = lint_arg_matching(&set);
         assert_eq!(lints.len(), 1, "{lints:?}");
         assert!(lints[0].contains("argv_tail"), "{lints:?}");
+        assert!(lints[0].contains("anchor"), "{lints:?}");
         // The operator has to be told *which* policy: the loader assigns
         // `<file stem>:<@id>` ids, so naming the id names the file too.
         let id = set.policies().next().unwrap().id().to_string();
@@ -497,10 +577,55 @@ when { resource.argv_tail like "push*" };"#;
 
         // A comment that merely mentions argv_tail is not a read of it.
         let clean = r#"@id("ok")
-// argv_tail is forbid-only, so this uses args
+// an unanchored argv_tail glob is forbid-only, so this uses args
 permit (principal, action == Nono::Action::"launchCommand", resource)
 when { resource.args.contains("status") };"#;
         assert!(lint_arg_matching(&PolicySet::from_str(clean).unwrap()).is_empty());
+    }
+
+    /// The reason `argv_tail` exists: it is the only way to say "the subcommand is
+    /// FIRST", which set membership cannot express. A pattern anchored at the start —
+    /// or an equality test — is a positional pin, not an over-matching substring
+    /// search, so it is the sound shape for a `permit` and must not be linted. The
+    /// shipped read-only git permit has exactly this shape.
+    #[test]
+    fn a_positionally_anchored_argv_tail_permit_is_not_linted() {
+        for body in [
+            r#"@id("git-status")
+permit (principal, action == Nono::Action::"launchCommand", resource)
+when { resource.argv_tail == "status" };"#,
+            r#"@id("git-status-args")
+permit (principal, action == Nono::Action::"launchCommand", resource)
+when { resource.argv_tail like "status *" };"#,
+            r#"@id("git-read-only")
+permit (principal, action == Nono::Action::"launchCommand", resource)
+when { resource.command == "git" &&
+       (resource.argv_tail == "status" || resource.argv_tail like "status *" ||
+        resource.argv_tail == "log" || resource.argv_tail like "log *") };"#,
+        ] {
+            let lints = lint_arg_matching(&PolicySet::from_str(body).unwrap());
+            assert!(lints.is_empty(), "{body}\ngot {lints:?}");
+        }
+
+        // One unanchored read among anchored ones is still flagged: the unanchored
+        // half is what can over-match into an approval.
+        let mixed = r#"@id("mixed")
+permit (principal, action == Nono::Action::"launchCommand", resource)
+when { resource.argv_tail like "status *" || resource.argv_tail like "*--porcelain*" };"#;
+        assert_eq!(
+            lint_arg_matching(&PolicySet::from_str(mixed).unwrap()).len(),
+            1
+        );
+
+        // Anything that is neither an anchored pattern nor an equality test is not a
+        // positional pin, so it stays flagged — a negated test in a permit widens it.
+        let negated = r#"@id("not-status")
+permit (principal, action == Nono::Action::"launchCommand", resource)
+when { resource.argv_tail != "push" };"#;
+        assert_eq!(
+            lint_arg_matching(&PolicySet::from_str(negated).unwrap()).len(),
+            1
+        );
     }
 
     /// The residual form of the fail-open bug: `args` still holds the per-run shim
