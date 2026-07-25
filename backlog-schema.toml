@@ -1,0 +1,25 @@
+# backlog-schema.toml — nono-cedar-pdp backlog vocabulary.
+# Extends the cross-project vocabulary bundled with the gitea-backlog skill
+# (type/, status/, horizon/, needs/). Only the project-specific axis is declared
+# here. Backlog lives on the private Gitea instance: ac/nono-cedar-pdp.
+
+extends = "general"
+
+[scopes.area]            # subsystems of the PDP daemon
+exclusive = false
+color = "#1d76db"
+values = [
+  "wire",        # nono approval contract mirror, adapters, conformance guard
+  "cedar",       # schema, entity slices, policy loading, evaluation, hot-reload
+  "policy-pack", # the shipped .cedar policies and authoring guidance
+  "server",      # HTTP decide endpoint, health, transport
+  "audit",       # decision log and its integrity guarantees
+  "ops",         # config, CLI, packaging, deployment
+  "security",    # hardening that spans modules (trust boundary, integrity)
+  "upstream",    # engagement with nolabs-ai/nono: issues, PRs, contract asks
+  "docs",        # README, design spec, ADRs, research
+]
+
+# priority/ stays off: single maintainer, horizon/ carries the ordering.
+[scopes.priority]
+enabled = false
