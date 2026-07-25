@@ -6,18 +6,18 @@ Global gate for every group: `just lint && just test` must pass before the group
 
 ## 1. Scaffold and configuration
 
-- [ ] 1.1 Write failing `Config` tests in `src/config.rs`: minimal config applies defaults, backend→agent map with fallback, unknown key rejected, `~/` expanded. Verify: `cargo test --lib config` → fails with "cannot find type `Config`"
-- [ ] 1.2 Create `Cargo.toml` with the pinned dependency set, `[lib]` + `[[bin]]`, and the `clippy::unwrap_used`/`expect_used`/`panic` denials. Confirm `nono` appears only under `[dev-dependencies]`
-- [ ] 1.3 Implement `Config`, `ConfigError`, `expand_tilde`, `Config::agent_for`. Verify: `cargo test --lib config` → 4 passed
-- [ ] 1.4 Add `Justfile` (default recipe `just --list`, plus `check`/`test`/`lint`/`fmt`/`serve`) and `.gitignore`. Verify: `just check && just test && just lint` → all pass
-- [ ] 1.5 Commit: `feat: project scaffold and config loading`
+- [x] 1.1 Write failing `Config` tests in `src/config.rs`: minimal config applies defaults, backend→agent map with fallback, unknown key rejected, `~/` expanded. Verify: `cargo test --lib config` → fails with "cannot find type `Config`"
+- [x] 1.2 Create `Cargo.toml` with the pinned dependency set, `[lib]` + `[[bin]]`, and the `clippy::unwrap_used`/`expect_used`/`panic` denials. Confirm `nono` appears only under `[dev-dependencies]`
+- [x] 1.3 Implement `Config`, `ConfigError`, `expand_tilde`, `Config::agent_for`. Verify: `cargo test --lib config` → 4 passed
+- [x] 1.4 Add `Justfile` (default recipe `just --list`, plus `check`/`test`/`lint`/`fmt`/`serve`) and `.gitignore`. Verify: `just check && just test && just lint` → all pass
+- [x] 1.5 Commit: `feat: project scaffold and config loading`
 
 ## 2. Wire types and upstream conformance guard
 
-- [ ] 2.1 Write failing `src/wire.rs` tests using the real captured payloads: command envelope parses, endpoint envelope parses with proxy identity, unknown `capability_type` maps to `Unsupported`, unknown fields tolerated, response serializes to `{"decision":"allow"}` / `{"decision":"deny","reason":…}`. Verify: `cargo test --lib wire` → fails
-- [ ] 2.2 Implement `WebhookEnvelope`, `ApprovalRequest` (internally tagged on `capability_type`, `#[serde(other)]` → `Unsupported`), `CommandRequest`, `EndpointRequest`, `WebhookResponse`. No `deny_unknown_fields` anywhere in this module. Verify: `cargo test --lib wire` → 5 passed
-- [ ] 2.3 Write `tests/conformance.rs`: serialize `nono::ApprovalRequest::{Command,Endpoint,Capability}` with upstream's own serde, assert exact key sets, assert our mirrors round-trip, assert `capability` classifies as `Unsupported`, and assert `{"decision":"allow"}` does not parse as `nono::ApprovalDecision`. Verify: `cargo test --test conformance` → 4 passed (first run compiles the `nono` dev-dep, ~30 s)
-- [ ] 2.4 Commit: `feat: nono wire types with upstream conformance guard`
+- [x] 2.1 Write failing `src/wire.rs` tests using the real captured payloads: command envelope parses, endpoint envelope parses with proxy identity, unknown `capability_type` maps to `Unsupported`, unknown fields tolerated, response serializes to `{"decision":"allow"}` / `{"decision":"deny","reason":…}`. Verify: `cargo test --lib wire` → fails
+- [x] 2.2 Implement `WebhookEnvelope`, `ApprovalRequest` (internally tagged on `capability_type`, `#[serde(other)]` → `Unsupported`), `CommandRequest`, `EndpointRequest`, `WebhookResponse`. No `deny_unknown_fields` anywhere in this module. Verify: `cargo test --lib wire` → 5 passed
+- [x] 2.3 Write `tests/conformance.rs`: serialize `nono::ApprovalRequest::{Command,Endpoint,Capability}` with upstream's own serde, assert exact key sets, assert our mirrors round-trip, assert `capability` classifies as `Unsupported`, and assert `{"decision":"allow"}` does not parse as `nono::ApprovalDecision`. Verify: `cargo test --test conformance` → 4 passed (first run compiles the `nono` dev-dep, ~30 s)
+- [x] 2.4 Commit: `feat: nono wire types with upstream conformance guard`
 
 ## 3. PolicyQuery boundary and webhook adapter
 
