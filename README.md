@@ -110,6 +110,14 @@ $ cargo run -- check tests/fixtures/git-force-push.json
 DENY: denied by 10-git:no-history-rewrites (1497 µs)
 ```
 
+Two shapes of `*.cedar` file are **skipped, not loaded**: a name starting with `.` or
+`#` (`.baseline.cedar`, Emacs's `.#10-git.cedar` lock symlink) and anything that is not
+a regular file (a directory named `archive.cedar`). Failing the load on those would
+brick every reload for as long as a policy file is open in an editor, so the daemon
+passes over them — but never silently: each skip is a WARN naming the path and the
+reason, because a skipped file is a policy you wrote that decides nothing. If a
+`forbid` of yours is not firing, grep the log for `skipping a *.cedar file`.
+
 Editing a policy file reloads the set in place (~150 ms debounce). A reload that
 fails to parse or validate keeps the **last-good** set and does not advance the
 generation, so a bad edit mid-session cannot deny-all a running agent. Startup with

@@ -82,6 +82,16 @@ state outside the repository, and the audit sink revalidates its inode before ev
 record so a rotation cannot silently detach the trail. `nono-cedar-pdp.toml`, the
 `Justfile`, `src/isolation.rs` and `src/audit.rs` are the shipped truth.
 
+**Two smaller shapes below are also not what shipped** (the deviations-honesty audit,
+change task group 15). (a) The `approve` handler in Step 8 takes `Bytes`; the shipped one
+takes `axum::body::Body` and buffers it itself against an explicit
+`MAX_REQUEST_BYTES = 1 MiB`, because an extractor rejects *before* the handler runs and
+nono would then record `returned HTTP 413` instead of our deny reason. (b) `Engine` grew a
+public `from_loaded` as a test seam for the 503 branch, bypassing the zero-policy guard;
+the shipped API has `from_policy_set` (which applies the same guards as a directory load)
+and keeps the unguarded constructor `#[cfg(test)]`. `src/server.rs` and
+`src/cedar/engine.rs` are the shipped truth.
+
 **Real endpoint-request JSON** (field set from `crates/nono/src/supervisor/types.rs`; the proxy hardcodes `session_id: "proxy"` and `child_pid: 0`):
 
 ```json

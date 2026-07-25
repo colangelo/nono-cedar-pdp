@@ -142,11 +142,15 @@ in the webhook backend config.
 | D15 | Endpoint `path` stays **raw**; a path whose meaning depends on the upstream's normalisation is denied before any policy runs | `resource.path like "/repos/*"` was satisfied by `/repos/../user/keys` (and `%2e%2e`, `%252e%252e`, `..;/`). Normalising here would change what a policy matches *and* guess at which of many normalisation rules the upstream applies; refusing the ambiguity keeps `path` faithful and fails closed. Query strings, dots inside a segment, and a stray `%` below the first decode pass are deliberately not ambiguous |
 | D16 | The audit sink revalidates the `(st_dev, st_ino)` of its path **before every record** and reopens on a mismatch; a failed reopen keeps writing to the handle already held | An append handle survives `rename`/`unlink` and its writes keep succeeding, so a rotation silently detached the trail: decisions were answered and recorded into an inode nothing can read at the configured path, with `/healthz` still green (proven by renaming the log under a running daemon). One `stat` per record is nothing next to a Cedar evaluation, and "periodic" would leave a window of unrecorded decisions. Dropping the line on a failed reopen would lose more than appending to the previous file, and neither path may change a decision |
 
+| D17 | The zero-policy guard is a property of **construction**: every engine constructor reachable outside the crate applies it (`bootstrap` from a directory, `from_policy_set` from a set assembled in memory), and the unguarded seam the 503 test needs is `#[cfg(test)]`. A `*.cedar` file the loader skips is logged at WARN naming the path and the reason | A public `from_loaded` let any caller build the one state D9 exists to refuse — an engine whose set decides nothing — for no reason other than reaching the 503 branch from an integration test; the test moved into the library instead. The skips are correct (an editor lock file must not abort every reload) but were silent, so a `.baseline.cedar` was a policy the operator wrote, governing nothing, with no trace — fail-open if it held a `forbid`. Both are observability/API defects rather than wrong-allows, found by the deviations-honesty audit |
+
 D9–D11 (empty policy dir refuses to start, policy ids carry file provenance, deny vs
 broken are different signals) were recorded during the change proposal and live in
 `openspec/changes/add-cedar-pdp-v1/design.md`; the numbering here continues from them.
 D12 and D13 are post-implementation audit corrections; D14–D16 come from the
-adversarial security audit that followed.
+adversarial security audit that followed, and D17 from the deviations-honesty audit
+of the record (whose other findings were corrections to the record itself — see the
+"Post-audit remediation" section of `openspec/changes/add-cedar-pdp-v1/tasks.md`).
 
 ### D12 — `argv_tail` replaces `argv`: one anchoring target, and it excludes the shim path
 

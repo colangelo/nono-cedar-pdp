@@ -215,6 +215,8 @@ The service SHALL map the envelope's `backend` name to a Cedar `Agent` identifie
 
 The service SHALL load every `*.cedar` file in the configured policy directory and assign each policy an identifier of the form `<file stem>:<id annotation or ordinal>`, so a decision names the file and rule that produced it. Duplicate identifiers SHALL be a load failure, never a silent overwrite. Files without the `.cedar` extension SHALL be ignored.
 
+Two shapes of `*.cedar` path SHALL be skipped rather than failing the load: a name starting with `.` or `#` (what editors give lock files and backups, which would otherwise abort every reload for the duration of an editing session), and anything that is not a regular file (a directory, a socket, a symlink with no target). Each skip SHALL be logged at WARN naming the path and the reason, because a skipped file is a policy the operator wrote that decides nothing — a silently ignored `.baseline.cedar` is a hole in the policy set with no trace.
+
 #### Scenario: Policy identifiers carry file provenance
 
 - **WHEN** `10-git.cedar` contains a policy annotated `@id("no-history-rewrites")` and one without an annotation
@@ -230,9 +232,21 @@ The service SHALL load every `*.cedar` file in the configured policy directory a
 - **WHEN** the policy directory also contains a `README.md`
 - **THEN** it is not loaded and does not affect validation
 
+#### Scenario: A skipped policy file is named in the log
+
+- **WHEN** the policy directory contains `.baseline.cedar`, an editor lock file `.#10-git.cedar`, or a directory named `archive.cedar`
+- **THEN** the load succeeds without them and each skip is logged at WARN naming the path and why it is not in force
+
 ### Requirement: Refuse to run without a usable policy set
 
 The service SHALL strict-validate the whole policy set against the embedded schema before serving, and SHALL refuse to start when the policy directory is unreadable, contains a syntax error, fails validation, or contains no policies. An empty directory SHALL NOT be treated as a valid deny-everything configuration, because refusing to start is equally fail-closed and far more diagnosable.
+
+The guard SHALL be a property of construction, not of one entry point: every way of building a decision engine that is reachable from outside this crate — from a directory or from a policy set assembled in memory — SHALL apply the non-empty and strict-validation checks. A constructor that skips them SHALL NOT exist in the library's public API, even as a test seam.
+
+#### Scenario: An in-memory policy set goes through the same guards
+
+- **WHEN** a caller builds an engine from a policy set it assembled itself
+- **THEN** an empty set is refused and a set that fails strict validation is refused, with the same errors the directory loader reports
 
 #### Scenario: Syntax error prevents startup and names the file
 

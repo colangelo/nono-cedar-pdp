@@ -76,9 +76,9 @@ Rollout, in order:
 
 1. Run `validate` against the starter policy pack; run `check` against saved payload fixtures to confirm expected decisions offline.
 2. Start the daemon; confirm `/healthz` reports the loaded generation.
-3. Wire the nono profile with `approval_defaults.backend` pointing at a `chain` backend in `any` mode over `["cedar", "terminal"]`. Cedar decides; a denial prompts. Observe the audit log.
+3. Wire the nono profile with `approval_defaults.backend` pointing at a `chain` backend in `any` mode over `["cedar", "terminal"]` — `cedar-or-ask` in `examples/cedar-pdp-smoke.json`. Cedar decides; a denial prompts. Observe the audit log.
 4. Tighten policies until prompts stop appearing for legitimate work.
-5. Switch `approval_defaults.backend` to the bare `cedar` backend to enforce without a fallback, or to a `chain` in `all` mode where human confirmation should also be mandatory.
+5. Switch `approval_defaults.backend` to the bare `cedar` backend to enforce without a fallback, or to a `chain` in `all` mode — `cedar-and-ask` — where human confirmation should also be mandatory. Both names are defined in the shipped example profile, so each step is one edit and `nono profile validate` accepts the result; that was not true until task 14.5, when the `all`-mode chain the README's Paranoid posture named turned out to exist in no profile.
 
 Rollback is configuration-only at every step: point `approval_defaults.backend` back at `terminal` and the daemon is out of the path. Stopping the daemon without changing the profile fails closed and blocks intercepted commands — that is the intended behaviour, not a rollback path.
 
