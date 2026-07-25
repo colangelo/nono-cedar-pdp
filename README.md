@@ -17,13 +17,22 @@ Read from nono v0.69.0's source, not its docs, and pinned by
 [ADR-001](docs/adr/ADR-001-rust-and-cedar-crate.md)).
 
 nono `POST`s an envelope wrapping an internally-tagged request. A real `command`
-payload:
+payload — the `args[0]` value below is verbatim from an audit line of the end-to-end
+smoke run:
 
 ```json
-{"backend":"cedar","request":{"capability_type":"command","request_id":"r1",
- "command":"git","args":["git","status"],"caller":"session",
- "intercept_rule":"status","reason":null,"child_pid":42,"session_id":"s1"}}
+{"backend":"cedar","request":{"capability_type":"command",
+ "request_id":"tool-sandbox-approve-git-1784990893285791000","command":"git",
+ "args":["/private/tmp/nono-tool-sandbox-13819-1784990893285791000-a4d3bceb3ec061c0/shims/git","status"],
+ "caller":"session","intercept_rule":"status","reason":null,
+ "child_pid":13820,"session_id":"35abc0894927242e"}}
 ```
+
+**`args[0]` is an absolute per-run shim path, not the command name.** The shim forwards
+its own `args_os()` and nono resolves the program with `which` against a shim directory
+named `<base>/nono-tool-sandbox-<pid>-<unix nanos>-<hex nonce>/shims/<command>`, so the
+value changes every run and no literal can match it. The command **name** arrives
+separately, in `command`. This matters for policy authoring — see the caveats below.
 
 and a real `endpoint` payload (the credential proxy hardcodes `session_id: "proxy"`
 and `child_pid: 0`):
@@ -193,7 +202,7 @@ already composes backends better than a flag could:
 ## Schema caveats you must know before writing policies
 
 The schema is [`nono.cedarschema`](nono.cedarschema) — the load-bearing design
-artifact, embedded in the binary. Three of its shapes are deliberate constraints, not
+artifact, embedded in the binary. Four of its shapes are deliberate constraints, not
 oversights.
 
 1. **`args` is a `Set<String>`, so positional matching is unexpressible.** Upstream
@@ -202,19 +211,31 @@ oversights.
    access, so a policy physically cannot say "the second argument is `push`". Test
    flag presence instead: `resource.args.contains("--force")`. (A runtime test for the
    lossy case is impossible from this side — the bytes are gone before we see them.)
-2. **`argv` globs are forbid-only.** `argv` is the space-join of `args`, provided for
-   `like` patterns. It over-matches: `git commit -m "do not --force this"` satisfies
-   `resource.argv like "*--force*"`, and `argv` cannot distinguish
-   `["git", "push --force"]` from `["git", "push", "--force"]`. Over-matching is
-   fail-safe in a `forbid` and unsound in a `permit`, so the loader **warns about any
-   `permit` that reads `resource.argv`**.
-3. **Endpoint requests carry no session identity.** nono's proxy hardcodes
+2. **There is no whole-argv attribute — anchor on `argv_tail`.** `args[0]` is a per-run
+   shim path, so a pattern anchored over the whole argv (`like "git commit *"`) can
+   never match a real payload: fail-safe in a `permit`, **fail-open in a `forbid`**.
+   Rather than warn about that, the schema does not offer the attribute at all — a
+   policy that reads `resource.argv` **fails strict validation and will not load**.
+   Anchor on `resource.argv_tail` (`args[1..]`, space-joined, `""` when there is no
+   tail), which is exactly the slice nono's own matcher uses (`argv.iter().skip(1)`).
+   For the same reason, `resource.args.contains("git")` — or any path literal — never
+   matches the program: use `resource.command`. The loader warns when an `args`
+   membership literal contains a `/`.
+3. **`argv_tail` globs are forbid-only.** Removing the whole-argv join fixed
+   *anchoring*; it did not fix *flattening*, which is inherent to any joined string.
+   `argv_tail` still over-matches: `git commit -m "do not --force this"` satisfies
+   `resource.argv_tail like "*--force*"`, and it cannot distinguish
+   `["push --force"]` from `["push", "--force"]`. Over-matching is fail-safe in a
+   `forbid` and unsound in a `permit`, so the loader **warns about any `permit` that
+   reads `resource.argv_tail`**. Two hazards, then: anchoring is now structurally
+   impossible, flattening is still a rule you have to follow.
+4. **Endpoint requests carry no session identity.** nono's proxy hardcodes
    `session_id: "proxy"` and `child_pid: 0`. Rather than echo whatever the payload
    claims, the daemon *pins* `Nono::Caller::"proxy"` in `Nono::Session::"proxy"`, so a
    crafted payload naming a real session id cannot place the proxy caller inside that
    session's hierarchy and satisfy a session-scoped policy.
 
-A fourth, related limitation: **nono sends a caller *label*, not a caller kind** —
+A fifth, related limitation: **nono sends a caller *label*, not a caller kind** —
 `"session"` for a direct agent launch, otherwise the name of the intercepted command
 that chained the launch. A profile that intercepts a command literally named `session`
 therefore produces a payload indistinguishable from a direct launch. Disambiguating

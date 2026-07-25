@@ -4,19 +4,32 @@ namespace Nono {
   entity Caller in [Session];
 
   entity Command {
+    // The command NAME ("git"), a separate wire field. This — never args[0] —
+    // is what identifies the command.
     command: String,
-    // A Set has no index access, so positional argument matching is
-    // unexpressible by construction. Deliberate: nono drops non-UTF-8 argv
-    // entries before sending them, so positions are untrustworthy.
+    // Exactly what nono sent, nothing normalised away. A Set has no index
+    // access, so positional argument matching is unexpressible by construction.
+    // Deliberate: nono drops non-UTF-8 argv entries before sending them, so
+    // positions are untrustworthy. NOTE args[0] is an absolute PER-RUN shim path
+    // (<base>/nono-tool-sandbox-<pid>-<nanos>-<hex>/shims/<command>), so
+    // args.contains("git") — or any path literal — can never match it; loading
+    // warns about that.
     args: Set<String>,
-    // Space-joined args, for `like` globs. FORBID-ONLY: a glob over argv also
-    // matches text *inside* a single argument — `git commit -m "do not --force
-    // this"` matches `argv like "*--force*"`. Over-matching is fail-safe in a
-    // forbid and unsound in a permit, and argv cannot tell
-    // ["git", "push --force"] from ["git", "push", "--force"]. For exact tests
-    // use args.contains(..). Loading warns about any permit that reads argv.
-    argv: String,
-    // Count of the args nono actually sent (post-filter; see args).
+    // args[1..] joined by a single space; "" when args has fewer than two
+    // entries. This is the ONLY sound target for a start-anchored `like` glob,
+    // because it omits the per-run args[0]; it mirrors nono's own invocation
+    // matcher, argv.iter().skip(1). There is deliberately no whole-argv
+    // attribute: an anchored pattern over one could never match at runtime,
+    // fail-open in a forbid, so it is unexpressible rather than discouraged.
+    // FORBID-ONLY: a glob over a joined string also matches text *inside* a
+    // single argument — `git commit -m "do not --force this"` matches
+    // `argv_tail like "*--force*"` — and it cannot tell ["push --force"] from
+    // ["push", "--force"]. Over-matching is fail-safe in a forbid and unsound in
+    // a permit, so loading warns about any permit that reads argv_tail. For
+    // exact tests use args.contains(..).
+    argv_tail: String,
+    // Count of the args nono actually sent (post-filter; args[0] included, so a
+    // bare `git status` is 2).
     arg_count: Long,
   };
 

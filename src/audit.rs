@@ -271,7 +271,10 @@ mod tests {
             reason: None,
             target: Target::Command {
                 command: "git".to_string(),
-                args: vec!["git".to_string(), "status".to_string()],
+                args: vec![
+                    crate::wire::EXAMPLE_SHIM_ARGV0.to_string(),
+                    "status".to_string(),
+                ],
                 intercept_rule: "status".to_string(),
                 child_pid: 42,
             },

@@ -34,6 +34,13 @@ context: |
     - `args` is lossy: nono drops non-UTF-8 argv entries, so positions shift.
       Positional argument matching is UNSOUND. Cedar `args` is a Set<String> so
       indexing is unexpressible by construction.
+    - `args[0]` is an absolute PER-RUN shim path
+      (<base>/nono-tool-sandbox-<pid>-<nanos>-<hex>/shims/<command>), NOT the command
+      name — the name arrives separately in `command`. No literal can match args[0],
+      so the schema exposes `argv_tail` (args[1..] joined) for anchored globs and has
+      no whole-argv attribute at all: a policy reading `resource.argv` fails strict
+      validation. `argv_tail` globs stay forbid-only (a joined string over-matches
+      inside a single argument).
     - The webhook is unauthenticated in both directions; loopback-only bind, with
       https-on-loopback as a follow-up.
 

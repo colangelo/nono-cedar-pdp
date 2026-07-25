@@ -46,37 +46,117 @@ fn is_loadable_policy_file(path: &Path) -> bool {
     path.is_file()
 }
 
-/// Operator lint: `argv` is the space-join of `args`, so `argv like "*--force*"`
-/// also matches when the text sits *inside* a single argument. Over-matching is
-/// fail-safe in a `forbid` and unsound in a `permit`, so a `permit` that reads
-/// `argv` is a policy smell worth naming at load time. Advisory, not fatal: the
-/// operator may have a narrow case, and refusing to start would be a worse
-/// failure mode than a warning.
-pub fn lint_argv_in_permit(set: &PolicySet) -> Vec<String> {
+/// Operator lints for the two argument-matching hazards that survive the schema.
+///
+/// The anchoring hazard is gone structurally: there is no whole-`argv` attribute,
+/// so a policy that reaches for one is refused by strict validation rather than
+/// warned about. What is left needs advice, not a wall:
+///
+/// 1. **A `permit` that reads `argv_tail`.** `argv_tail` is a joined string, so
+///    `argv_tail like "*--force*"` also matches when the text sits *inside* a
+///    single argument (`-m "do not --force this"`), and it cannot tell
+///    `["push --force"]` from `["push", "--force"]`. Over-matching is fail-safe in
+///    a `forbid` and unsound in a `permit`.
+/// 2. **An `args` membership test against a value containing `/`.** `args` stays
+///    faithful to the payload, so `args[0]` is the per-run shim path
+///    (`…/nono-tool-sandbox-<pid>-<nanos>-<hex>/shims/<command>`): a literal that
+///    is meant to pin the program can never match it — fail-open in a `forbid`,
+///    which is why this one is flagged for both effects. It over-reports by
+///    design: `args.contains("/etc/passwd")` about a path *argument* is sound and
+///    still gets a line, because the two are indistinguishable from here and the
+///    fail-open reading is the dangerous one.
+///
+/// Advisory, not fatal: the operator may have a narrow case, and refusing to start
+/// on a heuristic would be a worse failure mode than a warning.
+pub fn lint_arg_matching(set: &PolicySet) -> Vec<String> {
     let mut lints = Vec::new();
     for policy in set.policies() {
-        if policy.effect() != Effect::Permit {
-            continue;
-        }
-        // Compare against the JSON form, not the source text: a comment that
-        // merely mentions argv is not an argv read.
-        let reads_argv = match policy.to_json() {
-            Ok(json) => json.to_string().contains(r#""attr":"argv""#),
+        // Inspect the JSON form, not the source text: a comment that merely
+        // mentions argv_tail is not a read of it.
+        let json = match policy.to_json() {
+            Ok(json) => json,
             Err(e) => {
                 tracing::debug!(policy = %policy.id(), error = %e, "could not lint policy");
-                false
+                continue;
             }
         };
-        if reads_argv {
+
+        if policy.effect() == Effect::Permit && json.to_string().contains(r#""attr":"argv_tail""#) {
             lints.push(format!(
-                "policy {} is a permit that reads resource.argv; argv globs \
-                 over-match text inside a single argument, so they belong in \
-                 forbid only — use resource.args.contains(..) for exact tests",
+                "policy {} is a permit that reads resource.argv_tail; a glob over \
+                 a joined argument string over-matches text inside a single \
+                 argument, so it belongs in forbid only — use \
+                 resource.args.contains(..) for exact tests",
+                policy.id()
+            ));
+        }
+
+        for literal in args_membership_path_literals(&json) {
+            lints.push(format!(
+                "policy {} tests resource.args membership against {literal:?}, \
+                 which contains a path separator; args[0] is an absolute per-run \
+                 shim path that no literal can match, so if this is meant to pin \
+                 the program it never matches — match resource.command instead \
+                 (harmless if it really is a path argument)",
                 policy.id()
             ));
         }
     }
     lints
+}
+
+/// Every string literal a policy compares against `resource.args` membership that
+/// contains a `/`. Walks the policy's JSON (EST) form, so it sees `contains`,
+/// `containsAny` and `containsAll` wherever they are nested.
+fn args_membership_path_literals(json: &serde_json::Value) -> Vec<String> {
+    fn is_args_attr(node: &serde_json::Value) -> bool {
+        node.get(".")
+            .and_then(|access| access.get("attr"))
+            .and_then(serde_json::Value::as_str)
+            == Some("args")
+    }
+
+    fn string_literals(node: &serde_json::Value, out: &mut Vec<String>) {
+        if let Some(value) = node.get("Value").and_then(serde_json::Value::as_str) {
+            out.push(value.to_string());
+        }
+        if let Some(items) = node.get("Set").and_then(serde_json::Value::as_array) {
+            for item in items {
+                string_literals(item, out);
+            }
+        }
+    }
+
+    fn walk(node: &serde_json::Value, out: &mut Vec<String>) {
+        match node {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    if matches!(key.as_str(), "contains" | "containsAny" | "containsAll") {
+                        let left = value.get("left");
+                        let right = value.get("right");
+                        if let (Some(left), Some(right)) = (left, right) {
+                            if is_args_attr(left) {
+                                let mut literals = Vec::new();
+                                string_literals(right, &mut literals);
+                                out.extend(literals.into_iter().filter(|l| l.contains('/')));
+                            }
+                        }
+                    }
+                    walk(value, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(json, &mut out);
+    out
 }
 
 #[derive(Debug)]
@@ -157,7 +237,7 @@ pub fn load_dir(
     for w in result.validation_warnings() {
         tracing::warn!(warning = %w, "cedar policy validation warning");
     }
-    for lint in lint_argv_in_permit(&set) {
+    for lint in lint_arg_matching(&set) {
         tracing::warn!(lint = %lint, "cedar policy lint");
     }
 
@@ -351,7 +431,11 @@ when { resource.args.contains("--force") };
         assert_eq!(engine.snapshot().set.num_of_policies(), 2);
         assert!(
             engine
-                .evaluate(&command_query("session", "git", &["git", "status"]))
+                .evaluate(&command_query(
+                    "session",
+                    "git",
+                    &[crate::wire::EXAMPLE_SHIM_ARGV0, "status"]
+                ))
                 .allow,
             "an emptied reload must not become the active set"
         );
@@ -388,29 +472,119 @@ when { resource.args.contains("--force") };
         assert!(text.contains("bad.cedar"), "{text}");
     }
 
-    /// `argv` is a space-join, so `like` globs over it also match text *inside* a
-    /// single argument. Over-matching is fail-safe in a `forbid` and unsound in a
-    /// `permit`, so a permit that reads `argv` gets flagged for the operator.
+    /// `argv_tail` is a space-join, so `like` globs over it also match text
+    /// *inside* a single argument. Over-matching is fail-safe in a `forbid` and
+    /// unsound in a `permit`, so a permit that reads it gets flagged. This is the
+    /// hazard that SURVIVES the removal of `argv`: flattening, not anchoring.
     #[test]
-    fn a_permit_reading_argv_is_linted_but_a_forbid_is_not() {
-        let forbid_argv = r#"@id("no-force")
+    fn a_permit_reading_argv_tail_is_linted_but_a_forbid_is_not() {
+        let forbid_tail = r#"@id("no-force")
 forbid (principal, action == Nono::Action::"launchCommand", resource)
-when { resource.argv like "*--force*" };"#;
-        assert!(lint_argv_in_permit(&PolicySet::from_str(forbid_argv).unwrap()).is_empty());
+when { resource.argv_tail like "*--force*" };"#;
+        assert!(lint_arg_matching(&PolicySet::from_str(forbid_tail).unwrap()).is_empty());
 
-        let permit_argv = r#"@id("git-push")
+        let permit_tail = r#"@id("git-push")
 permit (principal, action == Nono::Action::"launchCommand", resource)
-when { resource.argv like "git push*" };"#;
-        let lints = lint_argv_in_permit(&PolicySet::from_str(permit_argv).unwrap());
+when { resource.argv_tail like "push*" };"#;
+        let set = PolicySet::from_str(permit_tail).unwrap();
+        let lints = lint_arg_matching(&set);
         assert_eq!(lints.len(), 1, "{lints:?}");
-        assert!(lints[0].contains("argv"), "{lints:?}");
+        assert!(lints[0].contains("argv_tail"), "{lints:?}");
+        // The operator has to be told *which* policy: the loader assigns
+        // `<file stem>:<@id>` ids, so naming the id names the file too.
+        let id = set.policies().next().unwrap().id().to_string();
+        assert!(lints[0].contains(&id), "{lints:?}");
 
-        // A comment that merely mentions argv is not an argv read.
+        // A comment that merely mentions argv_tail is not a read of it.
         let clean = r#"@id("ok")
-// argv is forbid-only, so this uses args
+// argv_tail is forbid-only, so this uses args
 permit (principal, action == Nono::Action::"launchCommand", resource)
 when { resource.args.contains("status") };"#;
-        assert!(lint_argv_in_permit(&PolicySet::from_str(clean).unwrap()).is_empty());
+        assert!(lint_arg_matching(&PolicySet::from_str(clean).unwrap()).is_empty());
+    }
+
+    /// The residual form of the fail-open bug: `args` still holds the per-run shim
+    /// path, so a literal that looks like a command path can never match it. In a
+    /// `forbid` that is fail-open, so the lint covers both effects.
+    #[test]
+    fn an_args_membership_test_against_a_path_literal_is_linted() {
+        for body in [
+            r#"@id("block-shim")
+forbid (principal, action == Nono::Action::"launchCommand", resource)
+when { resource.args.contains("/usr/bin/git") };"#,
+            r#"@id("allow-shim")
+permit (principal, action == Nono::Action::"launchCommand", resource)
+when { resource.args.contains("/private/tmp/nono-tool-sandbox-1-2-3/shims/git") };"#,
+            r#"@id("any-shim")
+forbid (principal, action == Nono::Action::"launchCommand", resource)
+when { resource.args.containsAny(["/bin/sh", "--force"]) };"#,
+        ] {
+            let lints = lint_arg_matching(&PolicySet::from_str(body).unwrap());
+            assert_eq!(lints.len(), 1, "{body}\ngot {lints:?}");
+            assert!(lints[0].contains("resource.command"), "{lints:?}");
+        }
+
+        // A flag or subcommand carries no `/`, so the common case stays quiet.
+        let clean = r#"@id("ok")
+forbid (principal, action == Nono::Action::"launchCommand", resource)
+when { resource.args.contains("--force") };"#;
+        assert!(lint_arg_matching(&PolicySet::from_str(clean).unwrap()).is_empty());
+    }
+
+    /// The lint that used to guard anchored `argv` patterns is replaced by a
+    /// structural guarantee: `argv` is not in the schema, so a policy that reads
+    /// it is refused at load. An operator cannot ignore this the way a warning
+    /// can be ignored.
+    #[test]
+    fn a_policy_reading_argv_is_refused_at_load() {
+        let schema = crate::cedar::schema::load().unwrap();
+        let d = dir_with(&[(
+            "30-anchor.cedar",
+            r#"@id("block-commit")
+forbid (principal, action == Nono::Action::"launchCommand", resource)
+when { resource.argv like "git commit *" };"#,
+        )]);
+        let err = load_dir(d.path(), &schema, 1).unwrap_err();
+        assert!(matches!(err, PolicyLoadError::Validation { .. }), "{err}");
+    }
+
+    /// End to end over the shape nono really sends: an anchored `forbid` fires
+    /// against `argv_tail` and the shim path in `args[0]` cannot suppress it.
+    #[test]
+    fn an_anchored_forbid_fires_against_the_runtime_payload_via_argv_tail() {
+        let schema = crate::cedar::schema::load().unwrap();
+        let body = r#"
+@id("permit-git")
+permit (principal, action == Nono::Action::"launchCommand", resource)
+when { resource.command == "git" };
+
+@id("no-commit")
+forbid (principal, action == Nono::Action::"launchCommand", resource)
+when { resource.argv_tail like "commit *" };
+"#;
+        let d = dir_with(&[("30-anchor.cedar", body)]);
+        let engine = Engine::bootstrap(schema, d.path().to_path_buf()).unwrap();
+
+        let denied = engine.evaluate(&command_query(
+            "session",
+            "git",
+            &[crate::wire::EXAMPLE_SHIM_ARGV0, "commit", "--amend"],
+        ));
+        assert!(
+            !denied.allow,
+            "the anchored forbid must fire on the real payload: {denied:?}"
+        );
+        assert!(
+            denied.matched.contains(&"30-anchor:no-commit".to_string()),
+            "{denied:?}"
+        );
+
+        let allowed = engine.evaluate(&command_query(
+            "session",
+            "git",
+            &[crate::wire::EXAMPLE_SHIM_ARGV0, "status"],
+        ));
+        assert!(allowed.allow, "{allowed:?}");
     }
 
     #[test]
@@ -532,7 +706,11 @@ permit (
     #[test]
     fn allows_a_permitted_command() {
         let (engine, _d) = matrix_engine();
-        let decision = engine.evaluate(&command_query("session", "git", &["git", "status"]));
+        let decision = engine.evaluate(&command_query(
+            "session",
+            "git",
+            &[crate::wire::EXAMPLE_SHIM_ARGV0, "status"],
+        ));
         assert!(decision.allow, "{decision:?}");
         assert_eq!(decision.matched, vec!["matrix:allow-git".to_string()]);
         assert!(
@@ -545,7 +723,11 @@ permit (
     #[test]
     fn denies_when_a_forbid_matches() {
         let (engine, _d) = matrix_engine();
-        let decision = engine.evaluate(&command_query("npm", "git", &["git", "status"]));
+        let decision = engine.evaluate(&command_query(
+            "npm",
+            "git",
+            &[crate::wire::EXAMPLE_SHIM_ARGV0, "status"],
+        ));
         assert!(!decision.allow);
         assert!(decision.matched.iter().any(|m| m.ends_with("session-only")));
         assert!(
@@ -558,8 +740,14 @@ permit (
     #[test]
     fn denies_with_default_deny_reason_when_nothing_matches() {
         let (engine, _d) = matrix_engine();
-        let decision =
-            engine.evaluate(&command_query("session", "curl", &["curl", "evil.example"]));
+        let decision = engine.evaluate(&command_query(
+            "session",
+            "curl",
+            &[
+                "/private/tmp/nono-tool-sandbox-13819-1784990893285791000-a4d3bceb3ec061c0/shims/curl",
+                "evil.example",
+            ],
+        ));
         assert!(!decision.allow);
         assert!(decision.matched.is_empty());
         assert!(
@@ -572,7 +760,11 @@ permit (
     #[test]
     fn unmapped_agent_is_denied() {
         let (engine, _d) = matrix_engine();
-        let mut q = command_query("session", "git", &["git", "status"]);
+        let mut q = command_query(
+            "session",
+            "git",
+            &[crate::wire::EXAMPLE_SHIM_ARGV0, "status"],
+        );
         q.agent = "unknown".to_string();
         assert!(!engine.evaluate(&q).allow);
     }
@@ -595,7 +787,11 @@ permit (
     #[test]
     fn records_evaluation_time() {
         let (engine, _d) = matrix_engine();
-        let decision = engine.evaluate(&command_query("session", "git", &["git", "status"]));
+        let decision = engine.evaluate(&command_query(
+            "session",
+            "git",
+            &[crate::wire::EXAMPLE_SHIM_ARGV0, "status"],
+        ));
         assert!(decision.eval_us > 0);
     }
 
@@ -605,7 +801,11 @@ permit (
     #[test]
     fn control_bytes_in_an_identifier_cannot_inject_into_the_deny_reason() {
         let (engine, _d) = matrix_engine();
-        let mut q = command_query("session", "git", &["git", "status"]);
+        let mut q = command_query(
+            "session",
+            "git",
+            &[crate::wire::EXAMPLE_SHIM_ARGV0, "status"],
+        );
         q.request_id = "approve-git\u{1b}[2K\rDENY OVERRIDDEN: decision=allow".to_string();
         let decision = engine.evaluate(&q);
         assert!(!decision.allow, "{decision:?}");
@@ -633,7 +833,11 @@ when { resource.arg_count + 9223372036854775807 > 0 };
 "#;
         let d = dir_with(&[("boom.cedar", body)]);
         let engine = Engine::bootstrap(schema, d.path().to_path_buf()).unwrap();
-        let decision = engine.evaluate(&command_query("session", "git", &["git", "status"]));
+        let decision = engine.evaluate(&command_query(
+            "session",
+            "git",
+            &[crate::wire::EXAMPLE_SHIM_ARGV0, "status"],
+        ));
         assert!(
             !decision.allow,
             "an errored forbid must not be silently skipped: {decision:?}"
@@ -652,7 +856,11 @@ when { resource.arg_count + 9223372036854775807 > 0 };
         let engine = Engine::bootstrap(schema, d.path().to_path_buf()).unwrap();
         assert!(
             engine
-                .evaluate(&command_query("session", "git", &["git", "status"]))
+                .evaluate(&command_query(
+                    "session",
+                    "git",
+                    &[crate::wire::EXAMPLE_SHIM_ARGV0, "status"]
+                ))
                 .allow
         );
 
@@ -665,7 +873,11 @@ when { resource.arg_count + 9223372036854775807 > 0 };
         assert_eq!(generation, 2);
         assert!(
             !engine
-                .evaluate(&command_query("session", "git", &["git", "status"]))
+                .evaluate(&command_query(
+                    "session",
+                    "git",
+                    &[crate::wire::EXAMPLE_SHIM_ARGV0, "status"]
+                ))
                 .allow
         );
     }
@@ -686,7 +898,11 @@ when { resource.arg_count + 9223372036854775807 > 0 };
         );
         assert!(
             engine
-                .evaluate(&command_query("session", "git", &["git", "status"]))
+                .evaluate(&command_query(
+                    "session",
+                    "git",
+                    &[crate::wire::EXAMPLE_SHIM_ARGV0, "status"]
+                ))
                 .allow,
             "a broken edit must not brick a running agent"
         );
@@ -715,7 +931,11 @@ when { resource.arg_count + 9223372036854775807 > 0 };
         );
         assert!(
             engine
-                .evaluate(&command_query("session", "git", &["git", "status"]))
+                .evaluate(&command_query(
+                    "session",
+                    "git",
+                    &[crate::wire::EXAMPLE_SHIM_ARGV0, "status"]
+                ))
                 .allow
         );
     }

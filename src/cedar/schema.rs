@@ -94,14 +94,62 @@ mod tests {
         }
     }
 
-    /// The `argv` caveat has to live in the artifact operators read, not only in
-    /// the design doc.
+    /// The flattened-string caveat has to live in the artifact operators read,
+    /// not only in the design doc — and it now belongs to `argv_tail`, the only
+    /// joined-string attribute left.
     #[test]
-    fn the_schema_artifact_documents_the_argv_caveat() {
+    fn the_schema_artifact_documents_the_argv_tail_caveat() {
+        assert!(
+            SCHEMA_SRC.contains("argv_tail"),
+            "nono.cedarschema must declare argv_tail"
+        );
         assert!(
             SCHEMA_SRC.to_lowercase().contains("forbid-only"),
-            "nono.cedarschema must document that argv globs belong in forbid only"
+            "nono.cedarschema must document that argv_tail globs belong in forbid only"
         );
+        assert!(
+            !SCHEMA_SRC.contains("argv:"),
+            "argv must not be declared: an anchored pattern over the whole argv \
+             cannot match a runtime payload, so the attribute is a fail-open \
+             footgun with no sound use (D12 amendment)"
+        );
+    }
+
+    /// D12 amendment: `argv` is *removed*, not deprecated. A policy that reaches
+    /// for it is refused by strict validation, so the anchoring hazard is
+    /// structurally unexpressible rather than merely linted — the same posture
+    /// D6 takes for positional matching.
+    #[test]
+    fn a_policy_reading_argv_is_refused_by_strict_validation() {
+        let schema = load().unwrap();
+        for body in [
+            r#"forbid (principal, action == Nono::Action::"launchCommand", resource)
+               when { resource.argv like "git commit *" };"#,
+            r#"permit (principal, action == Nono::Action::"launchCommand", resource)
+               when { resource.argv like "*--force*" };"#,
+        ] {
+            let policies = PolicySet::from_str(body).unwrap();
+            let result = Validator::new(schema.clone()).validate(&policies, ValidationMode::Strict);
+            assert!(
+                !result.validation_passed(),
+                "resource.argv must not validate: {body}"
+            );
+        }
+    }
+
+    /// The replacement has to be usable: an anchored glob over `argv_tail` is the
+    /// shape policy authors are directed to, so it must strict-validate.
+    #[test]
+    fn an_anchored_argv_tail_policy_strict_validates() {
+        let schema = load().unwrap();
+        let policies = PolicySet::from_str(
+            r#"forbid (principal, action == Nono::Action::"launchCommand", resource)
+               when { resource.argv_tail like "commit *" };"#,
+        )
+        .unwrap();
+        let result = Validator::new(schema).validate(&policies, ValidationMode::Strict);
+        let errors: Vec<String> = result.validation_errors().map(|e| e.to_string()).collect();
+        assert!(result.validation_passed(), "{errors:#?}");
     }
 
     #[test]

@@ -1,3 +1,5 @@
 {"backend":"cedar","request":{"capability_type":"command","request_id":"r1",
-"command":"git","args":["git","status"],"caller":"session","intercept_rule":"status",
+"command":"git",
+"args":["/private/tmp/nono-tool-sandbox-13819-1784990893285791000-a4d3bceb3ec061c0/shims/git","status"],
+"caller":"session","intercept_rule":"status",
 "reason":null,"child_pid":42,"session_id":"s1"}}

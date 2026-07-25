@@ -98,19 +98,22 @@ Consequences for policy authoring:
 
 - **`resource.command` is unaffected.** It is a separate field carrying the command
   name (`"git"`), and remains the correct thing to match a command on.
-- **Unanchored `argv` globs still work.** `resource.argv like "*--force*"` does not
-  care what sits in `args[0]`.
-- **Every start-anchored pattern silently stops matching at runtime.**
-  `resource.argv like "git *"`, `resource.argv like "git push*"` and
-  `resource.args.contains("git")` all match the fixture shape and never the real
-  payload. In a `permit` that is **fail-safe** — the permit never fires, so the request
-  falls through to default deny. In a `forbid` it **fails open**: the forbid never
-  fires and any permit that did match still allows the launch. Since the README
-  advertises `argv` globs as the *forbid-only* tool, the documented guidance was itself
-  the fail-open hazard.
-- The remedy is **D12** below: an `argv_tail` attribute that omits `args[0]`, giving
-  anchored matching a sound target while `args`/`argv` stay faithful to what nono
-  actually sends. The daemon never rewrites the payload.
+- **Unanchored globs are unaffected.** `like "*--force*"` does not care what sits in
+  `args[0]`: the shim path
+  (`<base>/nono-tool-sandbox-<pid>-<nanos>-<hex>/shims/<command>`) contains no
+  caller-controlled text, so it can neither create nor suppress such a match.
+- **Every start-anchored pattern silently stopped matching at runtime.** Against the
+  whole argv, `like "git *"`, `like "git push*"` and `resource.args.contains("git")`
+  all matched the old fixture shape and never the real payload. In a `permit` that is
+  **fail-safe** — the permit never fires, so the request falls through to default
+  deny. In a `forbid` it **fails open**: the forbid never fires and any permit that
+  did match still allows the launch. Since the README advertised whole-argv globs as
+  the *forbid-only* tool, the documented guidance was itself the fail-open hazard.
+- The remedy is **D12** below: the whole-argv `argv` attribute is **removed** and
+  replaced by `argv_tail` (the join of `args[1..]`), which is the only sound target
+  for an anchored glob. `args` stays faithful to the payload — `args[0]` included —
+  so the daemon still never rewrites what nono sent; it just refuses to offer a
+  policy hook that cannot work.
 
 ### Security note: PDP impersonation
 
@@ -133,7 +136,7 @@ in the webhook backend config.
 | D6 | `args` modeled as `Set<String>` | Cedar sets have no index access → positional matching is *unexpressible*, enforcing the lossy-argv finding structurally |
 | D7 | Keep last-good policy set on failed hot-reload | A bad edit mid-session must not deny-all a running agent; failed reload logs loudly. Startup with invalid policies still refuses to run |
 | D8 | Loopback HTTP on `127.0.0.1:8181`, no portless name | Fewer hops and no squattable hostname in a security path |
-| D12 | Expose `argv_tail` (the join of `args[1..]`) on `Command`; keep `args`/`argv` faithful to the payload nono sent | `args[0]` is a per-run shim path (§2 correction), so anchored patterns over `argv` never fire at runtime — fail-open in a `forbid`. `argv_tail` is the sound anchoring target and mirrors upstream's own `argv.iter().skip(1)` |
+| D12 | Expose `argv_tail` (the join of `args[1..]`) on `Command` and **remove `argv`** (the whole-argv join) entirely; `args` stays faithful to the payload nono sent | `args[0]` is a per-run shim path (§2 correction), so anchored patterns over the whole argv never fire at runtime — fail-open in a `forbid`. `argv_tail` is the sound anchoring target and mirrors upstream's own `argv.iter().skip(1)`. `argv` had no use `argv_tail` does not serve as well, so it is made unexpressible rather than merely discouraged (same posture as D6) |
 | D13 | Policy directory and audit log MUST live outside any tree the sandboxed agent can write; shipped defaults are home-anchored, never CWD-relative | Hot-reload turns a writable policy dir into a privilege-escalation path: the agent writes `permit(principal, action, resource);` and the PDP adopts it within a debounce. Proven end-to-end against the previous `./policies` default |
 
 D9–D11 (empty policy dir refuses to start, policy ids carry file provenance, deny vs
@@ -141,23 +144,58 @@ broken are different signals) were recorded during the change proposal and live 
 `openspec/changes/add-cedar-pdp-v1/design.md`; the numbering here continues from them.
 D12 and D13 are post-implementation audit corrections.
 
-### D12 — `argv_tail`: an anchoring target that excludes the shim path
+### D12 — `argv_tail` replaces `argv`: one anchoring target, and it excludes the shim path
 
-`Command` gains one attribute:
+`Command` gains one attribute and loses one:
 
 ```cedar
 argv_tail: String,   // args[1..] joined by a single space; "" when args has < 2 entries
+// argv: String      — REMOVED. The whole-argv join is not expressible any more.
 ```
 
-- `args` stays the `Set<String>` of exactly what nono sent (D6) and `argv` stays the
-  join of *all* of it, `args[0]` included. Nothing is normalised away, so a policy can
-  still see the shim path if it wants to.
+Why removal rather than deprecation (amended 2026-07-25, superseding the first draft
+of this decision, which kept `argv` alongside `argv_tail`):
+
+- **`argv` has no legitimate use that `argv_tail` does not serve at least as well.**
+  Unanchored globs (`*--force*`) behave identically, because the shim path
+  (`<base>/nono-tool-sandbox-<pid>-<nanos>-<hex>/shims/<command>`) contains no
+  caller-controlled text and so can neither create nor suppress a match. Anchored
+  globs work *only* against `argv_tail`. Matching `args[0]` itself is impossible (the
+  value is per-run random) and would be an anti-pattern regardless, since argv[0] is
+  caller-supplied and is never an identity claim.
+- **Keeping it would keep a fail-open footgun whose only guard is a load-time
+  WARNING.** That is exactly the posture D6 rejects for positional matching: make the
+  unsound pattern *unexpressible*, not merely discouraged. With `argv` gone, a policy
+  that references it fails strict validation — a structural guarantee instead of an
+  advisory one, and one an operator cannot scroll past.
+- **Removal is free now** (the change is unarchived and no operator policies exist)
+  and becomes a breaking change the moment it ships.
+- **`argv_tail` is not a workaround.** nono's own invocation matcher is
+  `argv.iter().skip(1)` (`crates/nono-cli/src/tool-sandbox/policy.rs:243`), so
+  upstream already treats argv[0] as not-an-argument. Our semantics track nono's,
+  which also means a forged argv[0] from a chained caller cannot desynchronise policy
+  from enforcement.
+
+What the change does and does not fix — **two hazards, one now structural and one
+still a rule**:
+
+- **The anchoring hazard is eliminated.** An anchored pattern can only be written
+  against `argv_tail`, where it matches the runtime payload.
+- **The flattening hazard is not, and now lives on `argv_tail`.** It is inherent to
+  any joined string: `argv_tail` still cannot tell `["push --force"]` from
+  `["push", "--force"]`, so `git commit -m "do not --force this"` still matches
+  `*--force*`. The **forbid-only** rule and the loader's
+  permit-reads-a-joined-string lint therefore transfer to `argv_tail` intact.
+
+The rest of D12, unchanged:
+
+- `args` stays the `Set<String>` of exactly what nono sent (D6), `args[0]` included.
+  Nothing is normalised away; a policy can still see the shim path via `args`, it just
+  can never usefully match it — which the loader now warns about when an
+  `args.contains(…)` literal carries a `/`.
 - `argv_tail` is what anchored `like` patterns must use:
-  `resource.argv_tail like "commit *"` instead of `resource.argv like "git commit *"`.
-- The over-matching caveat carries over unchanged: `argv_tail` is still a flattened
-  string, so it cannot tell `["push --force"]` from `["push", "--force"]`. It is
-  therefore **forbid-only** for the same reason `argv` is, and the loader's
-  `permit`-reads-`argv` lint must cover `argv_tail` too.
+  `resource.argv_tail like "commit *"` (not `"git commit *"` — the command name is
+  `resource.command`).
 - `argv_tail` is derived *after* upstream's lossy UTF-8 filter, so a dropped non-UTF-8
   argument still changes the string. Set membership (`resource.args.contains(…)`)
   remains the primary tool; `argv_tail` exists for patterns set membership cannot
@@ -236,9 +274,8 @@ namespace Nono {
   entity Command {
     command:   String,       // "git" — the command NAME (not args[0])
     args:      Set<String>,  // exact-membership tests only (D6); args[0] is a shim path
-    argv:      String,       // space-joined ALL args incl. the shim path; unanchored globs only
-    argv_tail: String,       // args[1..] joined — the target for anchored globs (D12)
-    arg_count: Long,         // count of post-filter args (lossy-argv caveat)
+    argv_tail: String,       // args[1..] joined — the ONLY joined string, forbid-only (D12)
+    arg_count: Long,         // count of post-filter args, args[0] included (lossy-argv caveat)
   }
 
   entity HttpEndpoint {
@@ -275,16 +312,24 @@ namespace Nono {
 
 Schema caveats (documented here and in the starter policy pack):
 
-- **`argv` is forbid-only.** Cedar strings support only `like` globs; a substring
-  pattern (`argv like "*--force*"`) also matches when the text appears *inside a
-  single argument* (`-m "do not --force"`). Over-matching is fail-safe in a
-  `forbid` (spurious deny → terminal fallback prompts) but unsound in a `permit`.
-  Exact flag tests use `resource.args.contains("--force")`.
-- **`argv` must never be anchored at the start; `argv_tail` must be.** `args[0]` is a
-  per-run shim path (§2 correction), so `argv like "git *"` cannot match a real
-  payload — silently fail-open in a `forbid`. Anchored patterns go against
-  `argv_tail` (`argv_tail like "commit *"`), which excludes `args[0]`; `argv_tail`
-  inherits the same forbid-only over-matching caveat (D12).
+- **`argv_tail` is forbid-only.** Cedar strings support only `like` globs; a substring
+  pattern (`argv_tail like "*--force*"`) also matches when the text appears *inside a
+  single argument* (`-m "do not --force"`), and a joined string cannot tell
+  `["push --force"]` from `["push", "--force"]`. Over-matching is fail-safe in a
+  `forbid` (spurious deny → terminal fallback prompts) but unsound in a `permit`, so
+  the loader warns about any `permit` that reads `argv_tail`. Exact flag tests use
+  `resource.args.contains("--force")`.
+- **There is no whole-argv attribute; anchored patterns go on `argv_tail`.** `args[0]`
+  is a per-run shim path (§2 correction), so a pattern anchored over the whole argv
+  could never match a real payload — silently fail-open in a `forbid`. Rather than
+  warn about it, the schema does not offer it: a policy referencing `resource.argv`
+  fails strict validation (D12 amendment). Anchored patterns use
+  `resource.argv_tail like "commit *"`, which starts at `args[1]`.
+- **`resource.args` can still hold the shim path, and no literal matches it.** `args`
+  is faithful to the payload, so `args.contains("git")` or
+  `args.contains("/usr/bin/git")` never matches the program — that is
+  `resource.command`'s job. The loader warns when an `args` membership literal
+  contains `/`, for both effects, because in a `forbid` this is the fail-open form.
 - **`caller_kind` is derived** in the adapter (`caller == "session"`), not a wire
   field — the conformance test must not expect it from nono.
 - **`arg_count`** counts args *after* upstream's lossy UTF-8 filter.

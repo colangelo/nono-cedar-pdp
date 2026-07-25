@@ -2,7 +2,7 @@
 
 ### Requirement: Cedar schema models the nono approval domain
 
-The service SHALL embed a Cedar schema in the `Nono` namespace declaring a `Caller in Session in Agent` principal hierarchy, a `Command` resource (`command`, `args`, `argv`, `argv_tail`, `arg_count`), an `HttpEndpoint` resource (`route_id`, `upstream`, `method`, `path`), and the actions `launchCommand` and `httpRequest` with their respective context types. The schema SHALL compile at startup and SHALL be the validation target for all policies.
+The service SHALL embed a Cedar schema in the `Nono` namespace declaring a `Caller in Session in Agent` principal hierarchy, a `Command` resource (`command`, `args`, `argv_tail`, `arg_count`), an `HttpEndpoint` resource (`route_id`, `upstream`, `method`, `path`), and the actions `launchCommand` and `httpRequest` with their respective context types. The schema SHALL compile at startup and SHALL be the validation target for all policies.
 
 #### Scenario: Embedded schema compiles
 
@@ -34,16 +34,16 @@ nono sends `args` as the shim process's raw argv, so `args[0]` is whatever the e
 placed in `argv[0]` — in the observed `nono run` path an absolute per-run shim path such
 as `/private/tmp/nono-tool-sandbox-<pid>-<nanos>-<hex>/shims/git` — and never reliably the
 command name. The schema SHALL therefore declare an `argv_tail` attribute on `Command`
-holding `args[1..]` joined by a single space, while `args` and `argv` remain faithful to
-what nono sent (`args[0]` included, nothing normalised away). `argv_tail` SHALL be the
-empty string when `args` carries fewer than two entries. The command name SHALL be read
-from `resource.command`, which is a separate wire field and is unaffected.
+holding `args[1..]` joined by a single space, while `args` remains faithful to what nono
+sent (`args[0]` included, nothing normalised away). `argv_tail` SHALL be the empty string
+when `args` carries fewer than two entries. The command name SHALL be read from
+`resource.command`, which is a separate wire field and is unaffected.
 
 #### Scenario: argv_tail omits the per-run shim path
 
 - **WHEN** a command request arrives with `args` `["/private/tmp/nono-tool-sandbox-13819-1784990893285791000-a4d3bceb3ec061c0/shims/git", "status", "--porcelain"]`
 - **THEN** `resource.argv_tail` is `"status --porcelain"`
-- **AND** `resource.argv` still contains the shim path verbatim, and `resource.command` is `"git"`
+- **AND** `resource.args` still carries the shim path verbatim, `resource.arg_count` is 3, and `resource.command` is `"git"`
 
 #### Scenario: A tail with nothing in it is empty, not absent
 
@@ -55,34 +55,58 @@ from `resource.command`, which is a separate wire field and is unaffected.
 - **WHEN** a policy tests `resource.argv_tail like "commit *"` for the `launchCommand` action
 - **THEN** strict validation against the schema passes
 
-### Requirement: Anchor argument patterns on argv_tail, never on argv
+### Requirement: Make whole-argv matching unexpressible, not merely discouraged
 
-Because `args[0]` is an unpredictable per-run path, a `like` pattern anchored at the
-start of `argv` cannot match a runtime payload: in a `permit` it is fail-safe (the permit
+Because `args[0]` is an unpredictable per-run path, a `like` pattern anchored at the start
+of the whole argv cannot match a runtime payload: in a `permit` it is fail-safe (the permit
 never fires and the request falls through to default deny), but in a `forbid` it fails
-open — the forbid never fires and any permit that matched still allows the launch. Policy
-authoring guidance, the shipped policy pack and the schema comments SHALL direct anchored
-matching at `argv_tail`. The loader SHALL report a load-time diagnostic, naming the file
-and policy identifier, for any policy whose `argv` glob is anchored at the start (no
-leading wildcard), and SHALL extend its existing `permit`-reads-`argv` lint to
-`argv_tail`, which inherits the same flattened-string over-matching caveat.
+open — the forbid never fires and any permit that matched still allows the launch. A
+joined string over the whole argv has no use that `argv_tail` does not serve at least as
+well: unanchored globs behave identically, because the shim path carries no
+caller-controlled text, and matching `args[0]` itself is impossible. The schema SHALL
+therefore declare **no whole-argv attribute**, so that a policy referencing `resource.argv`
+is refused by strict validation rather than warned about. Policy authoring guidance, the
+shipped policy pack and the schema comments SHALL direct anchored matching at `argv_tail`.
 
-#### Scenario: An anchored pattern matches the runtime payload only via argv_tail
+#### Scenario: A policy referencing resource.argv is refused
+
+- **WHEN** the policy directory contains a policy whose condition is `resource.argv like "git commit *"`
+- **THEN** strict validation fails, the policy set is refused, and (at startup) the daemon does not serve — the fail-open pattern cannot be loaded at all
+
+#### Scenario: An anchored pattern matches the runtime payload via argv_tail
 
 - **WHEN** a request whose `args` are `["/private/tmp/nono-tool-sandbox-13819-1784990893285791000-a4d3bceb3ec061c0/shims/git", "commit", "--amend"]` is evaluated against a forbid guarded by `resource.argv_tail like "commit *"`
 - **THEN** the forbid fires and the decision is deny
-- **AND WHEN** the same request is evaluated against a forbid guarded by `resource.argv like "git commit *"`
-- **THEN** that forbid does not fire, which is the fail-open shape the diagnostic below exists to catch
+- **AND WHEN** the same request carries `args` `[<the same shim path>, "status"]`
+- **THEN** that forbid does not fire and a permit on `resource.command == "git"` still allows the launch
 
-#### Scenario: A start-anchored argv glob is reported at load time
+### Requirement: Report the argument-matching hazards that survive the schema
 
-- **WHEN** the policy directory contains a policy whose condition is `resource.argv like "git commit *"`
-- **THEN** loading reports a diagnostic naming that file and policy identifier and stating that an anchored `argv` pattern cannot match at runtime because `args[0]` is a per-run shim path, and directing the author to `argv_tail`
+Removing the whole-argv attribute eliminates the anchoring hazard only. Two hazards remain
+and SHALL be reported as load-time diagnostics naming the policy identifier (which carries
+its file), advisory rather than fatal:
 
-#### Scenario: A permit reading argv_tail is linted like a permit reading argv
+1. **Flattening.** `argv_tail` is still a joined string, so it cannot distinguish
+   `["push --force"]` from `["push", "--force"]`, and `git commit -m "do not --force this"`
+   still matches `*--force*`. Over-matching is fail-safe in a `forbid` and unsound in a
+   `permit`, so `argv_tail` remains **forbid-only** and the loader SHALL report any
+   `permit` that reads `resource.argv_tail`.
+2. **Unmatchable `args` literals.** `args` still holds the per-run shim path, so an `args`
+   membership test against a value containing a path separator can never match the
+   program — fail-open when it appears in a `forbid`. The loader SHALL report such a test
+   for either effect and direct the author at `resource.command`.
+
+#### Scenario: A permit reading argv_tail is reported
 
 - **WHEN** the policy directory contains a `permit` whose condition reads `resource.argv_tail`
-- **THEN** loading reports the over-matching lint for that policy, exactly as it does for a `permit` reading `resource.argv`
+- **THEN** loading reports the over-matching lint naming that policy, and the policy set still loads
+
+#### Scenario: An args membership test against a path literal is reported
+
+- **WHEN** a policy tests `resource.args.contains("/usr/bin/git")`, or `resource.args.containsAny(["/bin/sh", "--force"])`, in either a `permit` or a `forbid`
+- **THEN** loading reports a lint naming that policy, stating that `args[0]` is a per-run shim path no literal can match, and directing the author to `resource.command`
+- **AND WHEN** the literal contains no path separator, such as `resource.args.contains("--force")`
+- **THEN** no lint is reported
 
 ### Requirement: Deny endpoint requests whose path is ambiguous
 

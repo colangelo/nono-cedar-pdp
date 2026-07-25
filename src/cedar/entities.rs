@@ -46,6 +46,29 @@ fn s(value: &str) -> RestrictedExpression {
     RestrictedExpression::new_string(value.to_string())
 }
 
+/// `args[1..]` joined by a single space — the schema's `argv_tail`, and the only
+/// joined string a policy may anchor a `like` glob against.
+///
+/// `args[0]` is whatever the exec caller put in argv[0]; on nono's own `nono run`
+/// path `which` resolves the program to the per-run shim, so it is an absolute
+/// path under `<base>/nono-tool-sandbox-<pid>-<nanos>-<hex>/shims/`. No literal
+/// can match a value that changes every run, and the caller could forge it
+/// anyway, so it is not part of the anchoring target. Skipping it also matches
+/// nono's own invocation matcher (`argv.iter().skip(1)`,
+/// `crates/nono-cli/src/tool-sandbox/policy.rs:243`), which keeps our semantics
+/// and upstream's enforcement in step.
+///
+/// Empty when `args` has fewer than two entries — an empty string is present and
+/// matches no pattern that begins with a literal, whereas a missing attribute
+/// would be an evaluation error, and an errored `forbid` is a skipped `forbid`.
+fn argv_tail(args: &[String]) -> String {
+    args.iter()
+        .skip(1)
+        .map(String::as_str)
+        .collect::<Vec<&str>>()
+        .join(" ")
+}
+
 pub fn build(q: &PolicyQuery, schema: &Schema) -> Result<(Request, Entities), BuildError> {
     let agent = Entity::new_no_attrs(
         uid(&format!("Nono::Agent::\"{}\"", escape(&q.agent)))?,
@@ -72,7 +95,7 @@ pub fn build(q: &PolicyQuery, schema: &Schema) -> Result<(Request, Entities), Bu
                     "args".to_string(),
                     RestrictedExpression::new_set(args.iter().map(|a| s(a))),
                 ),
-                ("argv".to_string(), s(&args.join(" "))),
+                ("argv_tail".to_string(), s(&argv_tail(args))),
                 (
                     "arg_count".to_string(),
                     RestrictedExpression::new_long(args.len() as i64),
@@ -149,7 +172,7 @@ pub fn build(q: &PolicyQuery, schema: &Schema) -> Result<(Request, Entities), Bu
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::query::{CallerKind, PolicyQuery, Target};
@@ -200,10 +223,69 @@ mod tests {
         }
     }
 
+    /// `args[0]` is an absolute per-run shim path, so the joined string a policy
+    /// anchors against must start at `args[1]`. Anything else can never match at
+    /// runtime — fail-open in a `forbid`.
+    #[test]
+    fn argv_tail_excludes_the_per_run_shim_path() {
+        let s = schema();
+        let q = command_query(
+            "session",
+            "git",
+            &[crate::wire::EXAMPLE_SHIM_ARGV0, "status", "--porcelain"],
+        );
+        let (request, entities) = build(&q, &s).unwrap();
+        let resource = entities.get(request.resource().unwrap()).unwrap();
+
+        assert!(matches!(
+            resource.attr("argv_tail").unwrap().unwrap(),
+            EvalResult::String(ref v) if v == "status --porcelain"
+        ));
+        // `args` stays faithful to the payload: the shim path is still in there.
+        assert!(matches!(
+            resource.attr("arg_count").unwrap().unwrap(),
+            EvalResult::Long(3)
+        ));
+        let EvalResult::Set(args) = resource.attr("args").unwrap().unwrap() else {
+            panic!("args must be a set");
+        };
+        assert!(
+            args.iter().any(
+                |a| matches!(a, EvalResult::String(v) if v == crate::wire::EXAMPLE_SHIM_ARGV0)
+            ),
+            "args must carry exactly what nono sent, shim path included: {args:?}"
+        );
+        // `argv` is gone from the schema, so it is gone from the entity too.
+        assert!(
+            resource.attr("argv").is_none(),
+            "argv must not be populated: an anchored pattern over it cannot match"
+        );
+    }
+
+    /// A bare `git` (or an `args` upstream's lossy filter emptied) has no tail.
+    /// The attribute must still exist and be empty — absent would be an
+    /// evaluation error, and an error in a `forbid` is a skipped `forbid`.
+    #[test]
+    fn argv_tail_is_empty_when_there_is_no_tail() {
+        let s = schema();
+        for args in [vec![crate::wire::EXAMPLE_SHIM_ARGV0], vec![]] {
+            let q = command_query("session", "git", &args);
+            let (request, entities) = build(&q, &s).unwrap();
+            let resource = entities.get(request.resource().unwrap()).unwrap();
+            assert!(
+                matches!(
+                    resource.attr("argv_tail").unwrap().unwrap(),
+                    EvalResult::String(ref v) if v.is_empty()
+                ),
+                "argv_tail must be present and empty for args {args:?}"
+            );
+        }
+    }
+
     #[test]
     fn builds_the_caller_session_agent_hierarchy_for_a_command() {
         let s = schema();
-        let q = command_query("session", "git", &["git", "push"]);
+        let q = command_query("session", "git", &[crate::wire::EXAMPLE_SHIM_ARGV0, "push"]);
         let (request, entities) = build(&q, &s).unwrap();
 
         let principal = request.principal().unwrap();
@@ -226,8 +308,8 @@ mod tests {
             EvalResult::String(ref c) if c == "git"
         ));
         assert!(matches!(
-            resource.attr("argv").unwrap().unwrap(),
-            EvalResult::String(ref c) if c == "git push"
+            resource.attr("argv_tail").unwrap().unwrap(),
+            EvalResult::String(ref c) if c == "push"
         ));
         assert!(matches!(
             resource.attr("arg_count").unwrap().unwrap(),
@@ -239,7 +321,11 @@ mod tests {
     #[test]
     fn omits_reason_from_context_when_absent_and_includes_it_when_present() {
         let s = schema();
-        let (request, _e) = build(&command_query("session", "git", &["git"]), &s).unwrap();
+        let (request, _e) = build(
+            &command_query("session", "git", &[crate::wire::EXAMPLE_SHIM_ARGV0]),
+            &s,
+        )
+        .unwrap();
         let context = request.context().unwrap();
         assert!(context.get("reason").is_none(), "reason must be omitted");
         assert!(matches!(
@@ -288,7 +374,7 @@ mod tests {
     fn crafted_names_cannot_break_out_of_the_uid_literal() {
         let s = schema();
         let hostile = r#"evil" in Nono::Agent::"claude-code"#;
-        let mut q = command_query(hostile, "git", &["git"]);
+        let mut q = command_query(hostile, "git", &[crate::wire::EXAMPLE_SHIM_ARGV0]);
         q.agent = r#"back\slash"#.to_string();
         let (request, entities) = build(&q, &s).unwrap();
 

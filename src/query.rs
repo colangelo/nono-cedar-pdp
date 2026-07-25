@@ -93,7 +93,7 @@ mod tests {
             target: Target::Command {
                 command: "git".to_string(),
                 args: vec![
-                    "git".to_string(),
+                    crate::wire::EXAMPLE_SHIM_ARGV0.to_string(),
                     "commit\u{1b}[2K\r-m".to_string(),
                     "ok".to_string(),
                 ],

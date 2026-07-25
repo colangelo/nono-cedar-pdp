@@ -4,7 +4,7 @@
 //! misreading a security decision.
 #![allow(clippy::unwrap_used, clippy::panic)]
 
-use nono_cedar_pdp::wire::{ApprovalRequest, WebhookEnvelope};
+use nono_cedar_pdp::wire::{ApprovalRequest, WebhookEnvelope, EXAMPLE_SHIM_ARGV0};
 use std::collections::BTreeSet;
 
 fn envelope_from(upstream: &nono::ApprovalRequest) -> (WebhookEnvelope, BTreeSet<String>) {
@@ -14,12 +14,16 @@ fn envelope_from(upstream: &nono::ApprovalRequest) -> (WebhookEnvelope, BTreeSet
     (serde_json::from_value(body).unwrap(), keys)
 }
 
+/// The key set is the drift guard; the VALUES here are the runtime shape. Upstream
+/// carries a unit-test fixture with `args: ["git", "push"]`
+/// (`crates/nono/src/supervisor/mod.rs:209-217`) that never reaches a webhook — the
+/// shim sends its own `args_os()`, so `args[0]` is a per-run shim path.
 #[test]
 fn command_request_matches_upstream() {
     let upstream = nono::ApprovalRequest::Command {
         request_id: "r1".into(),
         command: "git".into(),
-        args: vec!["git".into(), "push".into()],
+        args: vec![EXAMPLE_SHIM_ARGV0.into(), "push".into()],
         caller: "session".into(),
         intercept_rule: "push".into(),
         reason: None,
@@ -51,7 +55,7 @@ fn command_request_matches_upstream() {
         panic!("expected command variant");
     };
     assert_eq!(c.command, "git");
-    assert_eq!(c.args, vec!["git", "push"]);
+    assert_eq!(c.args, vec![EXAMPLE_SHIM_ARGV0, "push"]);
     assert_eq!(c.caller, "session");
     assert_eq!(c.child_pid, 42);
 }

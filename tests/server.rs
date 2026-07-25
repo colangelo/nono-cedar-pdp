@@ -8,6 +8,13 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
+/// nono sends `args[0]` as an absolute per-run shim path, not the command name.
+/// Every request body here uses that shape so the suite cannot green-light a
+/// policy pattern that production never matches.
+const SHIM_GIT: &str = nono_cedar_pdp::wire::EXAMPLE_SHIM_ARGV0;
+const SHIM_CURL: &str =
+    "/private/tmp/nono-tool-sandbox-13819-1784990893285791000-a4d3bceb3ec061c0/shims/curl";
+
 const POLICY: &str = r#"
 @id("allow-git-status")
 permit (
@@ -143,7 +150,7 @@ fn audit_lines(dir: &tempfile::TempDir) -> Vec<serde_json::Value> {
 #[tokio::test]
 async fn permitted_command_gets_allow() {
     let dir = tempfile::tempdir().unwrap();
-    let (status, body) = post(&dir, &command_body("git", &["git", "status"])).await;
+    let (status, body) = post(&dir, &command_body("git", &[SHIM_GIT, "status"])).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, serde_json::json!({"decision": "allow"}));
 }
@@ -151,7 +158,7 @@ async fn permitted_command_gets_allow() {
 #[tokio::test]
 async fn unpermitted_command_gets_deny_with_reason() {
     let dir = tempfile::tempdir().unwrap();
-    let (status, body) = post(&dir, &command_body("curl", &["curl", "evil.example"])).await;
+    let (status, body) = post(&dir, &command_body("curl", &[SHIM_CURL, "evil.example"])).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["decision"], "deny");
     assert!(body["reason"].as_str().unwrap().contains("no policy"));
@@ -195,7 +202,7 @@ async fn unsupported_variant_gets_200_deny() {
 #[tokio::test]
 async fn every_decision_is_audited() {
     let dir = tempfile::tempdir().unwrap();
-    let _ = post(&dir, &command_body("git", &["git", "status"])).await;
+    let _ = post(&dir, &command_body("git", &[SHIM_GIT, "status"])).await;
     let text = std::fs::read_to_string(dir.path().join("decisions.jsonl")).unwrap();
     assert_eq!(text.lines().count(), 1, "{text}");
     assert!(text.contains("\"decision\":\"allow\""));
@@ -217,7 +224,7 @@ async fn an_oversized_body_gets_200_deny_and_is_audited() {
             "capability_type": "command",
             "request_id": "r1",
             "command": "git",
-            "args": ["git", "status"],
+            "args": [SHIM_GIT, "status"],
             "caller": "session",
             "intercept_rule": "rule",
             "reason": null,
@@ -251,7 +258,7 @@ async fn an_oversized_body_gets_200_deny_and_is_audited() {
 async fn a_large_but_permitted_body_is_still_decided() {
     let dir = tempfile::tempdir().unwrap();
     let long_arg = "a".repeat(server::MAX_REQUEST_BYTES / 2);
-    let body = command_body("git", &["git", "status", &long_arg]);
+    let body = command_body("git", &[SHIM_GIT, "status", &long_arg]);
     assert!(body.len() < server::MAX_REQUEST_BYTES);
     let (status, body) = post(&dir, &body).await;
     assert_eq!(status, StatusCode::OK);
@@ -265,8 +272,8 @@ async fn a_large_but_permitted_body_is_still_decided() {
 async fn rejected_requests_are_audited_too() {
     let dir = tempfile::tempdir().unwrap();
 
-    let (_, allowed) = post(&dir, &command_body("git", &["git", "status"])).await;
-    let (_, policy_denied) = post(&dir, &command_body("curl", &["curl", "evil.example"])).await;
+    let (_, allowed) = post(&dir, &command_body("git", &[SHIM_GIT, "status"])).await;
+    let (_, policy_denied) = post(&dir, &command_body("curl", &[SHIM_CURL, "evil.example"])).await;
     let (_, unsupported) = post(&dir, &capability_body("cap-1")).await;
     let (_, malformed) = post(&dir, "{").await;
 
@@ -355,7 +362,7 @@ async fn logged_identifiers_carry_no_raw_control_bytes() {
         .finish();
 
     let dir = tempfile::tempdir().unwrap();
-    let allowed = command_body_with_request_id(hostile, "git", &["git", "status"]);
+    let allowed = command_body_with_request_id(hostile, "git", &[SHIM_GIT, "status"]);
     let refused = capability_body(hostile);
     {
         let _guard = tracing::subscriber::set_default(subscriber);
@@ -411,7 +418,7 @@ async fn a_daemon_with_no_policies_reports_unavailable() {
                 .method("POST")
                 .uri("/v1/approve")
                 .header("content-type", "application/json")
-                .body(Body::from(command_body("git", &["git", "status"])))
+                .body(Body::from(command_body("git", &[SHIM_GIT, "status"])))
                 .unwrap(),
         )
         .await

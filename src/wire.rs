@@ -5,6 +5,18 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The shape `args[0]` really has on the wire: an absolute **per-run** shim path,
+/// not the command name. Verbatim from an audit line of the end-to-end smoke run
+/// (`<base>/nono-tool-sandbox-<pid>-<unix nanos>-<hex nonce>/shims/<command>`).
+///
+/// Exported so every fixture and test asserts the runtime shape. The `["git",
+/// "push"]` shape this project used to model came from upstream's *unit-test*
+/// fixture (`crates/nono/src/supervisor/mod.rs:209-217`) and never reaches a
+/// webhook; a suite built on it green-lit start-anchored patterns that cannot
+/// match in production.
+pub const EXAMPLE_SHIM_ARGV0: &str =
+    "/private/tmp/nono-tool-sandbox-13819-1784990893285791000-a4d3bceb3ec061c0/shims/git";
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct WebhookEnvelope {
     pub backend: String,
@@ -68,9 +80,12 @@ pub enum WebhookResponse {
 mod tests {
     use super::*;
 
+    /// `args[0]` is the per-run shim path nono really sends, not the command
+    /// name — see `EXAMPLE_SHIM_ARGV0`.
     const REAL_COMMAND: &str = r#"{"backend":"cedar","request":{
         "capability_type":"command","request_id":"r1","command":"git",
-        "args":["git","push"],"caller":"session","intercept_rule":"push",
+        "args":["/private/tmp/nono-tool-sandbox-13819-1784990893285791000-a4d3bceb3ec061c0/shims/git","push"],
+        "caller":"session","intercept_rule":"push",
         "reason":null,"child_pid":42,"session_id":"s1"}}"#;
 
     const REAL_ENDPOINT: &str = r#"{"backend":"cedar","request":{
@@ -87,7 +102,7 @@ mod tests {
             panic!("expected command variant");
         };
         assert_eq!(c.command, "git");
-        assert_eq!(c.args, vec!["git", "push"]);
+        assert_eq!(c.args, vec![EXAMPLE_SHIM_ARGV0, "push"]);
         assert_eq!(c.caller, "session");
         assert_eq!(c.child_pid, 42);
         assert_eq!(c.reason, None);

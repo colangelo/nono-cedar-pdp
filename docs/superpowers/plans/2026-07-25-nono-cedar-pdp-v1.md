@@ -48,10 +48,15 @@ shim path**, never the command name:
  "child_pid":13820,"session_id":"35abc0894927242e"}
 ```
 
-`command` still carries the name. Anchored patterns (`argv like "git *"`,
-`args.contains("git")`) therefore never match in production — fail-safe in a `permit`,
-**fail-open in a `forbid`** — which is why the schema gained `argv_tail` (`args[1..]`
-joined). See the design spec §2 "Correction" and D12 for the upstream line references.
+`command` still carries the name. Anchored patterns (a whole-argv glob such as
+`like "git *"`, or `args.contains("git")`) therefore never match in production —
+fail-safe in a `permit`, **fail-open in a `forbid`** — which is why the schema gained
+`argv_tail` (`args[1..]` joined) and, per the D12 amendment, **dropped the whole-argv
+`argv` attribute entirely**: a policy that reads `resource.argv` now fails strict
+validation instead of merely earning a warning. Everything below that shows an `argv`
+attribute or a `["git", …]` `args` value is the plan as written, not as shipped; the
+schema, entity builder, fixtures and tests all use `argv_tail` and a shim-path `args[0]`.
+See the design spec §2 "Correction" and D12 for the upstream line references.
 
 **Real endpoint-request JSON** (field set from `crates/nono/src/supervisor/types.rs`; the proxy hardcodes `session_id: "proxy"` and `child_pid: 0`):
 

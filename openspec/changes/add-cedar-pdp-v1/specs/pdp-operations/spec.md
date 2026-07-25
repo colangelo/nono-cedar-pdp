@@ -119,17 +119,17 @@ postures and the example profile SHALL be consistent in both directions.
 
 ### Requirement: Document the decision-surface limits and known risks
 
-The project documentation SHALL state the limits that follow from nono's contract: only `command` and `endpoint` approvals reach the daemon; filesystem capability elevation cannot be arbitrated; argument positions are untrustworthy so `args` is a set; `args[0]` is an absolute per-run shim path rather than the command name, so the command name is read from `command` and anchored patterns belong on `argv_tail`; `argv` substring globs over-match text inside a single argument and are therefore safe only in `forbid`; endpoint paths arrive raw and unnormalised, so an ambiguous path is denied outright; endpoint requests carry no session identity; and the webhook is unauthenticated in both directions, so the daemon must bind loopback only.
+The project documentation SHALL state the limits that follow from nono's contract: only `command` and `endpoint` approvals reach the daemon; filesystem capability elevation cannot be arbitrated; argument positions are untrustworthy so `args` is a set; `args[0]` is an absolute per-run shim path rather than the command name, so the command name is read from `command`, there is no whole-argv attribute at all, and anchored patterns belong on `argv_tail`; `argv_tail` substring globs over-match text inside a single argument and are therefore safe only in `forbid`; endpoint paths arrive raw and unnormalised, so an ambiguous path is denied outright; endpoint requests carry no session identity; and the webhook is unauthenticated in both directions, so the daemon must bind loopback only.
 
 #### Scenario: Argument-matching guidance is documented
 
 - **WHEN** a policy author consults the documentation on matching command arguments
-- **THEN** they are told to use set membership rather than position, that `argv` globs belong only in `forbid` policies, and that such globs must not be anchored at the start
+- **THEN** they are told to use set membership rather than position, that anchored globs go on `argv_tail`, and that `argv_tail` globs belong only in `forbid` policies
 
 #### Scenario: The shim-path shape of args[0] is documented
 
 - **WHEN** a policy author consults the documentation on the payload nono sends
-- **THEN** the example payload shows `args[0]` as an absolute per-run shim path, and the documentation states that `command` carries the command name, that anchored `argv` patterns therefore never match at runtime — fail-safe in a `permit` and fail-open in a `forbid` — and that `argv_tail` is the anchoring target
+- **THEN** the example payload shows `args[0]` as an absolute per-run shim path, and the documentation states that `command` carries the command name, that a pattern anchored over the whole argv could never match at runtime — fail-safe in a `permit` and fail-open in a `forbid` — that the whole-argv attribute is therefore removed rather than deprecated (a policy reading `resource.argv` fails validation), and that `argv_tail` is the anchoring target
 
 #### Scenario: Impersonation risk is documented
 

@@ -8,6 +8,9 @@ use nono_cedar_pdp::{adapter::nono_webhook, cedar, config::Config};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// `args[0]` as nono really sends it: an absolute per-run shim path.
+const SHIM_GIT: &str = nono_cedar_pdp::wire::EXAMPLE_SHIM_ARGV0;
+
 const POLICY_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/policies");
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 
@@ -86,7 +89,7 @@ fn history_rewrites_are_denied() {
 /// baseline policy's job, so the shipped pack has to do it.
 #[test]
 fn an_unmapped_approval_backend_is_denied() {
-    let decision = decide(&command_body("rogue", "session", &["git", "status"]));
+    let decision = decide(&command_body("rogue", "session", &[SHIM_GIT, "status"]));
     assert!(
         !decision.allow,
         "an unmapped backend must not inherit a mapped agent's rights: {decision:?}"
@@ -103,7 +106,7 @@ fn an_unmapped_approval_backend_is_denied() {
 /// intercepted command that chained this one; only the former is approved.
 #[test]
 fn a_chained_command_launch_is_denied() {
-    let decision = decide(&command_body("cedar", "npm", &["git", "status"]));
+    let decision = decide(&command_body("cedar", "npm", &[SHIM_GIT, "status"]));
     assert!(!decision.allow, "{decision:?}");
     assert!(
         decision

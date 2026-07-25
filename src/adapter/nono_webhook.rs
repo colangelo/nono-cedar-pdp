@@ -158,9 +158,12 @@ mod tests {
         }
     }
 
+    /// `args[0]` is the per-run shim path nono really sends
+    /// (`crate::wire::EXAMPLE_SHIM_ARGV0`), not the command name.
     const COMMAND: &str = r#"{"backend":"cedar","request":{
         "capability_type":"command","request_id":"r1","command":"git",
-        "args":["git","push","--force"],"caller":"session","intercept_rule":"push",
+        "args":["/private/tmp/nono-tool-sandbox-13819-1784990893285791000-a4d3bceb3ec061c0/shims/git","push","--force"],
+        "caller":"session","intercept_rule":"push",
         "reason":null,"child_pid":42,"session_id":"s1"}}"#;
 
     #[test]
@@ -181,7 +184,11 @@ mod tests {
             panic!("expected command target");
         };
         assert_eq!(command, "git");
-        assert_eq!(args, vec!["git", "push", "--force"]);
+        assert_eq!(
+            args,
+            vec![crate::wire::EXAMPLE_SHIM_ARGV0, "push", "--force"],
+            "args must reach policy exactly as nono sent them, shim path included"
+        );
         assert_eq!(intercept_rule, "push");
         assert_eq!(child_pid, 42);
     }
