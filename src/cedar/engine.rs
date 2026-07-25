@@ -1,7 +1,7 @@
 //! Policy set loading, strict validation, and the hot-swappable current set.
 
 use arc_swap::ArcSwap;
-use cedar_policy::{PolicyId, PolicySet, Schema, ValidationMode, Validator};
+use cedar_policy::{Effect, PolicyId, PolicySet, Schema, ValidationMode, Validator};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -14,14 +14,69 @@ pub enum PolicyLoadError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("reading policy file {path}: {source}")]
+    ReadFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("parsing {path}: {message}")]
     Parse { path: PathBuf, message: String },
     #[error("duplicate policy id from {path}: {message}")]
     Duplicate { path: PathBuf, message: String },
     #[error("policy validation failed against the nono schema: {}", .errors.join("; "))]
     Validation { errors: Vec<String> },
-    #[error("no .cedar policies found in {path} — refusing to serve a deny-everything policy set")]
+    #[error(
+        "no policies found in {path} (checked every *.cedar file) — refusing to serve a deny-everything policy set"
+    )]
     Empty { path: PathBuf },
+}
+
+/// A `.cedar` entry we deliberately skip rather than fail on: editor lock files
+/// and backups (`.#10-git.cedar`, `#10-git.cedar#`), and anything that is not a
+/// regular file (a directory named `archive.cedar`, a dangling symlink). Failing
+/// on these would block startup — and every hot-reload — for as long as a policy
+/// file is open in an editor.
+fn is_loadable_policy_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if name.starts_with('.') || name.starts_with('#') {
+        return false;
+    }
+    path.is_file()
+}
+
+/// Operator lint: `argv` is the space-join of `args`, so `argv like "*--force*"`
+/// also matches when the text sits *inside* a single argument. Over-matching is
+/// fail-safe in a `forbid` and unsound in a `permit`, so a `permit` that reads
+/// `argv` is a policy smell worth naming at load time. Advisory, not fatal: the
+/// operator may have a narrow case, and refusing to start would be a worse
+/// failure mode than a warning.
+pub fn lint_argv_in_permit(set: &PolicySet) -> Vec<String> {
+    let mut lints = Vec::new();
+    for policy in set.policies() {
+        if policy.effect() != Effect::Permit {
+            continue;
+        }
+        // Compare against the JSON form, not the source text: a comment that
+        // merely mentions argv is not an argv read.
+        let reads_argv = match policy.to_json() {
+            Ok(json) => json.to_string().contains(r#""attr":"argv""#),
+            Err(e) => {
+                tracing::debug!(policy = %policy.id(), error = %e, "could not lint policy");
+                false
+            }
+        };
+        if reads_argv {
+            lints.push(format!(
+                "policy {} is a permit that reads resource.argv; argv globs \
+                 over-match text inside a single argument, so they belong in \
+                 forbid only — use resource.args.contains(..) for exact tests",
+                policy.id()
+            ));
+        }
+    }
+    lints
 }
 
 #[derive(Debug)]
@@ -50,18 +105,13 @@ pub fn load_dir(
         .filter_map(Result::ok)
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|e| e == "cedar"))
+        .filter(|p| is_loadable_policy_file(p))
         .collect();
     entries.sort();
 
-    if entries.is_empty() {
-        return Err(PolicyLoadError::Empty {
-            path: dir.to_path_buf(),
-        });
-    }
-
     let mut set = PolicySet::new();
     for path in &entries {
-        let text = std::fs::read_to_string(path).map_err(|source| PolicyLoadError::Io {
+        let text = std::fs::read_to_string(path).map_err(|source| PolicyLoadError::ReadFile {
             path: path.clone(),
             source,
         })?;
@@ -88,6 +138,16 @@ pub fn load_dir(
         }
     }
 
+    // Count policies, not files: a directory of `.cedar` files that are all
+    // comments, whitespace or templates yields exactly the deny-everything set
+    // this guard exists to refuse. A genuine deny-all is written explicitly as
+    // `forbid (principal, action, resource);`.
+    if set.num_of_policies() == 0 {
+        return Err(PolicyLoadError::Empty {
+            path: dir.to_path_buf(),
+        });
+    }
+
     let result = Validator::new(schema.clone()).validate(&set, ValidationMode::Strict);
     if !result.validation_passed() {
         return Err(PolicyLoadError::Validation {
@@ -96,6 +156,9 @@ pub fn load_dir(
     }
     for w in result.validation_warnings() {
         tracing::warn!(warning = %w, "cedar policy validation warning");
+    }
+    for lint in lint_argv_in_permit(&set) {
+        tracing::warn!(lint = %lint, "cedar policy lint");
     }
 
     Ok(LoadedPolicies {
@@ -222,6 +285,118 @@ when { resource.args.contains("--force") };
             load_dir(d.path(), &schema, 1),
             Err(PolicyLoadError::Empty { .. })
         ));
+    }
+
+    /// A directory full of `.cedar` files that yield *no policies* is exactly the
+    /// deny-everything set the Empty guard exists to refuse. Counting files
+    /// instead of policies lets it through.
+    #[test]
+    fn cedar_files_containing_no_policies_are_refused() {
+        let schema = crate::cedar::schema::load().unwrap();
+        let cases = [
+            (
+                "comments only",
+                "// every policy in here is commented out\n",
+            ),
+            ("whitespace only", "   \n\t\n"),
+            (
+                "templates only",
+                "@id(\"t\")\npermit (principal == ?principal, action, resource);\n",
+            ),
+        ];
+        for (label, body) in cases {
+            let d = dir_with(&[("10-git.cedar", body)]);
+            let err = load_dir(d.path(), &schema, 1).unwrap_err();
+            assert!(
+                matches!(err, PolicyLoadError::Empty { .. }),
+                "{label}: a zero-policy set denies everything and must be refused, got {err}"
+            );
+        }
+    }
+
+    /// D7 inverts if an empty set is allowed to become the last known good one:
+    /// every later failed reload would then retain deny-everything.
+    #[test]
+    fn reload_refuses_an_emptied_policy_set_and_keeps_the_last_good_one() {
+        let schema = crate::cedar::schema::load().unwrap();
+        let d = dir_with(&[("git.cedar", GOOD)]);
+        let engine = Engine::bootstrap(schema, d.path().to_path_buf()).unwrap();
+        std::fs::write(
+            d.path().join("git.cedar"),
+            "// oops, commented out the lot\n",
+        )
+        .unwrap();
+
+        let err = engine.reload().unwrap_err();
+        assert!(matches!(err, PolicyLoadError::Empty { .. }), "{err}");
+        assert_eq!(
+            engine.snapshot().generation,
+            1,
+            "generation must not advance"
+        );
+        assert_eq!(engine.snapshot().set.num_of_policies(), 2);
+        assert!(
+            engine
+                .evaluate(&command_query("session", "git", &["git", "status"]))
+                .allow,
+            "an emptied reload must not become the active set"
+        );
+    }
+
+    /// While a policy file is open in an editor the directory can hold lock
+    /// symlinks and backups. Those must not abort the load — a reload that fails
+    /// for the whole duration of an editing session is a self-inflicted outage.
+    #[test]
+    fn editor_sidecars_and_cedar_named_directories_are_ignored() {
+        let schema = crate::cedar::schema::load().unwrap();
+        let d = dir_with(&[("10-git.cedar", GOOD), ("10-git.cedar~", GOOD)]);
+        // Emacs's lock file is a dangling symlink named `.#<file>`.
+        std::os::unix::fs::symlink("ac@host.12345:1", d.path().join(".#10-git.cedar")).unwrap();
+        std::fs::create_dir(d.path().join("archive.cedar")).unwrap();
+
+        let loaded = load_dir(d.path(), &schema, 1).unwrap();
+        assert_eq!(loaded.files, vec![d.path().join("10-git.cedar")]);
+        assert_eq!(loaded.set.num_of_policies(), 2);
+    }
+
+    /// A per-file read failure is not a directory read failure; the message has
+    /// to say which is which or the operator debugs the wrong thing.
+    #[test]
+    fn an_unreadable_policy_file_is_reported_as_a_file_error() {
+        let schema = crate::cedar::schema::load().unwrap();
+        let d = tempfile::tempdir().unwrap();
+        // Invalid UTF-8 fails read_to_string without needing permission games.
+        std::fs::write(d.path().join("bad.cedar"), [0x70, 0x65, 0xff, 0xfe]).unwrap();
+        let err = load_dir(d.path(), &schema, 1).unwrap_err();
+        assert!(matches!(err, PolicyLoadError::ReadFile { .. }), "{err}");
+        let text = err.to_string();
+        assert!(text.contains("reading policy file"), "{text}");
+        assert!(text.contains("bad.cedar"), "{text}");
+    }
+
+    /// `argv` is a space-join, so `like` globs over it also match text *inside* a
+    /// single argument. Over-matching is fail-safe in a `forbid` and unsound in a
+    /// `permit`, so a permit that reads `argv` gets flagged for the operator.
+    #[test]
+    fn a_permit_reading_argv_is_linted_but_a_forbid_is_not() {
+        let forbid_argv = r#"@id("no-force")
+forbid (principal, action == Nono::Action::"launchCommand", resource)
+when { resource.argv like "*--force*" };"#;
+        assert!(lint_argv_in_permit(&PolicySet::from_str(forbid_argv).unwrap()).is_empty());
+
+        let permit_argv = r#"@id("git-push")
+permit (principal, action == Nono::Action::"launchCommand", resource)
+when { resource.argv like "git push*" };"#;
+        let lints = lint_argv_in_permit(&PolicySet::from_str(permit_argv).unwrap());
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert!(lints[0].contains("argv"), "{lints:?}");
+
+        // A comment that merely mentions argv is not an argv read.
+        let clean = r#"@id("ok")
+// argv is forbid-only, so this uses args
+permit (principal, action == Nono::Action::"launchCommand", resource)
+when { resource.args.contains("status") };"#;
+        assert!(lint_argv_in_permit(&PolicySet::from_str(clean).unwrap()).is_empty());
     }
 
     #[test]
@@ -408,6 +583,24 @@ permit (
         let (engine, _d) = matrix_engine();
         let decision = engine.evaluate(&command_query("session", "git", &["git", "status"]));
         assert!(decision.eval_us > 0);
+    }
+
+    /// Upstream embeds the intercepted command's name in `request_id`, so bytes
+    /// an attacker chose reach the entity uid. The decision must stay a deny and
+    /// the reason must not smuggle terminal escapes into the operator's log.
+    #[test]
+    fn control_bytes_in_an_identifier_cannot_inject_into_the_deny_reason() {
+        let (engine, _d) = matrix_engine();
+        let mut q = command_query("session", "git", &["git", "status"]);
+        q.request_id = "approve-git\u{1b}[2K\rDENY OVERRIDDEN: decision=allow".to_string();
+        let decision = engine.evaluate(&q);
+        assert!(!decision.allow, "{decision:?}");
+        assert!(
+            !decision.reason.chars().any(char::is_control),
+            "raw control bytes in the reason: {:?}",
+            decision.reason
+        );
+        assert!(decision.reason.contains("\\u{001b}"), "{}", decision.reason);
     }
 
     /// A `forbid` that errors at evaluation time is skipped by Cedar, so the

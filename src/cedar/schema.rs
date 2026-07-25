@@ -58,8 +58,7 @@ mod tests {
     }
 
     #[test]
-    fn positional_argument_access_is_rejected_by_the_schema() {
-        // `args` is a Set, so indexing is not valid Cedar against this schema.
+    fn set_membership_and_arg_count_policies_validate() {
         let schema = load().unwrap();
         let policies = PolicySet::from_str(
             r#"permit (
@@ -68,7 +67,41 @@ mod tests {
         )
         .unwrap();
         let result = Validator::new(schema).validate(&policies, ValidationMode::Strict);
-        assert!(result.validation_passed());
+        let errors: Vec<String> = result.validation_errors().map(|e| e.to_string()).collect();
+        assert!(result.validation_passed(), "{errors:#?}");
+    }
+
+    /// `args` is a `Set<String>` on purpose: upstream drops non-UTF-8 argv
+    /// entries, so positions shift. Index access must be unwritable, not merely
+    /// discouraged — either it fails to parse or it fails validation.
+    #[test]
+    fn positional_argument_access_is_rejected_by_the_schema() {
+        for body in [
+            r#"permit (principal, action == Nono::Action::"launchCommand", resource)
+               when { resource.args[1] == "push" };"#,
+            r#"permit (principal, action == Nono::Action::"launchCommand", resource)
+               when { resource.args["1"] == "push" };"#,
+        ] {
+            let Ok(policies) = PolicySet::from_str(body) else {
+                continue; // rejected by the parser: unexpressible, as intended
+            };
+            let schema = load().unwrap();
+            let result = Validator::new(schema).validate(&policies, ValidationMode::Strict);
+            assert!(
+                !result.validation_passed(),
+                "index access into args must not validate: {body}"
+            );
+        }
+    }
+
+    /// The `argv` caveat has to live in the artifact operators read, not only in
+    /// the design doc.
+    #[test]
+    fn the_schema_artifact_documents_the_argv_caveat() {
+        assert!(
+            SCHEMA_SRC.to_lowercase().contains("forbid-only"),
+            "nono.cedarschema must document that argv globs belong in forbid only"
+        );
     }
 
     #[test]

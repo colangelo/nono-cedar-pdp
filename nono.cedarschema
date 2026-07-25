@@ -5,8 +5,18 @@ namespace Nono {
 
   entity Command {
     command: String,
+    // A Set has no index access, so positional argument matching is
+    // unexpressible by construction. Deliberate: nono drops non-UTF-8 argv
+    // entries before sending them, so positions are untrustworthy.
     args: Set<String>,
+    // Space-joined args, for `like` globs. FORBID-ONLY: a glob over argv also
+    // matches text *inside* a single argument — `git commit -m "do not --force
+    // this"` matches `argv like "*--force*"`. Over-matching is fail-safe in a
+    // forbid and unsound in a permit, and argv cannot tell
+    // ["git", "push --force"] from ["git", "push", "--force"]. For exact tests
+    // use args.contains(..). Loading warns about any permit that reads argv.
     argv: String,
+    // Count of the args nono actually sent (post-filter; see args).
     arg_count: Long,
   };
 
