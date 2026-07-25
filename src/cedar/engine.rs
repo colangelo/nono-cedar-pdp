@@ -732,6 +732,9 @@ when { resource.args.contains("--force") };
         let schema = crate::cedar::schema::load().unwrap();
         let d = dir_with(&[("10-git.cedar", GOOD), (".baseline.cedar", GOOD)]);
         std::fs::create_dir(d.path().join("archive.cedar")).unwrap();
+        // Emacs's lock file is a dangling symlink named `.#<file>` — the shape
+        // that sits in a policy directory for the whole of an editing session.
+        std::os::unix::fs::symlink("ac@host.12345:1", d.path().join(".#10-git.cedar")).unwrap();
 
         let (loaded, log) =
             crate::test_log::with_captured_log(|| load_dir(d.path(), &schema, 1).unwrap());
@@ -746,15 +749,25 @@ when { resource.args.contains("--force") };
             "a .cedar path that is not a regular file must be named: {log:?}"
         );
         assert!(
-            log.lines().filter(|l| l.contains("WARN")).count() >= 2,
-            "both skips must be WARN, not a level an operator filters out: {log:?}"
+            log.contains(".#10-git.cedar"),
+            "an editor lock file must be named in the log too: {log:?}"
+        );
+        assert!(
+            log.lines()
+                .filter(|l| l.contains("WARN") && l.contains("skipping"))
+                .count()
+                >= 3,
+            "every skip must be WARN, not a level an operator filters out: {log:?}"
         );
         assert!(
             log.contains("not loaded"),
             "the line must say the file is not in force: {log:?}"
         );
+        // `/10-git.cedar` and not the bare name: the lock file's path legitimately
+        // ends `.#10-git.cedar`, which contains the loaded file's name as a
+        // substring.
         assert!(
-            !log.contains("10-git.cedar"),
+            !log.contains("/10-git.cedar"),
             "a file that WAS loaded must not be reported as skipped: {log:?}"
         );
     }

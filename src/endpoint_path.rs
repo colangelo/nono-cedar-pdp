@@ -215,6 +215,7 @@ mod tests {
             "/repos/..\\..\\user/keys",
             "/repos/foo\\../user/keys",
             "/repos/%5c..%5c/user/keys", // encoded backslash, caught after decoding
+            "/repos/..%5C../user/keys",  // the spec's own backslash-traversal example
         ] {
             let found = ambiguity(path);
             assert!(
@@ -259,6 +260,7 @@ mod tests {
             "/repos/foo/bar?ref=..",     // a `..` in the query cannot move the route
             "/repos/foo/bar?path=../x",  // ditto, the common API-parameter shape
             "/repos/foo/bar?q=..\\..",   // backslashes in a query are data too
+            "/search?q=..%2F..%2Fetc",   // encoded traversal in a query value is data
             "/repos/foo/bar#..",         // `bar#..` is one segment, not a `..` segment
             "/issues/issue#5",           // a raw `#` alone is not traversal
             "/repos/foo/bar\\baz",       // a backslash alone is not traversal either
