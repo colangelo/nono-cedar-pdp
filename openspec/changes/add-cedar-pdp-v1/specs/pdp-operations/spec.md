@@ -99,6 +99,53 @@ defaults SHALL be home-anchored: `~/.config/nono-cedar-pdp/policies` and
 - **WHEN** the end-to-end smoke recipe runs
 - **THEN** it starts the daemon with a configuration whose policy directory and audit log sit outside the sandboxed workdir, and it reads its assertions from that configured audit-log path rather than from a repository-root file
 
+### Requirement: Check the daemon's own state paths at startup, and do not overstate the checks
+
+`serve` SHALL, before loading policies, opening the audit log or binding a socket,
+refuse to start when the policy directory or any policy file the loader would load is
+group- or world-writable, naming the path, the mode and the `chmod go-w` remedy; a
+`.cedar` name the loader skips (an editor lock file or backup) SHALL NOT be a reason to
+refuse. It SHALL also fail closed when the policy directory cannot be inspected at all.
+Separately it SHALL warn — loudly, naming the risk — when the policy directory or the
+audit log resolves inside the current working directory, so that the repo-relative
+development configuration keeps working while being impossible to mistake for a
+deployment.
+
+Both checks SHALL be documented for what they actually buy, wherever they are
+described:
+
+- The group/world-writable refusal does **nothing** about the sandboxed agent. nono's
+  sandboxes are path-based (Seatbelt, Landlock) and do not change uid, so the agent runs
+  as the **same user** as this daemon and owner-write is exactly the access it has. The
+  refusal defends against a **different and weaker** threat: another local user.
+- The working-directory warning is a **heuristic proxy** and is wrong in both
+  directions: it misses an absolute `policy_dir` that happens to sit inside a granted
+  tree (on macOS the default profile groups grant write to `/tmp`, `$TMPDIR` and
+  `/var/folders`), and it fires on a development run where no agent exists.
+- The only control that actually prevents the escalation is the nono profile not
+  granting write access to those paths, so the documentation SHALL give a reader the
+  concrete procedure for checking a profile against that rule: the resolved write grants
+  (`nono profile show <profile> --format manifest`, filtered to grants whose access
+  includes write — which covers `filesystem.allow`/`write`/`allow_file`/`write_file`,
+  `workdir.access: "readwrite"`, `--allow-cwd` and any group-supplied grant) plus every
+  `command_policies.commands.*.from.*.sandbox.fs_write` and `fs_write_file` entry in the
+  profile, which the resolved manifest does **not** include.
+
+#### Scenario: A group-writable policy directory refuses to start
+
+- **WHEN** `serve` is given a policy directory whose mode grants write to group or other
+- **THEN** it exits non-zero without binding a port, and the message names the path, the mode and the `chmod go-w` remedy
+
+#### Scenario: A loose file the loader ignores is not a refusal
+
+- **WHEN** the policy directory contains a group-writable `.cedar` name the loader skips, such as an editor lock file
+- **THEN** startup is not refused on account of that file
+
+#### Scenario: A policy directory inside the working directory warns
+
+- **WHEN** `serve` resolves `policy_dir` or `audit_log` inside the current working directory
+- **THEN** it logs a warning that names the path, the profile keys that would grant an agent write access to it, that file modes cannot prevent the escalation because the sandbox runs as the same user, and that the check is a proxy that cannot read the profile — and then continues to serve
+
 ### Requirement: The shipped policy pack approves a subcommand by position, not by word
 
 A fresh install inherits the shipped pack's posture, so the pack is product surface rather

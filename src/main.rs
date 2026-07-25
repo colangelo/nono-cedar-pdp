@@ -105,6 +105,29 @@ async fn run_serve(config_path: &std::path::Path) -> Result<(), String> {
     use std::sync::Arc;
 
     let config = Config::load(config_path).map_err(|e| e.to_string())?;
+    // Before anything is loaded, opened or bound: who can write the policies
+    // decides every approval this daemon will ever make. An `Err` here is a
+    // refusal to serve; the warnings are advisory and deliberately loud. Both
+    // checks are narrower than they look — see `isolation`'s module docs and
+    // README "Keep the policy directory out of the sandbox".
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => Some(cwd),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "no readable working directory; cannot tell whether the policy \
+                 directory sits in one an agent may write"
+            );
+            None
+        }
+    };
+    let warnings =
+        nono_cedar_pdp::isolation::check(&config.policy_dir, &config.audit_log, cwd.as_deref())
+            .map_err(|e| e.to_string())?;
+    for warning in &warnings {
+        tracing::warn!("{warning}");
+    }
+
     let schema = cedar::schema::load().map_err(|e| e.to_string())?;
     let engine = Arc::new(
         cedar::engine::Engine::bootstrap(schema, config.policy_dir.clone())

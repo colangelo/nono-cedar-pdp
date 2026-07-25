@@ -1,0 +1,18 @@
+# DEVELOPMENT ONLY — do not deploy this file.
+#
+# Both paths are relative to the working directory, which is the point (edit
+# ./policies, watch the reload, read ./decisions.jsonl) and also the hazard: if a
+# nono profile grants a sandboxed agent write access to this tree — and
+# examples/cedar-pdp-smoke.json does, via `workdir.access: "readwrite"` and the
+# git command's `fs_write: ["."]` — then the agent can rewrite the policies that
+# decide its own approvals, and the watcher adopts them within ~150 ms.
+#
+# `serve` therefore prints a loud SECURITY warning for both paths at startup. File
+# permissions are no help: nono's sandboxes are path-based (Seatbelt/Landlock) and
+# do not change uid, so the agent runs as the same user as this daemon. Use
+# ./nono-cedar-pdp.toml for anything real.
+policy_dir = "./policies"
+audit_log = "./decisions.jsonl"
+
+[agents]
+cedar = "claude-code"

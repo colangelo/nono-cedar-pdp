@@ -1,5 +1,14 @@
-policy_dir = "./policies"
-audit_log = "./decisions.jsonl"
+# Shipped configuration. Both paths are deliberately outside any repository
+# working tree: the policy directory is hot-reloaded, so write access to it is
+# write access to every decision this daemon makes, and the audit log is the
+# record of what was decided. Neither may sit anywhere a nono profile grants a
+# sandboxed agent write access — README "Keep the policy directory out of the
+# sandbox" has the procedure for checking your own profile against that rule.
+#
+# `just install-policies` copies the starter pack into policy_dir.
+# For repo-relative development, use ./nono-cedar-pdp.dev.toml instead.
+policy_dir = "~/.config/nono-cedar-pdp/policies"
+audit_log = "~/.local/state/nono-cedar-pdp/decisions.jsonl"
 
 [agents]
 cedar = "claude-code"

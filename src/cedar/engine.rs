@@ -36,7 +36,7 @@ pub enum PolicyLoadError {
 /// regular file (a directory named `archive.cedar`, a dangling symlink). Failing
 /// on these would block startup — and every hot-reload — for as long as a policy
 /// file is open in an editor.
-fn is_loadable_policy_file(path: &Path) -> bool {
+pub(crate) fn is_loadable_policy_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
