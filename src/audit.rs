@@ -242,16 +242,22 @@ impl AuditLog {
     /// Record a decision. A logging failure must never change a decision, so
     /// errors are traced and swallowed.
     pub fn record(&self, query: &PolicyQuery, decision: &Decision) {
-        // What routed the request here, per target kind. The rule fields are
-        // request-derived text, so they are control-escaped at this boundary —
-        // the same rule the resource summary follows — rather than left to
-        // serde: JSON string encoding escapes only C0 controls (U+0000..U+001F),
+        // The boundary rule: every request-derived value on the line is
+        // control-escaped here, at the recording boundary, rather than left to
+        // serde — JSON string encoding escapes only C0 controls (U+0000..U+001F),
         // so a DEL or C1 control (CSI among them) would land in the JSONL raw
-        // and replay in the terminal of whoever reads the trail. The real rule
-        // shapes contain no control bytes, so an honest value is byte-identical
-        // either way. (`record_rejected` is the other recording path: its rule
-        // fields are always null, and its scraped context is escaped at the
-        // adapter boundary by `scrape_context`.)
+        // and replay in the terminal of whoever reads the trail. That covers the
+        // routing fields below and the wire-chosen identifiers (`request_id`,
+        // `session_id`, `backend`); the remaining values are covered elsewhere:
+        // `agent` comes from our own config, `principal` goes through `{:?}`
+        // (which escapes controls), and `resource` is escaped inside
+        // `resource_summary`. Honest values contain no control bytes, so they
+        // are byte-identical either way. (`record_rejected` is the other
+        // recording path: its rule fields are always null, and its scraped
+        // context is escaped at the adapter boundary by `scrape_context`.)
+        let request_id = crate::sanitize::control_escape(&query.request_id);
+        let session_id = crate::sanitize::control_escape(&query.session_id);
+        let backend = crate::sanitize::control_escape(&query.backend);
         let (child_pid, intercept_rule, rule_label) = match &query.target {
             crate::query::Target::Command {
                 intercept_rule,
@@ -274,9 +280,9 @@ impl AuditLog {
         };
         self.append(&AuditRecord {
             ts: now_rfc3339(),
-            request_id: Some(&query.request_id),
-            session_id: Some(&query.session_id),
-            backend: Some(&query.backend),
+            request_id: Some(&request_id),
+            session_id: Some(&session_id),
+            backend: Some(&backend),
             agent: Some(&query.agent),
             principal: Some(format!("Nono::Caller::{:?}", query.caller)),
             action: Some(query.action_name()),
@@ -593,6 +599,49 @@ mod tests {
             lines[0]
         );
         assert_eq!(lines[1]["rule_label"], "rl\\u{007f}\\u{009b}0m", "{:#}", lines[1]);
+    }
+
+    /// The same boundary rule, for the identifier fields the first fix stopped
+    /// short of: the delta spec's SHALL covers *every* request-derived value, and
+    /// `request_id`, `session_id` and `backend` are wire-chosen text a decided
+    /// line always carries. serde escapes C0 only, so a C0-based test would pass
+    /// while DEL and C1 (CSI, U+009B) still reach the file raw — which is exactly
+    /// how the gap survived the first round. Raw file bytes again, decided path.
+    #[test]
+    fn del_and_c1_controls_in_the_identifier_fields_never_reach_the_file_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decisions.jsonl");
+        let log = AuditLog::open(&path).unwrap();
+
+        let mut hostile = query();
+        hostile.request_id = "r1\u{9b}31mDENY OVERRIDDEN".to_string();
+        hostile.session_id = "s\u{7f}1".to_string();
+        hostile.backend = "cedar\u{9b}0m\u{7f}".to_string();
+
+        log.record(&hostile, &crate::decision::Decision::deny("nope"));
+
+        let raw = std::fs::read(&path).unwrap();
+        let csi = "\u{9b}".as_bytes(); // 0xC2 0x9B in UTF-8
+        assert!(
+            !raw.windows(csi.len()).any(|window| window == csi),
+            "a raw CSI byte reached the audit file: {:?}",
+            String::from_utf8_lossy(&raw)
+        );
+        assert!(
+            !raw.contains(&0x7f),
+            "a raw DEL byte reached the audit file: {:?}",
+            String::from_utf8_lossy(&raw)
+        );
+
+        // Escaped, not truncated or dropped: the identifiers must still identify
+        // the request when the trail is reviewed.
+        let line = &lines(&path)[0];
+        assert_eq!(
+            line["request_id"], "r1\\u{009b}31mDENY OVERRIDDEN",
+            "{line:#}"
+        );
+        assert_eq!(line["session_id"], "s\\u{007f}1", "{line:#}");
+        assert_eq!(line["backend"], "cedar\\u{009b}0m\\u{007f}", "{line:#}");
     }
 
     /// A rejected request never became a `PolicyQuery`, so none of the three

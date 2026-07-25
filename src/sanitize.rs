@@ -1,4 +1,8 @@
 //! Escaping for attacker-controlled text that ends up in operator-facing output.
+//!
+//! The escaping is terminal-safety, not a reversible encoding: text that
+//! literally spells an escape sequence (`"a\\u{001b}b"`) reads identically to an
+//! escaped control, so the recorded trail is not forensically injective.
 
 /// Replace every control character with a `\u{XXXX}` escape.
 ///

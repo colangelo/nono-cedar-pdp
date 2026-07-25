@@ -49,7 +49,7 @@ delta spec's SHALL covers every request-derived value: `request_id`, `session_id
 and `backend` still reach the audit file raw on the decided path (the rejected path
 already escapes via `scrape_context`).
 
-- [ ] 7.1 Failing test: a decided line whose `request_id`, `session_id` and `backend` carry U+009B (CSI) and U+007F (DEL) lands in the audit FILE with no raw 0x9b/0x7f bytes — assert on the file's raw bytes, not a tracing sink, and use C1/DEL specifically (the C0-only test is what let this survive)
-- [ ] 7.2 Implement: `control_escape` for the identifier fields in `record()` at the recording boundary; comment states the boundary rule (every request-derived value is escaped here, serde covers C0 only)
-- [ ] 7.3 One sentence in `src/sanitize.rs` module docs: the escaping is terminal-safety, not a reversible encoding — text that literally spells an escape sequence reads identically to an escaped control, so the trail is not forensically injective
-- [ ] 7.4 Full + filtered tests green, `just lint` clean; `openspec validate --changes close-audit-and-loader-gaps` passes
+- [x] 7.1 Failing test: a decided line whose `request_id`, `session_id` and `backend` carry U+009B (CSI) and U+007F (DEL) lands in the audit FILE with no raw 0x9b/0x7f bytes — assert on the file's raw bytes, not a tracing sink, and use C1/DEL specifically (the C0-only test is what let this survive)
+- [x] 7.2 Implement: `control_escape` for the identifier fields in `record()` at the recording boundary; comment states the boundary rule (every request-derived value is escaped here, serde covers C0 only)
+- [x] 7.3 One sentence in `src/sanitize.rs` module docs: the escaping is terminal-safety, not a reversible encoding — text that literally spells an escape sequence reads identically to an escaped control, so the trail is not forensically injective
+- [x] 7.4 Full + filtered tests green, `just lint` clean; `openspec validate --changes close-audit-and-loader-gaps` passes
