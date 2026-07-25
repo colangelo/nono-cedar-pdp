@@ -1,5 +1,7 @@
-//! Startup checks on the daemon's own state paths: the hot-reloaded policy
-//! directory and the audit log.
+//! Trust checks on the daemon's own state paths: the hot-reloaded policy
+//! directory and the audit log. [`check`] runs once at startup; its refusal core,
+//! [`refuse_untrusted_policy_dir`], re-runs in the watcher before every reloaded
+//! policy set is adopted.
 //!
 //! Why they need checking at all: write access to the policy directory *is* write
 //! access to every future decision. Dropping `permit (principal, action,

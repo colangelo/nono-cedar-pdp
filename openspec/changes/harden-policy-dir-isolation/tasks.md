@@ -23,8 +23,8 @@ and filtered (`cargo test --lib isolation`, `cargo test --lib watcher`) — see
 
 ## 3. Documentation
 
-- [ ] 3.1 README "Keep the policy directory out of the sandbox": add the parent-chain rule and the reload re-check, keeping the existing "what these checks do and do not buy" framing — no sentence may imply mode bits constrain the sandboxed agent
-- [ ] 3.2 `src/isolation.rs` and `src/watcher.rs` module docs updated to the same standard; design doc D13 section gets a pointer to this change (post-implementation correction trail, same as D12/D13 did)
+- [x] 3.1 README "Keep the policy directory out of the sandbox": add the parent-chain rule and the reload re-check, keeping the existing "what these checks do and do not buy" framing — no sentence may imply mode bits constrain the sandboxed agent
+- [x] 3.2 `src/isolation.rs` and `src/watcher.rs` module docs updated to the same standard; design doc D13 section gets a pointer to this change (post-implementation correction trail, same as D12/D13 did)
 
 ## 4. Verification
 

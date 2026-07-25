@@ -372,10 +372,11 @@ Two traps worth knowing: on macOS the **default** profile groups grant write to 
 agent-writable no matter how absolute it looks; and a grant on a parent directory is a
 grant on everything below it.
 
-### What the two startup checks actually buy
+### What the built-in checks actually buy
 
-`serve` performs two checks before it loads anything. Both are worth having and neither is
-the control above — do not read them as one:
+`serve` checks its own state paths before it loads anything, and re-checks the policy
+directory on every hot reload. All of it is worth having and none of it is the control
+above — do not read them as one:
 
 - **Refusal on a group- or world-writable policy directory or policy file** (naming the
   path, the mode and `chmod go-w`). This defends against **other local users** — a shared
@@ -383,6 +384,22 @@ the control above — do not read them as one:
   the sandboxed agent. It does nothing about the agent, which runs as the same uid and has
   owner-write by construction. (A user-private group counts as group-writable: the daemon
   cannot tell a private group from a shared one, so `chmod go-w` is the answer either way.)
+- **Refusal on a loosely-writable non-sticky *ancestor* of the policy directory or the
+  audit log.** Write access to a parent is the power to rename the directory out from
+  under the daemon and substitute another, so the mode of the directory itself never
+  mattered. The sticky bit exempts an ancestor — it stops other users renaming or
+  unlinking entries they do not own, so a `/tmp`-style `1777` chain is not refused — but
+  it never exempts the policy directory itself, where the attack is *creating* a new
+  `*.cedar` file and sticky does not restrict creation. Same threat model as above:
+  other local users, not the agent.
+- **The same refusals re-run on every hot reload**, before a freshly read policy set can
+  replace the active one. A policy directory that becomes loosely writable *while the
+  daemon runs* is therefore not adopted silently: the last-known-good set keeps
+  deciding, the refusal is logged at ERROR naming the path and mode, and repairing the
+  mode plus one edit recovers without a restart. Two honest limits: the re-check runs
+  just before the files are read, so a loosening inside that window is only caught at
+  the next event; and a mode change alone does not wake the watcher — it is caught when
+  the next policy-directory event fires.
 - **A loud `SECURITY:` warning when `policy_dir` or `audit_log` resolves inside the current
   working directory** — the common case of "the tree the agent is working in", and what
   makes the dev config unmistakable. It is a **heuristic proxy, wrong in both directions**:
@@ -390,10 +407,8 @@ the control above — do not read them as one:
   inside a granted tree (the `$TMPDIR` case above), and it *fires* on a plain development
   run where no agent exists at all. The warning is not a substitute for the `jq` check.
 
-Neither check inspects the ancestors of the policy directory, so a group-writable *parent*
-(which would let another user swap the directory itself) is not detected. The audit log's
-mode is tightened to `0600` on open rather than being a refusal, because a log the daemon
-cannot own is still better recorded than not recorded.
+The audit log's own mode is tightened to `0600` on open rather than being a refusal,
+because a log the daemon cannot own is still better recorded than not recorded.
 
 ## Security posture
 

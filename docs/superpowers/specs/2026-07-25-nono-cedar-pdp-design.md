@@ -291,6 +291,20 @@ escalation above, and the code, the specs and the README say so in the same word
   in neither `--json` nor `--format manifest`). `just smoke` runs exactly that comparison
   as an assertion.
 
+**Post-v1 hardening (re-audit finding, Gitea #23 →
+`openspec/changes/harden-policy-dir-isolation`).** The mode refusal as first shipped had
+two gaps, both closed after this document was written: it never inspected the
+*ancestors* of either state path (a loosely-writable non-sticky parent lets another
+local user rename the directory out from under the daemon, so the directory's own mode
+never mattered), and it ran at startup only (a directory loosened mid-session was
+re-read and adopted silently on the next edit). Now the refusal walks the existing
+ancestor chain — sticky exempts an ancestor, where the attack is renaming, but never
+the policy directory itself, where the attack is creating a new `*.cedar` file — and
+the same refusal core re-runs in the watcher before any reloaded set is adopted,
+keeping the last-known-good set and logging at ERROR on refusal. The threat model is
+unchanged and stated wherever the checks are described: other local users, never the
+sandboxed agent.
+
 ## 4. Architecture
 
 One Rust binary (lib + bin). The lib half (`wire`, `query`, `cedar/`) is what a
