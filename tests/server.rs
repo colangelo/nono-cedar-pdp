@@ -22,6 +22,13 @@ permit (
   action == Nono::Action::"launchCommand",
   resource
 ) when { resource.command == "git" && resource.args.contains("status") };
+
+@id("allow-github-repo-reads")
+permit (
+  principal in Nono::Agent::"claude-code",
+  action == Nono::Action::"httpRequest",
+  resource
+) when { resource.method == "GET" && resource.path like "/repos/*" };
 "#;
 
 fn state(dir: &tempfile::TempDir) -> server::AppState {
@@ -116,6 +123,27 @@ fn command_body_with_request_id(request_id: &str, command: &str, args: &[&str]) 
     .to_string()
 }
 
+/// An `endpoint` approval request, as nono's credential proxy sends one: the raw
+/// request target, unnormalised and still percent-encoded.
+fn endpoint_body(request_id: &str, path: &str) -> String {
+    serde_json::json!({
+        "backend": "cedar",
+        "request": {
+            "capability_type": "endpoint",
+            "request_id": request_id,
+            "route_id": "github-api",
+            "upstream": "https://api.github.com",
+            "method": "GET",
+            "path": path,
+            "rule_label": "endpoint_policy.approve[GET /repos/*]",
+            "reason": "route requires approval",
+            "child_pid": 0,
+            "session_id": "proxy"
+        }
+    })
+    .to_string()
+}
+
 /// A `capability` approval request: a variant the daemon refuses to evaluate,
 /// but one that still carries full identifying context on the wire.
 fn capability_body(request_id: &str) -> String {
@@ -162,6 +190,54 @@ async fn unpermitted_command_gets_deny_with_reason() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["decision"], "deny");
     assert!(body["reason"].as_str().unwrap().contains("no policy"));
+}
+
+/// The endpoint half of the wrong-allow matrix: a permit written the way the design
+/// and the README write it (`path like "/repos/*"`) must not be satisfiable by a
+/// traversal, and the deny nono records has to say *why*.
+#[tokio::test]
+async fn a_traversal_endpoint_path_gets_200_deny_naming_the_ambiguity() {
+    let dir = tempfile::tempdir().unwrap();
+    let (status, body) = post(&dir, &endpoint_body("p1", "/repos/../user/keys")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["decision"], "deny", "{body}");
+    let reason = body["reason"].as_str().unwrap();
+    assert!(reason.contains("ambiguous endpoint path"), "{reason}");
+    assert!(reason.contains("/repos/../user/keys"), "{reason}");
+
+    // The same permit still decides an unambiguous path, so the guard has not simply
+    // turned every endpoint approval into a deny.
+    let (status, body) = post(&dir, &endpoint_body("p2", "/repos/foo/bar")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, serde_json::json!({"decision": "allow"}), "{body}");
+}
+
+/// A refused path is still a decision nono acts on, so it is on the record with the
+/// path as sent — the audit trail is where an operator sees what was attempted.
+#[tokio::test]
+async fn an_ambiguous_endpoint_path_is_audited_with_the_raw_path() {
+    let dir = tempfile::tempdir().unwrap();
+    post(&dir, &endpoint_body("p1", "/repos/%2e%2e/user/keys")).await;
+    let lines = audit_lines(&dir);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["decision"], "deny");
+    assert_eq!(lines[0]["matched"], serde_json::json!([]));
+    assert!(
+        lines[0]["resource"]
+            .as_str()
+            .unwrap()
+            .contains("/repos/%2e%2e/user/keys"),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("ambiguous endpoint path"),
+        "{}",
+        lines[0]
+    );
 }
 
 #[tokio::test]
@@ -523,5 +599,5 @@ async fn healthz_reports_the_loaded_generation() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(json["generation"], 1);
-    assert_eq!(json["policies"], 1);
+    assert_eq!(json["policies"], 2, "{json}");
 }

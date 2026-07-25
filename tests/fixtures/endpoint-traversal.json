@@ -1,0 +1,6 @@
+{"backend":"cedar","request":{"capability_type":"endpoint",
+"request_id":"proxy-endpoint-approval-github-api-1737",
+"route_id":"github-api","upstream":"https://api.github.com","method":"GET",
+"path":"/repos/../user/keys",
+"rule_label":"endpoint_policy.approve[GET /repos/*]",
+"reason":"route requires approval","child_pid":0,"session_id":"proxy"}}

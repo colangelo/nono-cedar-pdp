@@ -3,6 +3,7 @@ pub mod audit;
 pub mod cedar;
 pub mod config;
 pub mod decision;
+pub mod endpoint_path;
 pub mod query;
 pub mod sanitize;
 pub mod server;

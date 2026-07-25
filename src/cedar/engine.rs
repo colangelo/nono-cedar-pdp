@@ -377,6 +377,32 @@ impl Engine {
         use crate::decision::Decision;
 
         let started = std::time::Instant::now();
+
+        // Endpoint paths arrive exactly as the client sent them: not normalised,
+        // still percent-encoded. A policy matching `resource.path` is therefore
+        // matching a string whose meaning depends on the upstream's own
+        // normalisation rules, and a prefix glob like `path like "/repos/*"` is
+        // satisfied by `/repos/../user/keys`. Normalising here would silently change
+        // what policy sees and would guess at those rules, so the path stays raw and
+        // an ambiguous one is refused instead — before any policy is consulted, so no
+        // permit can be credited for it. See `crate::endpoint_path`.
+        if let crate::query::Target::Endpoint { path, .. } = &q.target {
+            if let Some(ambiguity) = crate::endpoint_path::ambiguity(path) {
+                let reason = format!(
+                    "ambiguous endpoint path {path:?}: {} — refusing to guess what the \
+                     upstream resolves it to",
+                    ambiguity.describe()
+                );
+                let decision = Decision::deny(reason);
+                tracing::warn!(
+                    request_id = %crate::sanitize::control_escape(&q.request_id),
+                    reason = %decision.reason,
+                    "denying an endpoint request whose path is ambiguous"
+                );
+                return decision;
+            }
+        }
+
         let (request, entities) = match crate::cedar::entities::build(q, &self.schema) {
             Ok(pair) => pair,
             Err(e) => {
@@ -906,6 +932,58 @@ permit (
             !engine
                 .evaluate(&endpoint_query("DELETE", "/repos/foo/bar"))
                 .allow
+        );
+    }
+
+    /// nono sends the raw, unnormalised, still-percent-encoded path, so the prefix
+    /// glob the design and the docs use — `resource.path like "/repos/*"` — is
+    /// satisfied by a path a normalising upstream resolves to `/user/keys`. The path
+    /// stays raw for the policies that match it; an *ambiguous* one is refused
+    /// before any policy is consulted, so no permit can be credited for it.
+    #[test]
+    fn an_ambiguous_endpoint_path_is_denied_before_any_policy_is_consulted() {
+        let (engine, _d) = matrix_engine();
+        for path in [
+            "/repos/../user/keys",
+            "/repos/%2e%2e/user/keys",
+            "/repos/%2E%2e/user/keys",
+            "/repos/%252e%252e/user/keys",
+            "/repos/..;/user/keys",
+            "/repos//../user/emails",
+            "/repos/%zz/foo",
+        ] {
+            let decision = engine.evaluate(&endpoint_query("GET", path));
+            assert!(
+                !decision.allow,
+                "{path} must not satisfy a /repos/* permit: {decision:?}"
+            );
+            assert!(
+                decision.matched.is_empty(),
+                "no policy may be credited for {path}: {decision:?}"
+            );
+            assert!(
+                decision.reason.contains("ambiguous endpoint path"),
+                "the reason must name the ambiguity, got {}",
+                decision.reason
+            );
+            assert!(
+                decision.reason.contains(path),
+                "the reason must name the path, got {}",
+                decision.reason
+            );
+        }
+
+        // The guard is about endpoint paths only: `..` in a command argument is an
+        // ordinary relative path and must still be decided by policy.
+        assert!(
+            engine
+                .evaluate(&command_query(
+                    "session",
+                    "git",
+                    &[crate::wire::EXAMPLE_SHIM_ARGV0, "diff", "../sibling"]
+                ))
+                .allow,
+            "a command argument containing .. must not be caught by the path guard"
         );
     }
 

@@ -27,6 +27,67 @@ fn serve_with(config_body: &str) -> (bool, String) {
     )
 }
 
+/// `check` against the shipped policy directory, with the audit log in a temp dir so
+/// the repo's own trail is untouched, and the same `[agents]` map the shipped
+/// `nono-cedar-pdp.toml` carries — without it every decision is the baseline
+/// unknown-agent deny rather than the decision under test. Returns (success, stdout).
+fn check_fixture(fixture: &str) -> (bool, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "policy_dir = \"{POLICY_DIR}\"\naudit_log = \"{}\"\n\n[agents]\ncedar = \"claude-code\"\n",
+            dir.path().join("decisions.jsonl").display()
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_nono-cedar-pdp"))
+        .arg("check")
+        .arg("--config")
+        .arg(&config)
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures").to_string() + "/" + fixture)
+        .output()
+        .unwrap();
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+    )
+}
+
+/// The operator-facing half of the endpoint-path fix: `check` on a saved payload has
+/// to reproduce the production decision, including *why* it was refused. A reason
+/// that only said "deny" would send the operator hunting for a missing permit.
+#[test]
+fn checking_a_traversal_endpoint_payload_denies_and_names_the_ambiguity() {
+    let (ok, stdout) = check_fixture("endpoint-traversal.json");
+    assert!(!ok, "a traversal path must exit non-zero: {stdout}");
+    // `contains`, not `starts_with`: the daemon's tracing goes to stdout too, so the
+    // WARN line about the refusal precedes the decision line.
+    assert!(stdout.contains("DENY:"), "{stdout}");
+    assert!(stdout.contains("ambiguous endpoint path"), "{stdout}");
+    assert!(stdout.contains("/repos/../user/keys"), "{stdout}");
+}
+
+/// The command fixtures still decide the way the README says they do, so the same
+/// invocation an operator copies from the docs keeps working.
+#[test]
+fn checking_the_command_fixtures_reproduces_the_documented_decisions() {
+    let (ok, stdout) = check_fixture("git-status.json");
+    assert!(ok, "{stdout}");
+    assert!(
+        stdout.contains("ALLOW: permitted by 10-git:git-read-only"),
+        "{stdout}"
+    );
+
+    let (ok, stdout) = check_fixture("git-force-push.json");
+    assert!(!ok, "{stdout}");
+    assert!(
+        stdout.contains("DENY: denied by 10-git:no-history-rewrites"),
+        "{stdout}"
+    );
+}
+
 #[test]
 fn an_unopenable_audit_log_names_the_path_and_the_subsystem() {
     let (ok, stderr) = serve_with(&format!(
