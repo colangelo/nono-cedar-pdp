@@ -602,8 +602,7 @@ mod tests {
         .to_string();
 
         let (response, log_text) = {
-            let sink = crate::test_log::CapturedLog::default();
-            let guard = tracing::subscriber::set_default(crate::test_log::subscriber(&sink));
+            let capture = crate::test_log::capture();
             let response = crate::server::router(state)
                 .oneshot(
                     axum::http::Request::builder()
@@ -615,8 +614,8 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            drop(guard);
-            (response, sink.text())
+            let text = capture.text();
+            (response, text)
         };
 
         assert_eq!(

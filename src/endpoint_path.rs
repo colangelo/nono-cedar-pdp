@@ -271,20 +271,73 @@ mod tests {
 
     /// Each variant has to say *which* ambiguity it is: the reason lands in nono's
     /// audit trail, and "denied" without the cause is not actionable.
+    ///
+    /// Asserting a length here would be hollow — four variants all returning the same
+    /// sentence would pass it. So this pins the distinguishing token of each variant and
+    /// that no two descriptions coincide.
     #[test]
     fn every_ambiguity_describes_itself() {
-        for found in [
+        let cases = [
+            (
+                Ambiguity::DotSegment {
+                    segment: "..".to_string(),
+                    passes: 2,
+                },
+                vec!["\"..\"", "after 2 percent-decode passes", "normalising"],
+            ),
+            (Ambiguity::MalformedEscape, vec!["malformed percent-escape"]),
+            (Ambiguity::NonUtf8, vec!["not UTF-8"]),
+            (
+                Ambiguity::NestedTooDeep,
+                vec!["nests deeper than", "decode"],
+            ),
+        ];
+
+        let mut seen: Vec<String> = Vec::new();
+        for (found, must_mention) in cases {
+            let text = found.describe();
+            for token in must_mention {
+                assert!(
+                    text.contains(token),
+                    "{found:?} must name its cause: expected {token:?} in {text:?}"
+                );
+            }
+            assert!(
+                !text.chars().any(char::is_control),
+                "a reason reaches nono's audit trail, so it must carry no control bytes: \
+                 {text:?}"
+            );
+            assert!(
+                !seen.contains(&text),
+                "two variants share a description, so the reason cannot identify which \
+                 ambiguity was found: {text:?}"
+            );
+            seen.push(text);
+        }
+    }
+
+    /// The `passes` count is part of the cause, not decoration: an operator reading the
+    /// audit trail needs to know whether the traversal was visible in the path as sent or
+    /// only surfaced after decoding.
+    #[test]
+    fn a_dot_segment_reports_the_decode_depth_it_surfaced_at() {
+        let described = |passes| {
             Ambiguity::DotSegment {
                 segment: "..".to_string(),
-                passes: 2,
-            },
-            Ambiguity::MalformedEscape,
-            Ambiguity::NonUtf8,
-            Ambiguity::NestedTooDeep,
-        ] {
-            let text = found.describe();
-            assert!(text.len() > 30, "{found:?} -> {text}");
-            assert!(!text.chars().any(char::is_control), "{text}");
-        }
+                passes,
+            }
+            .describe()
+        };
+        assert!(described(0).contains("in the path as sent"), "{}", described(0));
+        assert!(
+            described(1).contains("after one percent-decode pass"),
+            "{}",
+            described(1)
+        );
+        assert!(
+            described(3).contains("after 3 percent-decode passes"),
+            "{}",
+            described(3)
+        );
     }
 }

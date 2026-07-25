@@ -322,47 +322,15 @@ fn a_policy_load_failure_exits_without_binding_a_port() {
     );
 }
 
-/// A config with no `bind` has to reach the documented default, `127.0.0.1:8181`,
-/// and the only way to see which address the daemon really tried is to make that
-/// address unavailable: the failure then names it. Occupying the port rather than
-/// listening on it keeps the test off a port a developer's own daemon may be using —
-/// if that daemon already holds 8181 our bind simply fails, the precondition holds
-/// anyway, and nothing of theirs is disturbed.
-///
-/// It also pins the ordering from the other end: the bind is the *last* thing
-/// startup does, so a valid policy directory and a writable audit log leave the
-/// address as the only thing left to fail on.
-#[test]
-fn a_config_without_a_bind_uses_the_documented_default_address() {
-    const DEFAULT: &str = "127.0.0.1:8181";
-    let dir = tempfile::tempdir().unwrap();
-    let policies = copy_shipped_policies(dir.path());
-    // Deliberately unused: holding it is the point, and it may already be held.
-    let _occupied = TcpListener::bind(DEFAULT);
-
-    let (ok, output) = serve_from(
-        dir.path(),
-        &format!(
-            "policy_dir = \"{}\"\naudit_log = \"{}\"\n",
-            policies.display(),
-            dir.path().join("decisions.jsonl").display()
-        ),
-        None,
-    );
-    assert!(
-        !ok,
-        "the default address is occupied, so startup cannot succeed: {output}"
-    );
-    assert!(
-        output.contains(DEFAULT),
-        "a config with no bind must resolve to {DEFAULT}: {output}"
-    );
-    assert!(
-        output.to_lowercase().contains("address already in use"),
-        "the failure must be the occupied default address, not something else — \
-         otherwise this test proves nothing about which address was tried: {output}"
-    );
-}
+// A test asserting the documented default `127.0.0.1:8181` by occupying it used to live
+// here. It was removed as non-hermetic: it depended on the state of a global port at two
+// different instants, so if nothing held 8181 when the child started, `serve` bound it
+// successfully and the test failed — on a machine where the operator's own daemon is
+// running, or not, depending on timing. Deliberately not replaced: the default *value* is
+// pinned by `config::tests::loads_minimal_config_with_defaults`, and that the daemon binds
+// exactly the address its configuration names is pinned by
+// `a_started_daemon_answers_healthz_and_approve_over_a_real_socket` on an ephemeral port.
+// Together those cover the guarantee without claiming a port a developer may be using.
 
 /// The ordering proof the previous tests cannot give on their own: hold the port the
 /// daemon is configured to bind, and the failure it reports still has to be the
