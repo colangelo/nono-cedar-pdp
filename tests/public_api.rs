@@ -5,8 +5,11 @@
 //! request without passing that guard: `cedar::entities::build` (policy query →
 //! Cedar request + entities) and `Decision::from_response` (raw authorizer
 //! response → decision). Both are `pub(crate)` now — the same closed-seam
-//! property `Engine::from_loaded_unchecked` already has — so the only externally
-//! reachable route from a policy query to a decision runs the ambiguity check.
+//! property `Engine::from_loaded_unchecked` already has — so no route *this
+//! library offers* from a policy query to a decision skips the guard. That is
+//! the whole claim: a caller re-implementing entity construction against the
+//! `cedar-policy` crate directly is outside it — they are not on this library's
+//! decision path, and no visibility cap can bind code that does not call it.
 //! The bin crate (`src/main.rs`) and every integration test are the compile-time
 //! canary that the *intended* public API still suffices.
 //!
@@ -35,8 +38,9 @@ fn the_d15_guards_bypass_pieces_are_not_exported() {
         "src/cedar/mod.rs no longer declares `pub(crate) mod entities;`. The D15 \
          guard's bypass pieces must not be exported: `cedar::entities::build` turns \
          a policy query into a Cedar request/entities pair without the \
-         ambiguous-endpoint-path check, so a public export lets an external caller \
-         authorize around the guard `Engine::evaluate` runs first"
+         ambiguous-endpoint-path check, so a public export would make this library \
+         itself offer a route from a policy query to a decision that skips the \
+         guard `Engine::evaluate` runs first"
     );
 
     // The module marker alone is not enough: a `pub fn` inside a `pub(crate)`
@@ -60,8 +64,8 @@ fn the_d15_guards_bypass_pieces_are_not_exported() {
         decision.contains("pub(crate) fn from_response"),
         "src/decision.rs no longer declares `pub(crate) fn from_response`. The D15 \
          guard's bypass pieces must not be exported: a public raw-`Response` \
-         conversion is the other half of authorizing a request without \
-         `Engine::evaluate`, whose guard denies ambiguous endpoint paths before \
-         any policy is consulted"
+         conversion is the other half of a library-offered route to a decision \
+         that never passes `Engine::evaluate`, whose guard denies ambiguous \
+         endpoint paths before any policy is consulted"
     );
 }
