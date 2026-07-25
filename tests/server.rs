@@ -172,6 +172,63 @@ async fn every_decision_is_audited() {
     assert!(text.contains("\"decision\":\"allow\""));
 }
 
+/// An oversized body must be refused the same way every other unusable input is:
+/// HTTP 200 with our own reason. Upstream maps any non-2xx to
+/// `"approval webhook … returned HTTP {status}"`, which is exactly the generic
+/// status outcome the contract exists to avoid — and axum's default extractor
+/// limit produces a plain-text 413 with no audit line at all.
+#[tokio::test]
+async fn an_oversized_body_gets_200_deny_and_is_audited() {
+    let dir = tempfile::tempdir().unwrap();
+    let padding = "a".repeat(server::MAX_REQUEST_BYTES);
+    let body = serde_json::json!({
+        "backend": "cedar",
+        "padding": padding,
+        "request": {
+            "capability_type": "command",
+            "request_id": "r1",
+            "command": "git",
+            "args": ["git", "status"],
+            "caller": "session",
+            "intercept_rule": "rule",
+            "reason": null,
+            "child_pid": 42,
+            "session_id": "s1"
+        }
+    })
+    .to_string();
+    assert!(body.len() > server::MAX_REQUEST_BYTES);
+
+    let (status, body) = post(&dir, &body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a 413 denies too, but nono then records only the HTTP status"
+    );
+    assert_eq!(body["decision"], "deny");
+    assert!(
+        body["reason"].as_str().unwrap().contains("limit"),
+        "{body:#?}"
+    );
+
+    let lines = audit_lines(&dir);
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert_eq!(lines[0]["decision"], "deny");
+}
+
+/// The cap is generous on purpose: a long argv must never be mistaken for an
+/// attack, so a body well inside the limit is still decided on its merits.
+#[tokio::test]
+async fn a_large_but_permitted_body_is_still_decided() {
+    let dir = tempfile::tempdir().unwrap();
+    let long_arg = "a".repeat(server::MAX_REQUEST_BYTES / 2);
+    let body = command_body("git", &["git", "status", &long_arg]);
+    assert!(body.len() < server::MAX_REQUEST_BYTES);
+    let (status, body) = post(&dir, &body).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["decision"], "allow");
+}
+
 /// A denial the caller receives but that leaves no audit line is a decision with
 /// no reviewable record. The rejection paths — unsupported variant, malformed
 /// body, oversized body — are exactly the ones a hostile caller controls.

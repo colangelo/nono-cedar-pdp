@@ -1,15 +1,17 @@
 //! HTTP surface. Deliberately thin: every decision is made below this layer.
 //!
-//! `/v1/approve` takes raw bytes rather than `Json<T>` because a malformed body
-//! must produce a `200 {"decision":"deny"}` with our own reason, not axum's
-//! generic 400 — nono records the reason we hand back.
+//! `/v1/approve` reads the body itself rather than through `Json<T>` or `Bytes`
+//! because every unusable body — malformed, unsupported, oversized — must produce
+//! a `200 {"decision":"deny"}` carrying our own reason. nono records the reason
+//! we hand back; for any non-2xx it records only `returned HTTP <status>`.
 
+use crate::adapter::nono_webhook::RejectedContext;
 use crate::audit::AuditLog;
 use crate::cedar::engine::Engine;
 use crate::config::Config;
 use crate::decision::Decision;
-use axum::body::Bytes;
-use axum::extract::State;
+use axum::body::Body;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -22,6 +24,14 @@ use tower_http::catch_panic::CatchPanicLayer;
 /// null, and an empty value reads as "we forgot to log it".
 const UNKNOWN: &str = "-";
 
+/// Largest approval body the daemon will buffer.
+///
+/// Explicit, not inherited from axum's default extractor limit: the threshold
+/// that decides whether nono records our reason or a bare `413` must not move on
+/// a dependency bump. Generous next to a real envelope (a few hundred bytes) so
+/// that a long argv is never mistaken for an attack.
+pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
 #[derive(Clone)]
 pub struct AppState {
     pub engine: Arc<Engine>,
@@ -30,14 +40,26 @@ pub struct AppState {
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/v1/approve", post(approve))
-        .route("/healthz", get(healthz))
-        .layer(CatchPanicLayer::new())
-        .with_state(state)
+    with_middleware(
+        Router::new()
+            .route("/v1/approve", post(approve))
+            .route("/healthz", get(healthz))
+            // Belt and braces: `approve` enforces MAX_REQUEST_BYTES itself, but if
+            // a later refactor reaches for `Bytes` or `Json<T>` this keeps the
+            // limit ours rather than axum's default.
+            .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+            .with_state(state),
+    )
 }
 
-async fn approve(State(state): State<AppState>, body: Bytes) -> Response {
+/// The middleware every route runs behind. Separate from [`router`] so a test can
+/// prove a panicking handler becomes a 5xx instead of a dropped connection —
+/// nono must record a definite failure, not an opaque transport error.
+pub fn with_middleware(router: Router) -> Router {
+    router.layer(CatchPanicLayer::new())
+}
+
+async fn approve(State(state): State<AppState>, body: Body) -> Response {
     // Defence in depth: bootstrap refuses an empty policy dir, so this should be
     // unreachable. If it ever fires, 503 tells nono "PDP broken", which is a
     // different signal from "policy said no".
@@ -49,6 +71,27 @@ async fn approve(State(state): State<AppState>, body: Bytes) -> Response {
         )
             .into_response();
     }
+
+    let body = match axum::body::to_bytes(body, MAX_REQUEST_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            // No context at all: the body was never readable. Still a decision the
+            // caller acts on, so still one audit line.
+            let decision = Decision::deny(format!(
+                "approval request body was unreadable or above the \
+                 {MAX_REQUEST_BYTES}-byte limit; failing closed"
+            ));
+            state
+                .audit
+                .record_rejected(&RejectedContext::default(), &decision);
+            tracing::warn!(
+                error = %crate::sanitize::control_escape(&e.to_string()),
+                limit = MAX_REQUEST_BYTES,
+                "refusing an unreadable or oversized approval request"
+            );
+            return (StatusCode::OK, Json(decision.to_wire())).into_response();
+        }
+    };
 
     let query = match crate::adapter::nono_webhook::parse(&body, &state.config) {
         Ok(query) => query,
