@@ -28,11 +28,16 @@ smoke run:
  "child_pid":13820,"session_id":"35abc0894927242e"}}
 ```
 
-**`args[0]` is an absolute per-run shim path, not the command name.** The shim forwards
-its own `args_os()` and nono resolves the program with `which` against a shim directory
-named `<base>/nono-tool-sandbox-<pid>-<unix nanos>-<hex nonce>/shims/<command>`, so the
-value changes every run and no literal can match it. The command **name** arrives
-separately, in `command`. This matters for policy authoring — see the caveats below.
+**`args[0]` is not the command name — and what it *is* depends on the launch path.**
+`args` is the shim process's raw argv, so `args[0]` is whatever the caller execed with.
+When nono launches the command itself it resolves the program with `which` against a
+per-run shim directory (`<base>/nono-tool-sandbox-<pid>-<unix nanos>-<hex nonce>/shims/<command>`),
+which is the absolute path shown above and changes every run; but a shell *inside* the
+sandbox running `git status` execs that same shim with `args[0] = "git"`. So a pattern
+anchored over the whole argv matches on one launch path and silently not on another —
+nondeterministic, which is worse than consistently failing. The command **name** always
+arrives separately, in `command`. This is why the schema exposes `argv_tail` (`args[1..]`)
+and has no whole-argv attribute at all — see the caveats below.
 
 and a real `endpoint` payload (the credential proxy hardcodes `session_id: "proxy"`
 and `child_pid: 0`):

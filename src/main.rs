@@ -27,6 +27,13 @@ enum Command {
         config: PathBuf,
         /// Path to a JSON file containing a nono webhook envelope.
         fixture: PathBuf,
+        /// Also append this evaluation to the configured audit log.
+        ///
+        /// Off by default: a `check` run is a what-if, not a decision the daemon made
+        /// for nono, and its record would be byte-identical to a real one — so an
+        /// investigator could not tell a genuine allow from someone's local experiment.
+        #[arg(long)]
+        audit: bool,
     },
     /// Run the PDP daemon.
     Serve {
@@ -54,7 +61,11 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Command::Check { config, fixture } => match run_check(&config, &fixture) {
+        Command::Check {
+            config,
+            fixture,
+            audit,
+        } => match run_check(&config, &fixture, audit) {
             Ok(decision) => {
                 println!(
                     "{}: {} ({} µs)",
@@ -155,6 +166,7 @@ async fn run_serve(config_path: &std::path::Path) -> Result<(), String> {
 fn run_check(
     config_path: &std::path::Path,
     fixture: &std::path::Path,
+    audit: bool,
 ) -> Result<nono_cedar_pdp::decision::Decision, String> {
     let config = Config::load(config_path).map_err(|e| e.to_string())?;
     let schema = cedar::schema::load().map_err(|e| e.to_string())?;
@@ -164,12 +176,14 @@ fn run_check(
     let query =
         nono_cedar_pdp::adapter::nono_webhook::parse(&body, &config).map_err(|e| e.to_string())?;
     let decision = engine.evaluate(&query);
-    match nono_cedar_pdp::audit::AuditLog::open(&config.audit_log) {
-        Ok(log) => log.record(&query, &decision),
-        Err(e) => eprintln!(
-            "warning: audit log {} unavailable: {e}",
-            config.audit_log.display()
-        ),
+    if audit {
+        match nono_cedar_pdp::audit::AuditLog::open(&config.audit_log) {
+            Ok(log) => log.record(&query, &decision),
+            Err(e) => eprintln!(
+                "warning: audit log {} unavailable: {e}",
+                config.audit_log.display()
+            ),
+        }
     }
     Ok(decision)
 }

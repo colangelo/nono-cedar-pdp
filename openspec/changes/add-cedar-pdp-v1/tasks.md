@@ -168,7 +168,37 @@ D12's fail-open `forbid`, D13's agent-writable policy directory, D14's
 | 12 | Adversarial security audit (D14, D15) | Two wrong-allows: `args.contains("status")` permitted `git -c core.fsmonitor=<cmd> status` (arbitrary execution), and `path like "/repos/*"` permitted `/repos/../user/keys`. Permit pinned positionally + a flag `forbid`; ambiguous endpoint paths denied before any policy is consulted |
 | 13 | Adversarial security audit (D13, D16) | The sandboxed agent could rewrite the policies governing it (proven end-to-end) — state moved out of the repo, isolation checks at startup; and the audit trail detached on rotation — the sink now re-stats before every record |
 | 14 | Spec-coverage audit | 15 unguarded or by-construction-only scenarios, including the two fail-closed startup guarantees; `tests/docs.rs` added, and the rotted Paranoid posture fixed (the profile now defines `cedar-and-ask`) |
-| 15 | Deviations-honesty audit | This group: two API/observability defects, and the record corrections below |
+| 15 | Deviations-honesty audit | Two API/observability defects, and the record corrections below |
+| 16 | **Re-audit** of the remediation itself | Three defects the remediation introduced or left, fixed inline — see below |
+
+**Group 16 — what the re-audit of the remediation found.** Running the same three lenses
+over the fixes caught two defects the remediation had *added* and one claim it had
+overstated. That the second pass found fewer, smaller things (32 findings → 22, none a
+wrong-allow) is the convergence signal; that it found anything at all is why a fix pass
+gets audited like any other change.
+
+- **Order-dependent tests.** `set_default` is thread-local, but `tracing`'s max-level
+  hint is process-wide: `a_deleted_log_is_recreated_at_the_configured_path` logs from a
+  thread with no subscriber, dropping the hint to OFF and silencing the capturing test.
+  `a_rotated_log_is_reopened_at_the_configured_path` therefore failed 3/3 when the two
+  ran together and passed alone — the 160-test green bar held only because full-run
+  scheduling kept them apart. Fixed by pinning the hint and serializing capture windows.
+- **A non-hermetic test** added by the remediation itself (`5480c60`): a TOCTOU on port
+  8181, the port the README tells operators to run their daemon on. Removed, not
+  replaced — the guarantee it claimed is covered by a unit test and an ephemeral-port
+  socket test.
+- **A hollow assertion** added by the remediation itself: `every_ambiguity_describes_itself`
+  asserted `text.len() > 30`, which four identical sentences would satisfy.
+
+**Task 12.7 was ticked while partly untrue, and this is the correction.** It claimed the
+docs matched shipped behaviour; `nono.cedarschema` and design-spec §5 still described the
+lint as warning when an `argv_tail` permit "is not anchored", which was the rule *before*
+`69dc1fd` narrowed it. Anchoring alone is insufficient — `like "diff*"` is anchored and
+still matches `difftool --extcmd=<cmd>`, which git executes — so the shipped rule is a
+whole-token pin. Both sites now say so. Two further record fixes in the same pass: the
+approval-webhook spec's canonical payload still carried the pre-D12 `"args":["git","push"]`
+fixture shape (with a `THEN` that contradicted it once corrected), and the design spec's
+frontmatter advertised "D1-D13 … three caveats" for a document that now has D1-D16 and six.
 
 What group 15 corrected in the record itself, so the earlier entries stop claiming more
 than they should: task 8.2 said the handler takes `Bytes` (it takes `Body`, with an

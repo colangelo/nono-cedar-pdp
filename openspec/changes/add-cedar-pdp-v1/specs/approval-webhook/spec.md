@@ -6,8 +6,8 @@ The service SHALL accept `POST /v1/approve` carrying nono's approval envelope `{
 
 #### Scenario: Command approval request is accepted
 
-- **WHEN** the body is `{"backend":"cedar","request":{"capability_type":"command","request_id":"r1","command":"git","args":["git","push"],"caller":"session","intercept_rule":"push","reason":null,"child_pid":42,"session_id":"s1"}}`
-- **THEN** the service parses it as a command approval for `git` with args `["git","push"]`, caller `session`, and session `s1`, and returns a decision with HTTP 200
+- **WHEN** the body is `{"backend":"cedar","request":{"capability_type":"command","request_id":"tool-sandbox-approve-git-1784990893285791000","command":"git","args":["/private/tmp/nono-tool-sandbox-13819-1784990893285791000-a4d3bceb3ec061c0/shims/git","push"],"caller":"session","intercept_rule":"push","reason":null,"child_pid":13820,"session_id":"35abc0894927242e"}}`
+- **THEN** the service parses it as a command approval for `git` — command name from `command`, never from `args[0]`, which here is the per-run shim path — with `argv_tail` `"push"`, caller `session`, and session `35abc0894927242e`, and returns a decision with HTTP 200
 
 #### Scenario: Endpoint approval request is accepted with proxy identity
 

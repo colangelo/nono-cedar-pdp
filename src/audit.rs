@@ -793,8 +793,11 @@ mod tests {
             archived.contains("after rotation"),
             "a record must never be dropped just because the reopen failed: {archived:?}"
         );
+        // Match the reopen failure specifically: a bare "could not" is also produced by
+        // the unrelated "could not tell whether the audit log ends mid-record" warning,
+        // so the loose form would pass while proving nothing.
         assert!(
-            log_text.contains("could not"),
+            log_text.contains("could not be reopened"),
             "the operator must be told the trail is detached: {log_text:?}"
         );
     }

@@ -28,10 +28,31 @@ install-policies dir="~/.config/nono-cedar-pdp/policies":
     DIR="${DIR/#\~/$HOME}"
     mkdir -p "$DIR"
     chmod 700 "$DIR"
-    cp -n policies/*.cedar "$DIR"/ || true
+    # Never overwrite — but never *silently* keep a stale copy either. The shipped pack
+    # has already carried a wrong-allow fix once (the `git -c` hole), so an operator who
+    # re-runs this after pulling must not be told "done" while their old policy stands.
+    stale=0
+    for src in policies/*.cedar; do
+        dest="$DIR/$(basename "$src")"
+        if [ ! -e "$dest" ]; then
+            cp "$src" "$dest"
+            echo "installed $(basename "$src")"
+        elif cmp -s "$src" "$dest"; then
+            echo "unchanged  $(basename "$src")"
+        else
+            echo "DIFFERS    $(basename "$src") — yours is not the shipped version"
+            stale=$((stale + 1))
+        fi
+    done
     chmod 600 "$DIR"/*.cedar
     echo "policy_dir: $DIR"
-    ls -l "$DIR"
+    if [ "$stale" -gt 0 ]; then
+        echo
+        echo "$stale shipped polic(y/ies) differ from yours and were NOT overwritten."
+        echo "Review before trusting them — a shipped fix may not be in your copy:"
+        echo "  diff -u \"$DIR/<file>\" policies/<file>"
+        exit 1
+    fi
 
 # End-to-end: a real `nono run` decision answered by Cedar.
 smoke:

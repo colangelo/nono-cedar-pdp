@@ -32,7 +32,10 @@ namespace Nono {
     // this"` matches `argv_tail like "*--force*"` — and it cannot tell
     // ["push --force"] from ["push", "--force"]. Over-matching is fail-safe in a
     // forbid and unsound in a permit, so loading warns about any permit whose
-    // argv_tail test is not anchored. For exact per-argument tests use
+    // argv_tail test is not a WHOLE-TOKEN pin: it must be anchored at the start
+    // AND end at a token boundary. `like "diff*"` is anchored yet still matches
+    // `difftool --extcmd=<cmd>`, which executes <cmd> — so `== "diff"` or
+    // `like "diff *"`, never `like "diff*"`. For exact per-argument tests use
     // args.contains(..).
     argv_tail: String,
     // Count of the args nono actually sent (post-filter; args[0] included, so a

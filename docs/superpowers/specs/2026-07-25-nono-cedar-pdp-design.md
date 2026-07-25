@@ -1,7 +1,7 @@
 ---
 type: design
 title: "nono-cedar-pdp v1 design"
-description: "The authoritative design: verified upstream contract, decisions D1-D13 with alternatives considered, the Cedar schema and its three caveats, the fail-closed error matrix, and the post-audit args[0]-is-a-shim-path correction."
+description: "The authoritative design: verified upstream contract, decisions D1-D16 with alternatives considered, the Cedar schema and its six caveats, the fail-closed error matrix, and the post-audit corrections (args[0] is a per-run shim path; policy dir outside the agent-writable tree; ambiguous endpoint paths denied)."
 tags: [design, cedar, nono, security, fail-closed]
 timestamp: 2026-07-25
 ---
@@ -374,8 +374,11 @@ Schema caveats (documented here and in the starter policy pack):
   argument* (`-m "do not --force"`), and a joined string cannot tell
   `["push --force"]` from `["push", "--force"]`. Over-matching is fail-safe in a
   `forbid` (spurious deny → terminal fallback prompts) but unsound in a `permit`, so
-  the loader warns about a `permit` whose `argv_tail` test starts with a wildcard.
-  A test anchored at the start — or an `==` — is the opposite case: it pins the first
+  the loader warns about a `permit` whose `argv_tail` test is not a **whole-token
+  pin**. Anchoring alone is not enough: `like "diff*"` starts at the beginning and
+  still matches `difftool --extcmd=<cmd>`, which git executes — so the test must also
+  end at a token boundary (`== "diff"` or `like "diff *"`, never `like "diff*"`).
+  A whole-token pin is the opposite case to a leading wildcard: it fixes the first
   token of `args[1..]`, i.e. the subcommand, which set membership cannot express, and
   is the required shape for a read-only permit (D14). Exact flag tests use
   `resource.args.contains("--force")`.
