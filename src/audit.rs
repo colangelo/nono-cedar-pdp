@@ -70,14 +70,14 @@ impl AuditLog {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            // Read access only so the last byte can be inspected below; the mode is
-            // 0600 either way.
-            .read(true)
-            .mode(0o600)
-            .open(path)?;
+        // Read access is wanted only so the last byte can be inspected below (the
+        // mode is 0600 either way), but an append-only log we cannot read is a
+        // legitimate setup — and a daemon that refuses to start cannot decide
+        // anything. Fall back to write-only; `ends_mid_line` then reports why.
+        let file = match open_append(path, true) {
+            Ok(file) => file,
+            Err(_) => open_append(path, false)?,
+        };
         // `mode` above only applies when the file is created. A log that already
         // exists keeps whatever permissions it had, and it records the full
         // command lines and API paths an agent attempted.
@@ -197,6 +197,15 @@ impl AuditLog {
             }
         }
     }
+}
+
+fn open_append(path: &Path, read: bool) -> std::io::Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(read)
+        .mode(0o600)
+        .open(path)
 }
 
 /// True when the file is non-empty and does not end with a newline, i.e. its last
@@ -399,6 +408,25 @@ mod tests {
             text.contains("after recovery"),
             "the record written after recovery must survive: {text:?}"
         );
+    }
+
+    /// Reading the last byte needs read access, but an append-only log is a
+    /// legitimate setup. A log we can write but not read must still open — a
+    /// daemon that refuses to start cannot decide anything.
+    #[test]
+    fn a_write_only_log_still_opens() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decisions.jsonl");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+
+        let log = AuditLog::open(&path).unwrap();
+        log.record(&query(), &crate::decision::Decision::deny("nope"));
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text:?}");
     }
 
     /// An interrupted write — a full disk, a killed daemon — leaves a record with
