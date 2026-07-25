@@ -42,4 +42,4 @@ and filtered (`cargo test --lib isolation`, `cargo test --lib watcher`) — see
 - [x] 5.6 Watcher-level tests for the two remaining WHEN disjuncts of the reload re-check scenario: a loadable policy file going loose mid-session, and an existing ancestor going loose mid-session — both keep last-good and log ERROR
 - [x] 5.7 Pin the README documentation clauses in `tests/docs.rs`: the profile-checking procedure (`nono profile show --format manifest` + `fs_write` sweep), the sticky-ancestor rationale, and the ownership rule — silent doc regression must fail a test
 - [x] 5.8 Update README + module docs for D6/D7 with the same scope honesty (other local users, never the sandboxed agent); design doc D13 trail pointer updated
-- [ ] 5.9 Full + filtered tests green, `just lint` clean, `just smoke` still green (real home chain must satisfy the ownership rule)
+- [x] 5.9 Full + filtered tests green, `just lint` clean, `just smoke` still green (real home chain must satisfy the ownership rule)
