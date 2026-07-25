@@ -30,15 +30,17 @@ pub struct AuditRecord<'a> {
     /// proxy's endpoint requests; null only on a rejected line, where no request
     /// was ever parsed.
     pub child_pid: Option<u32>,
-    /// The intercept rule that routed a *command* request here, as sent — the
-    /// matched rule's args joined with spaces (`"status"`, `"push --force"`),
-    /// `"<catch-all>"`, or an `invocation_policy.*` label. Null on endpoint and
-    /// rejected lines.
+    /// The intercept rule that routed a *command* request here — the matched
+    /// rule's args joined with spaces (`"status"`, `"push --force"`),
+    /// `"<catch-all>"`, or an `invocation_policy.*` label. Byte-identical to
+    /// what was sent except that control characters arrive escaped (none of the
+    /// real shapes contains one). Null on endpoint and rejected lines.
     pub intercept_rule: Option<&'a str>,
-    /// The route rule label that routed an *endpoint* request here, as sent
-    /// (`endpoint_policy.approve[GET /repos/*]`). Null on command and rejected
-    /// lines. Kept separate from `intercept_rule` on purpose: they are different
-    /// upstream fields with different grammars, and the line's job is fidelity.
+    /// The route rule label that routed an *endpoint* request here
+    /// (`endpoint_policy.approve[GET /repos/*]`), control-escaped like
+    /// `intercept_rule`. Null on command and rejected lines. Kept separate from
+    /// `intercept_rule` on purpose: they are different upstream fields with
+    /// different grammars, and the line's job is fidelity.
     pub rule_label: Option<&'a str>,
     pub decision: &'static str,
     pub matched: &'a [String],
@@ -238,20 +240,31 @@ impl AuditLog {
     /// Record a decision. A logging failure must never change a decision, so
     /// errors are traced and swallowed.
     pub fn record(&self, query: &PolicyQuery, decision: &Decision) {
-        // What routed the request here, per target kind. The endpoint pid is the
-        // 0 upstream's proxy hardcodes on the wire (mirrored in
-        // `wire::EndpointRequest::child_pid`): the adapter pins the proxy identity
-        // rather than echoing wire values, so the pinned 0 is recorded — an
-        // explicit value, not a synthesized absence.
+        // What routed the request here, per target kind. The rule fields are
+        // request-derived text, so they are control-escaped at this boundary —
+        // the same rule the resource summary follows — rather than left to
+        // serde: JSON string encoding escapes only C0 controls (U+0000..U+001F),
+        // so a DEL or C1 control (CSI among them) would land in the JSONL raw
+        // and replay in the terminal of whoever reads the trail. The real rule
+        // shapes contain no control bytes, so an honest value is byte-identical
+        // either way. (`record_rejected` is the other recording path: its rule
+        // fields are always null, and its scraped context is escaped at the
+        // adapter boundary by `scrape_context`.)
         let (child_pid, intercept_rule, rule_label) = match &query.target {
             crate::query::Target::Command {
                 intercept_rule,
                 child_pid,
                 ..
-            } => (Some(*child_pid), Some(intercept_rule.as_str()), None),
-            crate::query::Target::Endpoint { rule_label, .. } => {
-                (Some(0), None, Some(rule_label.as_str()))
-            }
+            } => (
+                Some(*child_pid),
+                Some(crate::sanitize::control_escape(intercept_rule)),
+                None,
+            ),
+            crate::query::Target::Endpoint { rule_label, .. } => (
+                Some(0),
+                None,
+                Some(crate::sanitize::control_escape(rule_label)),
+            ),
         };
         self.append(&AuditRecord {
             ts: now_rfc3339(),
@@ -263,8 +276,8 @@ impl AuditLog {
             action: Some(query.action_name()),
             resource: Some(query.resource_summary()),
             child_pid,
-            intercept_rule,
-            rule_label,
+            intercept_rule: intercept_rule.as_deref(),
+            rule_label: rule_label.as_deref(),
             decision: if decision.allow { "allow" } else { "deny" },
             matched: &decision.matched,
             reason: &decision.reason,
@@ -526,6 +539,53 @@ mod tests {
              omit the key: {line:#}"
         );
         assert!(line["intercept_rule"].is_null(), "{line:#}");
+    }
+
+    /// serde's JSON string encoding escapes only C0 controls (U+0000..U+001F), so
+    /// a DEL or C1 control in a request-derived routing field — U+009B is CSI, the
+    /// one-byte form of `ESC [` — would land in the file raw and replay in any
+    /// terminal that reads the trail. The recording boundary has to escape them
+    /// itself, exactly like the resource summary. Asserting on parsed JSON would
+    /// prove nothing (parsing folds the escape back), so this reads the raw bytes.
+    #[test]
+    fn del_and_c1_controls_in_the_routing_fields_never_reach_the_file_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decisions.jsonl");
+        let log = AuditLog::open(&path).unwrap();
+
+        let mut hostile_command = query();
+        if let Target::Command { intercept_rule, .. } = &mut hostile_command.target {
+            *intercept_rule = "status\u{9b}31mDENY OVERRIDDEN".to_string();
+        }
+        let mut hostile_endpoint = endpoint_query();
+        if let Target::Endpoint { rule_label, .. } = &mut hostile_endpoint.target {
+            *rule_label = "rl\u{7f}\u{9b}0m".to_string();
+        }
+
+        log.record(&hostile_command, &crate::decision::Decision::deny("nope"));
+        log.record(&hostile_endpoint, &crate::decision::Decision::deny("nope"));
+
+        let raw = std::fs::read(&path).unwrap();
+        let csi = "\u{9b}".as_bytes(); // 0xC2 0x9B in UTF-8
+        assert!(
+            !raw.windows(csi.len()).any(|window| window == csi),
+            "a raw CSI byte reached the audit file: {:?}",
+            String::from_utf8_lossy(&raw)
+        );
+        assert!(
+            !raw.contains(&0x7f),
+            "a raw DEL byte reached the audit file: {:?}",
+            String::from_utf8_lossy(&raw)
+        );
+
+        // The value must arrive escaped, not truncated or dropped.
+        let lines = lines(&path);
+        assert_eq!(
+            lines[0]["intercept_rule"], "status\\u{009b}31mDENY OVERRIDDEN",
+            "{:#}",
+            lines[0]
+        );
+        assert_eq!(lines[1]["rule_label"], "rl\\u{007f}\\u{009b}0m", "{:#}", lines[1]);
     }
 
     /// A rejected request never became a `PolicyQuery`, so none of the three

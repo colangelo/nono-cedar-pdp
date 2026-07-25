@@ -34,8 +34,8 @@ filtered test runs must both pass.
 
 ## 6. Remediation from the security re-audit (2026-07-26)
 
-- [ ] 6.1 Failing test: an `intercept_rule` (and a `rule_label`) carrying DEL/C1 control bytes (e.g. U+009B CSI) reaches the audit line escaped, never raw — assert on the raw file bytes, since serde escapes C0 but not DEL/C1
-- [ ] 6.2 Implement: `control_escape` for `intercept_rule` and `rule_label` at the audit recording boundary (both `record` paths); comment states why serde's own escaping is not enough
+- [x] 6.1 Failing test: an `intercept_rule` (and a `rule_label`) carrying DEL/C1 control bytes (e.g. U+009B CSI) reaches the audit line escaped, never raw — assert on the raw file bytes, since serde escapes C0 but not DEL/C1
+- [x] 6.2 Implement: `control_escape` for `intercept_rule` and `rule_label` at the audit recording boundary (both `record` paths); comment states why serde's own escaping is not enough
 - [ ] 6.3 Failing test: an endpoint request whose wire `child_pid` is non-zero has that value on its audit line (fidelity: record the claim, do not rewrite it to 0)
 - [ ] 6.4 Implement: thread `child_pid` through `query::Target::Endpoint` from the wire; fix the `AuditRecord` field doc ("as sent" becomes true); Cedar entities unchanged (the schema has no endpoint child_pid attribute)
 - [ ] 6.5 Corpus verbatim additions from the spec-coverage audit: `/search?q=..%2F..%2Fetc` in the non-ambiguous set and `/repos/..%5C../user/keys` in the denied set; assert the `.#10-git.cedar` emacs lock file's WARN line is present in the skip-log test
