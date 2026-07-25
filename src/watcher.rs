@@ -265,6 +265,99 @@ mod tests {
         );
     }
 
+    /// The second WHEN disjunct of the reload re-check scenario: a loadable
+    /// policy *file* going loose mid-session, with the directory's own mode
+    /// still tight. A file another local user can rewrite in place is a policy
+    /// someone else authors, so the re-check must refuse before the reload
+    /// adopts what was read — same containment as the directory case: last-good
+    /// set stays, ERROR names the file and its mode.
+    #[test]
+    fn a_policy_file_loosened_mid_session_is_refused_and_the_last_good_set_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = dir.path().join("p.cedar");
+        std::fs::write(&policy, POLICY).unwrap();
+        let schema = crate::cedar::schema::load().unwrap();
+        let engine = Arc::new(
+            crate::cedar::engine::Engine::bootstrap(schema, dir.path().to_path_buf()).unwrap(),
+        );
+        let capture = crate::test_log::capture();
+        let _watcher = spawn(Arc::clone(&engine)).unwrap();
+        assert!(
+            engine.evaluate(&git_status()).allow,
+            "the last-good set permits git status before the loosening"
+        );
+
+        // Loosen the file, then give it content that would flip the decision if
+        // the reload were wrongly adopted. `std::fs::write` truncates in place,
+        // so the loosened mode survives the edit.
+        chmod(&policy, 0o660);
+        std::fs::write(&policy, r#"forbid (principal, action, resource);"#).unwrap();
+
+        assert!(
+            !within(Duration::from_secs(2), || engine.snapshot().generation != 1
+                || !engine.evaluate(&git_status()).allow),
+            "a policy set read past a loosened file must not be adopted: generation {}",
+            engine.snapshot().generation
+        );
+        let log = capture.text();
+        assert!(
+            log.contains("ERROR"),
+            "the refusal must be ERROR, not a level an operator filters out: {log:?}"
+        );
+        assert!(log.contains("0660"), "the mode must be named: {log:?}");
+        assert!(
+            log.contains(&policy.display().to_string()),
+            "the offending file must be named, not just the directory: {log:?}"
+        );
+    }
+
+    /// The third WHEN disjunct: an existing *ancestor* going loose mid-session.
+    /// A mode change on the ancestor alone does not wake the watcher (`notify`
+    /// watches the policy directory only — documented limit), so the refusal
+    /// lands when the next policy-directory event fires; what matters is that
+    /// the loosened chain is refused before anything read through it becomes
+    /// the active set.
+    #[test]
+    fn a_loose_ancestor_mid_session_is_refused_when_the_next_edit_fires() {
+        let root = tempfile::tempdir().unwrap();
+        let holder = root.path().join("holder");
+        std::fs::create_dir(&holder).unwrap();
+        let dir = holder.join("policies");
+        std::fs::create_dir(&dir).unwrap();
+        let policy = dir.join("p.cedar");
+        std::fs::write(&policy, POLICY).unwrap();
+        let schema = crate::cedar::schema::load().unwrap();
+        let engine =
+            Arc::new(crate::cedar::engine::Engine::bootstrap(schema, dir.clone()).unwrap());
+        let capture = crate::test_log::capture();
+        let _watcher = spawn(Arc::clone(&engine)).unwrap();
+        assert!(
+            engine.evaluate(&git_status()).allow,
+            "the last-good set permits git status before the loosening"
+        );
+
+        chmod(&holder, 0o770);
+        std::fs::write(&policy, r#"forbid (principal, action, resource);"#).unwrap();
+
+        assert!(
+            !within(Duration::from_secs(2), || engine.snapshot().generation != 1
+                || !engine.evaluate(&git_status()).allow),
+            "a policy set below a loosened ancestor must not be adopted: generation {}",
+            engine.snapshot().generation
+        );
+        let log = capture.text();
+        assert!(
+            log.contains("ERROR"),
+            "the refusal must be ERROR, not a level an operator filters out: {log:?}"
+        );
+        assert!(log.contains("0770"), "the mode must be named: {log:?}");
+        assert!(
+            log.contains(&holder.display().to_string()),
+            "the ancestor must be named — the operator would otherwise stare at a \
+             tight policy dir wondering what to fix: {log:?}"
+        );
+    }
+
     /// The reload half of "an unenumerable listing is never a silent drop", from
     /// the operator's chair: the policy directory stops being listable
     /// mid-session. The last-good set must keep deciding and the refusal must be
