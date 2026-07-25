@@ -28,6 +28,11 @@ enum Command {
         /// Path to a JSON file containing a nono webhook envelope.
         fixture: PathBuf,
     },
+    /// Run the PDP daemon.
+    Serve {
+        #[arg(long, default_value = "./nono-cedar-pdp.toml")]
+        config: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -68,6 +73,22 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::Serve { config } => {
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(runtime) => runtime,
+                Err(e) => {
+                    eprintln!("FAIL: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match runtime.block_on(run_serve(&config)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(message) => {
+                    eprintln!("FAIL: {message}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
     }
 }
 
@@ -77,6 +98,26 @@ fn run_validate(config_path: &std::path::Path) -> Result<usize, String> {
     let loaded =
         cedar::engine::load_dir(&config.policy_dir, &schema, 1).map_err(|e| e.to_string())?;
     Ok(loaded.set.num_of_policies())
+}
+
+async fn run_serve(config_path: &std::path::Path) -> Result<(), String> {
+    use nono_cedar_pdp::{audit::AuditLog, server};
+    use std::sync::Arc;
+
+    let config = Config::load(config_path).map_err(|e| e.to_string())?;
+    let schema = cedar::schema::load().map_err(|e| e.to_string())?;
+    let engine = Arc::new(
+        cedar::engine::Engine::bootstrap(schema, config.policy_dir.clone())
+            .map_err(|e| e.to_string())?,
+    );
+    let audit = Arc::new(AuditLog::open(&config.audit_log).map_err(|e| e.to_string())?);
+    let bind = config.bind;
+    let state = server::AppState {
+        engine,
+        config: Arc::new(config),
+        audit,
+    };
+    server::serve(state, bind).await.map_err(|e| e.to_string())
 }
 
 fn run_check(

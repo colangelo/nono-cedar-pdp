@@ -5,4 +5,5 @@ pub mod config;
 pub mod decision;
 pub mod query;
 pub mod sanitize;
+pub mod server;
 pub mod wire;

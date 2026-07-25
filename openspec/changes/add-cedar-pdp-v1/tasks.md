@@ -59,11 +59,11 @@ Global gate for every group: `just lint && just test` must pass before the group
 
 ## 8. HTTP decision endpoint
 
-- [ ] 8.1 Write failing `tests/server.rs`: permitted command → `200 {"decision":"allow"}`; unpermitted → `200` deny with a "no policy" reason; malformed body → **`200` deny, not 4xx**; unsupported variant → `200` deny; every decision audited (exactly one line); `/healthz` reports generation 1 and 1 policy. Verify: `cargo test --test server` → fails
-- [ ] 8.2 Implement `src/server.rs`: `AppState`, `router()` with `CatchPanicLayer`, `POST /v1/approve` taking `Bytes` (**not** `Json<T>`, so a malformed body yields our deny reason instead of axum's 400), `GET /healthz`, and the defensive empty-policy-set `503` guard
-- [ ] 8.3 Implement `serve()` binding a `TcpListener` and add the `serve` subcommand with a tokio runtime. Verify: `cargo test --test server` → 6 passed
-- [ ] 8.4 Manual smoke: start `serve`, then `curl /healthz`, `curl -d @tests/fixtures/git-status.json /v1/approve`, `curl -d 'garbage' /v1/approve`. Verify: health JSON, `{"decision":"allow"}`, `{"decision":"deny","reason":"malformed…"}`
-- [ ] 8.5 Commit: `feat: fail-closed HTTP decision endpoint with health check`
+- [x] 8.1 Write failing `tests/server.rs`: permitted command → `200 {"decision":"allow"}`; unpermitted → `200` deny with a "no policy" reason; malformed body → **`200` deny, not 4xx**; unsupported variant → `200` deny; every decision audited (exactly one line); `/healthz` reports generation 1 and 1 policy. Verify: `cargo test --test server` → fails
+- [x] 8.2 Implement `src/server.rs`: `AppState`, `router()` with `CatchPanicLayer`, `POST /v1/approve` taking `Bytes` (**not** `Json<T>`, so a malformed body yields our deny reason instead of axum's 400), `GET /healthz`, and the defensive empty-policy-set `503` guard
+- [x] 8.3 Implement `serve()` binding a `TcpListener` and add the `serve` subcommand with a tokio runtime. Verify: `cargo test --test server` → 6 passed
+- [x] 8.4 Manual smoke: start `serve`, then `curl /healthz`, `curl -d @tests/fixtures/git-status.json /v1/approve`, `curl -d 'garbage' /v1/approve`. Verify: health JSON, `{"decision":"allow"}`, `{"decision":"deny","reason":"malformed…"}`
+- [x] 8.5 Commit: `feat: fail-closed HTTP decision endpoint with health check`
 
 ## 9. Policy hot-reload
 
