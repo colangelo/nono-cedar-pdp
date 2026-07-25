@@ -89,17 +89,28 @@ its file), advisory rather than fatal:
 1. **Flattening.** `argv_tail` is still a joined string, so it cannot distinguish
    `["push --force"]` from `["push", "--force"]`, and `git commit -m "do not --force this"`
    still matches `*--force*`. Over-matching is fail-safe in a `forbid` and unsound in a
-   `permit`, so `argv_tail` remains **forbid-only** and the loader SHALL report any
-   `permit` that reads `resource.argv_tail`.
+   `permit`. An **anchored** test is not affected: because `argv_tail` omits `args[0]`, a
+   pattern anchored at the start (`like "status *"`) or an equality test (`== "status"`)
+   pins the first token of `args[1..]` — the subcommand — which is the one thing set
+   membership cannot express, and is therefore the sound shape for a `permit`. The loader
+   SHALL report a `permit` whose `resource.argv_tail` test is **not** such a positional
+   pin, and SHALL NOT report one that is.
 2. **Unmatchable `args` literals.** `args` still holds the per-run shim path, so an `args`
    membership test against a value containing a path separator can never match the
    program — fail-open when it appears in a `forbid`. The loader SHALL report such a test
    for either effect and direct the author at `resource.command`.
 
-#### Scenario: A permit reading argv_tail is reported
+#### Scenario: A permit with an unanchored argv_tail glob is reported
 
-- **WHEN** the policy directory contains a `permit` whose condition reads `resource.argv_tail`
-- **THEN** loading reports the over-matching lint naming that policy, and the policy set still loads
+- **WHEN** the policy directory contains a `permit` whose condition is `resource.argv_tail like "*push*"`
+- **THEN** loading reports the over-matching lint naming that policy, telling the author to anchor the pattern, and the policy set still loads
+
+#### Scenario: A permit that pins a position is not reported
+
+- **WHEN** a `permit` tests `resource.argv_tail == "status"`, or `resource.argv_tail like "status *"`, or a disjunction of both forms over several subcommands
+- **THEN** no lint is reported, because the test pins the subcommand rather than searching the joined string
+- **AND WHEN** the same `permit` also contains an unanchored test such as `resource.argv_tail like "*--porcelain*"`
+- **THEN** the lint is reported, because the unanchored half is what can over-match into an approval
 
 #### Scenario: An args membership test against a path literal is reported
 
@@ -114,12 +125,29 @@ nono's proxy sends the raw upstream path: not normalised and still percent-encod
 prefix glob such as `resource.path like "/repos/*"` is therefore satisfied by
 `/repos/../user/keys`, `/repos/%2e%2e/user/keys` and `/repos/..;/user/keys`, which a
 normalising origin resolves elsewhere. The service SHALL NOT normalise the path (that
-would guess at the upstream's behaviour); instead it SHALL deny an endpoint request whose
-path contains an ambiguous segment — any segment that is `.` or `..` after one
-percent-decode pass and after stripping `;`-parameters — or whose path contains a
-malformed percent-escape, **before any policy is consulted**, with a deny reason naming
-the ambiguous path. Unambiguous paths SHALL continue to be evaluated with the raw path
-value.
+would both change what a policy matches and guess at the upstream's behaviour); instead
+it SHALL deny an endpoint request whose path's meaning depends on normalisation rules,
+**before any policy is consulted**, with a deny reason naming the ambiguity and the path
+as sent. Unambiguous paths SHALL continue to be evaluated with the raw path value.
+
+A path SHALL be treated as ambiguous when, over the part of the target before any `?` or
+`#`:
+
+1. a segment is `.` or `..` after stripping `;`-parameters, at **any** percent-decode
+   depth up to a bound the service SHALL declare — not merely the first, because the
+   service cannot know how many decode hops sit between it and the origin, so
+   `%252e%252e` is refused for the same reason as `%2e%2e`;
+2. the path **as sent** contains a malformed percent-escape (a `%` not followed by two
+   hex digits), or decodes to bytes that are not UTF-8 — an overlong encoding such as
+   `%c0%ae` is a `.` to some servers; or
+3. its percent-encoding nests deeper than the declared bound, so the traversal check
+   above could not be completed.
+
+Ambiguity SHALL NOT be inferred from the query string (a `..` in a query value cannot
+change which resource the origin routes to, and `?path=../x` is an ordinary API
+parameter), from dots inside a segment (`/repos/foo..bar`), or from an undecodable escape
+that appears only *after* the first decode pass — `/x/50%25-done` legitimately decodes to
+`50%-done`, whose stray `%` is data.
 
 #### Scenario: A literal traversal segment is denied without policy evaluation
 
@@ -128,18 +156,25 @@ value.
 
 #### Scenario: A percent-encoded or parameterised traversal segment is denied
 
-- **WHEN** an endpoint request carries `path` `/repos/%2e%2e/user/keys`, or `/repos/..;/user/keys`, or `/repos/%2E%2E%2Fuser/keys`
+- **WHEN** an endpoint request carries `path` `/repos/%2e%2e/user/keys`, or `/repos/%2E%2e/user/keys`, or `/repos/..;/user/keys`, or `/repos/%2E%2E%2Fuser/keys`, or the double-encoded `/repos/%252e%252e/user/keys`
 - **THEN** the decision is deny with the ambiguous-path reason, for the same reason as a literal `..`
 
 #### Scenario: An undecodable path is denied rather than guessed at
 
-- **WHEN** an endpoint request carries a path containing a malformed percent-escape such as `/repos/%zz/foo`
+- **WHEN** an endpoint request carries a path containing a malformed percent-escape such as `/repos/%zz/foo`, or one that decodes to non-UTF-8 bytes such as `/repos/%c0%ae%c0%ae/user/keys`
 - **THEN** the decision is deny with a reason naming the path as ambiguous, because the daemon cannot know what the upstream will make of it
 
 #### Scenario: An unambiguous path is still decided by policy
 
 - **WHEN** an endpoint request carries `path` `/repos/foo/bar` and a permit guarded by `resource.path like "/repos/*"` matches
 - **THEN** the decision is allow and the reason names that permit
+- **AND WHEN** the path is `/repos/foo/bar?path=../x`, `/repos/foo..bar/x` or `/repos/50%25-done`
+- **THEN** the request is still decided by policy, because none of those can move which resource the origin routes to
+
+#### Scenario: The ambiguity refusal is reproducible offline
+
+- **WHEN** an operator runs the `check` subcommand on a saved endpoint payload whose path contains a traversal segment
+- **THEN** the command reports a deny whose reason names the ambiguity and the path as sent, and exits non-zero
 
 ### Requirement: Derive the principal hierarchy from request identity
 

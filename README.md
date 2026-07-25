@@ -87,7 +87,7 @@ Endpoints:
 - `POST /v1/approve` — the decision endpoint. Always `200` with an allow or a deny;
   a malformed body gets *our* deny reason rather than axum's `400`, so the reason
   lands in nono's audit trail.
-- `GET /healthz` — `{"generation":1,"policies":4,"policy_dir":"./policies"}`.
+- `GET /healthz` — `{"generation":1,"policies":5,"policy_dir":"./policies"}`.
   `503` if no policies are loaded, so "PDP broken" is distinguishable from
   "policy said no".
 
@@ -202,7 +202,7 @@ already composes backends better than a flag could:
 ## Schema caveats you must know before writing policies
 
 The schema is [`nono.cedarschema`](nono.cedarschema) — the load-bearing design
-artifact, embedded in the binary. Four of its shapes are deliberate constraints, not
+artifact, embedded in the binary. Six of its shapes are deliberate constraints, not
 oversights.
 
 1. **`args` is a `Set<String>`, so positional matching is unexpressible.** Upstream
@@ -221,21 +221,46 @@ oversights.
    For the same reason, `resource.args.contains("git")` — or any path literal — never
    matches the program: use `resource.command`. The loader warns when an `args`
    membership literal contains a `/`.
-3. **`argv_tail` globs are forbid-only.** Removing the whole-argv join fixed
-   *anchoring*; it did not fix *flattening*, which is inherent to any joined string.
-   `argv_tail` still over-matches: `git commit -m "do not --force this"` satisfies
-   `resource.argv_tail like "*--force*"`, and it cannot distinguish
-   `["push --force"]` from `["push", "--force"]`. Over-matching is fail-safe in a
-   `forbid` and unsound in a `permit`, so the loader **warns about any `permit` that
-   reads `resource.argv_tail`**. Two hazards, then: anchoring is now structurally
-   impossible, flattening is still a rule you have to follow.
-4. **Endpoint requests carry no session identity.** nono's proxy hardcodes
+3. **Set membership cannot express POSITION — pin a subcommand with an anchored
+   `argv_tail` test.** `resource.args.contains("status")` is true of
+   `git -c core.fsmonitor=<cmd> status`, and git *runs* `<cmd>`: a "read-only git"
+   permit written that way approves arbitrary code execution (this was the shipped
+   pack's bug, fixed in [`policies/10-git.cedar`](policies/10-git.cedar)). Because
+   `argv_tail` drops `args[0]`, its first token **is** the subcommand, so write
+   `resource.argv_tail == "status" || resource.argv_tail like "status *"`. That also
+   denies `git -c … status` — correct for a permit: a pattern that cannot prove the
+   subcommand is first must not approve. Pair it with a `forbid` on the flags that
+   execute code (`-c`, `--config-env`, `--exec-path`, `--upload-pack`,
+   `--receive-pack`), so a later permit written with `contains` cannot resurrect the
+   hole.
+4. **UNANCHORED `argv_tail` globs are forbid-only.** Removing the whole-argv join
+   fixed *anchoring*; it did not fix *flattening*, which is inherent to any joined
+   string. A glob that begins with a wildcard over-matches: `git commit -m "do not
+   --force this"` satisfies `resource.argv_tail like "*--force*"`, and no joined
+   string can distinguish `["push --force"]` from `["push", "--force"]`. Over-matching
+   is fail-safe in a `forbid` and unsound in a `permit`, so the loader **warns about a
+   `permit` whose `argv_tail` test is not a positional pin** (an anchored pattern or
+   an `==` is a pin; anything else is not). Two hazards, then: anchoring is now
+   structurally impossible, flattening is still a rule you have to follow.
+5. **Endpoint paths arrive raw, and an ambiguous one is denied outright.** nono's proxy
+   forwards the request target verbatim — unnormalised, still percent-encoded, query
+   string included — so `resource.path like "/repos/*"` used to be satisfied by
+   `/repos/../user/keys`, which GitHub-class origins resolve to `/user/keys`. The
+   daemon does **not** normalise (that would change what your policy matches and would
+   guess at the upstream's rules). Instead a path whose meaning depends on those rules
+   is refused **before any policy is consulted**, with a reason naming the ambiguity:
+   a `.`/`..` segment at any percent-decode depth (so `%2e%2e`, `%252e%252e` and
+   `..;/` are covered), a malformed percent-escape, a decode that yields non-UTF-8
+   bytes (overlong encodings can hide a `.`), or encoding nested more than 8 deep. A
+   `..` inside the *query* is not ambiguous — it cannot move which resource the origin
+   routes to. Unambiguous paths reach policy exactly as nono sent them.
+6. **Endpoint requests carry no session identity.** nono's proxy hardcodes
    `session_id: "proxy"` and `child_pid: 0`. Rather than echo whatever the payload
    claims, the daemon *pins* `Nono::Caller::"proxy"` in `Nono::Session::"proxy"`, so a
    crafted payload naming a real session id cannot place the proxy caller inside that
    session's hierarchy and satisfy a session-scoped policy.
 
-A fifth, related limitation: **nono sends a caller *label*, not a caller kind** —
+A seventh, related limitation: **nono sends a caller *label*, not a caller kind** —
 `"session"` for a direct agent launch, otherwise the name of the intercepted command
 that chained the launch. A profile that intercepts a command literally named `session`
 therefore produces a payload indistinguishable from a direct launch. Disambiguating

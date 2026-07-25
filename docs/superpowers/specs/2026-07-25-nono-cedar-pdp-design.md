@@ -138,11 +138,14 @@ in the webhook backend config.
 | D8 | Loopback HTTP on `127.0.0.1:8181`, no portless name | Fewer hops and no squattable hostname in a security path |
 | D12 | Expose `argv_tail` (the join of `args[1..]`) on `Command` and **remove `argv`** (the whole-argv join) entirely; `args` stays faithful to the payload nono sent | `args[0]` is a per-run shim path (§2 correction), so anchored patterns over the whole argv never fire at runtime — fail-open in a `forbid`. `argv_tail` is the sound anchoring target and mirrors upstream's own `argv.iter().skip(1)`. `argv` had no use `argv_tail` does not serve as well, so it is made unexpressible rather than merely discouraged (same posture as D6) |
 | D13 | Policy directory and audit log MUST live outside any tree the sandboxed agent can write; shipped defaults are home-anchored, never CWD-relative | Hot-reload turns a writable policy dir into a privilege-escalation path: the agent writes `permit(principal, action, resource);` and the PDP adopts it within a debounce. Proven end-to-end against the previous `./policies` default |
+| D14 | The shipped read-only git permit pins the subcommand with an **anchored `argv_tail`** test, and a second, independent `forbid` covers git's code-executing flags (`-c`, `--config-env`, `--exec-path`, `--upload-pack`, `--receive-pack`) | Set membership cannot express position: `args.contains("status")` is true of `git -c core.fsmonitor=<cmd> status`, which git *executes*. Anchoring is the only expressible position pin (`args[0]` is gone from `argv_tail`, so its first token is the subcommand). Two independent layers, each proven to deny the exploit alone, so a future membership-shaped permit cannot resurrect it. Cost: `git -c … status` is denied — fail-safe, and a prompt under `chain`/`any` |
+| D15 | Endpoint `path` stays **raw**; a path whose meaning depends on the upstream's normalisation is denied before any policy runs | `resource.path like "/repos/*"` was satisfied by `/repos/../user/keys` (and `%2e%2e`, `%252e%252e`, `..;/`). Normalising here would change what a policy matches *and* guess at which of many normalisation rules the upstream applies; refusing the ambiguity keeps `path` faithful and fails closed. Query strings, dots inside a segment, and a stray `%` below the first decode pass are deliberately not ambiguous |
 
 D9–D11 (empty policy dir refuses to start, policy ids carry file provenance, deny vs
 broken are different signals) were recorded during the change proposal and live in
 `openspec/changes/add-cedar-pdp-v1/design.md`; the numbering here continues from them.
-D12 and D13 are post-implementation audit corrections.
+D12 and D13 are post-implementation audit corrections; D14 and D15 come from the
+adversarial security audit that followed.
 
 ### D12 — `argv_tail` replaces `argv`: one anchoring target, and it excludes the shim path
 
@@ -186,6 +189,12 @@ still a rule**:
   `["push", "--force"]`, so `git commit -m "do not --force this"` still matches
   `*--force*`. The **forbid-only** rule and the loader's
   permit-reads-a-joined-string lint therefore transfer to `argv_tail` intact.
+  **Amended 2026-07-25 (D14, security audit): forbid-only applies to *unanchored*
+  globs only.** Flattening is a property of *searching* the joined string; an
+  **anchored** test (`argv_tail == "status"`, `argv_tail like "status *"`) instead
+  *pins a position* — since `args[0]` is gone, the first token of `argv_tail` is the
+  subcommand — and that is the only expressible way to say "the subcommand is X". The
+  lint was narrowed to a permit whose `argv_tail` test is not such a pin.
 
 The rest of D12, unchanged:
 
@@ -274,7 +283,8 @@ namespace Nono {
   entity Command {
     command:   String,       // "git" — the command NAME (not args[0])
     args:      Set<String>,  // exact-membership tests only (D6); args[0] is a shim path
-    argv_tail: String,       // args[1..] joined — the ONLY joined string, forbid-only (D12)
+    argv_tail: String,       // args[1..] joined — the ONLY joined string; anchored tests pin
+                             // the subcommand (D14), unanchored globs are forbid-only (D12)
     arg_count: Long,         // count of post-filter args, args[0] included (lossy-argv caveat)
   }
 
@@ -312,12 +322,16 @@ namespace Nono {
 
 Schema caveats (documented here and in the starter policy pack):
 
-- **`argv_tail` is forbid-only.** Cedar strings support only `like` globs; a substring
-  pattern (`argv_tail like "*--force*"`) also matches when the text appears *inside a
-  single argument* (`-m "do not --force"`), and a joined string cannot tell
+- **Unanchored `argv_tail` globs are forbid-only; anchored ones pin a position
+  (D14).** Cedar strings support only `like` globs; a substring pattern
+  (`argv_tail like "*--force*"`) also matches when the text appears *inside a single
+  argument* (`-m "do not --force"`), and a joined string cannot tell
   `["push --force"]` from `["push", "--force"]`. Over-matching is fail-safe in a
   `forbid` (spurious deny → terminal fallback prompts) but unsound in a `permit`, so
-  the loader warns about any `permit` that reads `argv_tail`. Exact flag tests use
+  the loader warns about a `permit` whose `argv_tail` test starts with a wildcard.
+  A test anchored at the start — or an `==` — is the opposite case: it pins the first
+  token of `args[1..]`, i.e. the subcommand, which set membership cannot express, and
+  is the required shape for a read-only permit (D14). Exact flag tests use
   `resource.args.contains("--force")`.
 - **There is no whole-argv attribute; anchored patterns go on `argv_tail`.** `args[0]`
   is a per-run shim path (§2 correction), so a pattern anchored over the whole argv
@@ -339,10 +353,17 @@ Schema caveats (documented here and in the starter policy pack):
   `/repos/../user/keys`, `/repos/%2e%2e/user/keys` and `/repos/..;/user/keys`, all of
   which resolve elsewhere at a normalising origin — a permit that fails open. The
   daemon does **not** normalise the path (that would decide, in the PDP, what the
-  upstream will do); instead an ambiguous path is **denied before any policy is
-  consulted**: any segment that is `.` or `..` after one percent-decode pass and after
-  `;`-parameter stripping, or a malformed percent-escape, is a deny with a reason
-  naming path ambiguity.
+  upstream will do, and would change what a policy matches); instead an ambiguous path
+  is **denied before any policy is consulted**, with a reason naming the ambiguity and
+  the path as sent (D15, `src/endpoint_path.rs`). Ambiguous means, over the target up
+  to the first `?`/`#`: a segment that is `.` or `..` after `;`-parameter stripping at
+  **any** percent-decode depth up to 8 — not just the first, since the number of decode
+  hops downstream is unknown, so `%252e%252e` is refused too — a malformed
+  percent-escape in the path *as sent*, a decode that yields non-UTF-8 bytes (overlong
+  encodings hide a `.`), or nesting deeper than the bound. Deliberately **not**
+  ambiguous: the query string (`?path=../x` cannot move the route), dots inside a
+  segment (`/repos/foo..bar`), and a stray `%` that only appears after the first decode
+  pass (`/x/50%25-done` → `50%-done`).
 - **Entity ids stay short** (`Caller::"session"`, `Caller::"git"`, `Caller::"proxy"`)
   because the entity slice is per-request; session identity lives in the parent
   `Session` entity and in context.
@@ -386,7 +407,7 @@ resource summary, decision, matched policy ids, eval time (µs).
 |---|---|---|
 | Malformed JSON / unknown `capability_type` | `200` deny + reason | our reason lands in nono's audit trail; 4xx would deny with a useless generic reason |
 | `capability` / `network` variant | `200` deny, "unsupported variant" | fail closed on anything upstream adds later |
-| Endpoint path with an ambiguous segment (`.`/`..`, before or after percent-decoding) or a malformed escape | `200` deny + reason, **policies not consulted** | a prefix glob over a raw path would otherwise permit `/repos/../user/keys`; normalising in the PDP would guess at the origin's behaviour |
+| Endpoint path with an ambiguous segment (`.`/`..` at any percent-decode depth) or an undecodable escape | `200` deny + reason naming the ambiguity, **policies not consulted** | a prefix glob over a raw path would otherwise permit `/repos/../user/keys`; normalising in the PDP would guess at the origin's behaviour |
 | Policy set invalid at startup | refuse to start | fail fast, not fail quiet |
 | Policy set invalid on hot-reload | keep last-good, log error | D7 |
 | Cedar evaluation error | `200` deny + error log | schema validation should make this unreachable |

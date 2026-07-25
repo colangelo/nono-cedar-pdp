@@ -39,8 +39,17 @@ context: |
       name — the name arrives separately in `command`. No literal can match args[0],
       so the schema exposes `argv_tail` (args[1..] joined) for anchored globs and has
       no whole-argv attribute at all: a policy reading `resource.argv` fails strict
-      validation. `argv_tail` globs stay forbid-only (a joined string over-matches
-      inside a single argument).
+      validation. Because args[0] is gone, argv_tail's FIRST token is the subcommand,
+      so an anchored test (`== "status"`, `like "status *"`) is the only way to pin a
+      subcommand — set membership on a subcommand word approves anything containing it
+      (`git -c core.fsmonitor=<cmd> status` is code execution). UNANCHORED argv_tail
+      globs stay forbid-only (a joined string over-matches inside a single argument);
+      the loader lints a permit whose argv_tail test is not a positional pin.
+    - Endpoint `path` is the RAW request target: unnormalised, still percent-encoded,
+      query string included. It is deliberately not normalised (that would change what
+      a policy matches and guess at the upstream's rules), so a path whose meaning
+      depends on normalisation — a `.`/`..` segment at any percent-decode depth, a
+      malformed or non-UTF-8 escape — is denied before any policy is consulted.
     - The webhook is unauthenticated in both directions; loopback-only bind, with
       https-on-loopback as a follow-up.
 

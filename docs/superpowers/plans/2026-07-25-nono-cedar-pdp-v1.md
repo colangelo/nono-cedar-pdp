@@ -58,6 +58,17 @@ attribute or a `["git", …]` `args` value is the plan as written, not as shippe
 schema, entity builder, fixtures and tests all use `argv_tail` and a shim-path `args[0]`.
 See the design spec §2 "Correction" and D12 for the upstream line references.
 
+**Superseded again by the security audit (design spec D14/D15).** Two further shapes in
+this plan are not what shipped: (a) every `resource.args.contains("status")`-style
+read-only git permit below — set membership cannot express *position*, so it also
+approves `git -c core.fsmonitor=<cmd> status`, which git executes; the shipped pack pins
+the subcommand with `argv_tail == "status" || argv_tail like "status *"` and adds a
+`forbid` on git's code-executing flags. (b) endpoint `path` is used raw in the plan's
+policy examples with no caveat; the shipped daemon denies a path whose meaning depends on
+the upstream's normalisation (`/repos/../user/keys` and its encodings) before any policy
+is consulted. `policies/10-git.cedar`, `src/endpoint_path.rs` and the tests are the
+shipped truth.
+
 **Real endpoint-request JSON** (field set from `crates/nono/src/supervisor/types.rs`; the proxy hardcodes `session_id: "proxy"` and `child_pid: 0`):
 
 ```json

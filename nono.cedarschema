@@ -21,12 +21,19 @@ namespace Nono {
     // matcher, argv.iter().skip(1). There is deliberately no whole-argv
     // attribute: an anchored pattern over one could never match at runtime,
     // fail-open in a forbid, so it is unexpressible rather than discouraged.
-    // FORBID-ONLY: a glob over a joined string also matches text *inside* a
-    // single argument — `git commit -m "do not --force this"` matches
-    // `argv_tail like "*--force*"` — and it cannot tell ["push --force"] from
-    // ["push", "--force"]. Over-matching is fail-safe in a forbid and unsound in
-    // a permit, so loading warns about any permit that reads argv_tail. For
-    // exact tests use args.contains(..).
+    // Because args[0] is gone, the FIRST token of argv_tail is the subcommand, so
+    // an ANCHORED test — `argv_tail == "status"` or `argv_tail like "status *"` —
+    // is the one way to say "the subcommand is `status`", which set membership
+    // cannot express (`args.contains("status")` also matches
+    // `git -c core.fsmonitor=<cmd> status`, i.e. code execution). Anchored tests
+    // are therefore the sound shape for a permit.
+    // UNANCHORED GLOBS ARE FORBID-ONLY: a glob that starts with a wildcard also
+    // matches text *inside* a single argument — `git commit -m "do not --force
+    // this"` matches `argv_tail like "*--force*"` — and it cannot tell
+    // ["push --force"] from ["push", "--force"]. Over-matching is fail-safe in a
+    // forbid and unsound in a permit, so loading warns about any permit whose
+    // argv_tail test is not anchored. For exact per-argument tests use
+    // args.contains(..).
     argv_tail: String,
     // Count of the args nono actually sent (post-filter; args[0] included, so a
     // bare `git status` is 2).
@@ -37,6 +44,15 @@ namespace Nono {
     route_id: String,
     upstream: String,
     method: String,
+    // The RAW request target nono's proxy forwards: not normalised, still
+    // percent-encoded, query string included. It is deliberately not normalised
+    // here — that would change what a policy matches and would guess at the
+    // upstream's own normalisation rules — so a path whose meaning depends on those
+    // rules (a `.`/`..` segment at any percent-decode depth, an undecodable escape)
+    // is denied before any policy runs rather than handed to one. See
+    // src/endpoint_path.rs. A `path like "/repos/*"` glob is therefore safe against
+    // traversal, but it still matches the query string: put method and upstream
+    // conditions alongside it, not path shape alone.
     path: String,
   };
 

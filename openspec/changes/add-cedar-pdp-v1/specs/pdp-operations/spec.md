@@ -99,6 +99,47 @@ defaults SHALL be home-anchored: `~/.config/nono-cedar-pdp/policies` and
 - **WHEN** the end-to-end smoke recipe runs
 - **THEN** it starts the daemon with a configuration whose policy directory and audit log sit outside the sandboxed workdir, and it reads its assertions from that configured audit-log path rather than from a repository-root file
 
+### Requirement: The shipped policy pack approves a subcommand by position, not by word
+
+A fresh install inherits the shipped pack's posture, so the pack is product surface rather
+than an example. Its read-only git permit SHALL identify the subcommand **positionally**,
+by an anchored `resource.argv_tail` test, and SHALL NOT approve on set membership of a
+subcommand word: `resource.args.contains("status")` is true of
+`git -c core.fsmonitor=<cmd> status`, and git runs `<cmd>`, so a membership permit
+approves arbitrary command execution. Anchoring also denies otherwise read-only
+invocations that place a flag before the subcommand; that is the intended direction for a
+permit, and the documented `chain`/`any` posture turns such a denial into a prompt.
+
+Independently of the permit, the pack SHALL `forbid` the git flags that execute a command
+or relocate the binaries git executes — `-c`, `--config-env`, `--exec-path`,
+`--upload-pack`, `--receive-pack` — using exact `args` membership where the value is a
+separate argv entry and an `argv_tail` glob where git accepts a `--flag=<value>` spelling
+that membership cannot see. Each of the two layers SHALL deny the code-execution
+invocation on its own, so neither is load-bearing alone, and the pack SHALL load without
+tripping any of the loader's own lints.
+
+#### Scenario: A config-injecting flag before a read-only subcommand is denied
+
+- **WHEN** an approval request carries `command` `git` and `args` `[<shim path>, "-c", "core.fsmonitor=<cmd>", "status"]`
+- **THEN** the decision is deny, and the matched-policy list names the flag `forbid`
+
+#### Scenario: Each layer holds with the other removed
+
+- **WHEN** the flag `forbid` is removed from the loaded pack and the same request is evaluated
+- **THEN** the decision is deny with an empty matched-policy list, because the anchored permit cannot fire when the subcommand is not first
+- **AND WHEN** the anchored permit is instead replaced by a membership-shaped permit (`resource.args.contains("status")`)
+- **THEN** the decision is still deny and the matched-policy list names the flag `forbid`
+
+#### Scenario: Read-only invocations are still approved
+
+- **WHEN** an approval request carries `args` `[<shim path>, "status"]`, `[<shim path>, "status", "--porcelain"]`, `[<shim path>, "log", "-n", "5"]` or `[<shim path>, "show", "HEAD"]`
+- **THEN** the decision is allow and the matched-policy list names the read-only permit
+
+#### Scenario: A read-only word elsewhere in the argv approves nothing
+
+- **WHEN** an approval request carries `args` `[<shim path>, "commit", "-m", "status"]`, `[<shim path>, "commit", "--amend", "-m", "log"]`, `[<shim path>, "reset", "--soft", "status"]` or `[<shim path>, "clone", "ext::sh -c evil", "status"]`
+- **THEN** the decision is deny and the read-only permit is not among the matched policies
+
 ### Requirement: Documented rollout postures exist in the shipped example profile
 
 Every approval backend the documentation tells an operator to select SHALL be defined in
@@ -119,12 +160,17 @@ postures and the example profile SHALL be consistent in both directions.
 
 ### Requirement: Document the decision-surface limits and known risks
 
-The project documentation SHALL state the limits that follow from nono's contract: only `command` and `endpoint` approvals reach the daemon; filesystem capability elevation cannot be arbitrated; argument positions are untrustworthy so `args` is a set; `args[0]` is an absolute per-run shim path rather than the command name, so the command name is read from `command`, there is no whole-argv attribute at all, and anchored patterns belong on `argv_tail`; `argv_tail` substring globs over-match text inside a single argument and are therefore safe only in `forbid`; endpoint paths arrive raw and unnormalised, so an ambiguous path is denied outright; endpoint requests carry no session identity; and the webhook is unauthenticated in both directions, so the daemon must bind loopback only.
+The project documentation SHALL state the limits that follow from nono's contract: only `command` and `endpoint` approvals reach the daemon; filesystem capability elevation cannot be arbitrated; argument positions are untrustworthy so `args` is a set; `args[0]` is an absolute per-run shim path rather than the command name, so the command name is read from `command`, there is no whole-argv attribute at all, and anchored patterns belong on `argv_tail`; set membership cannot express position, so a subcommand is pinned with an anchored `argv_tail` test and a membership permit on a subcommand word approves far more than it names; *unanchored* `argv_tail` globs over-match text inside a single argument and are therefore safe only in `forbid`; endpoint paths arrive raw and unnormalised, so an ambiguous path is denied outright; endpoint requests carry no session identity; and the webhook is unauthenticated in both directions, so the daemon must bind loopback only.
 
 #### Scenario: Argument-matching guidance is documented
 
 - **WHEN** a policy author consults the documentation on matching command arguments
-- **THEN** they are told to use set membership rather than position, that anchored globs go on `argv_tail`, and that `argv_tail` globs belong only in `forbid` policies
+- **THEN** they are told to test flags by set membership rather than by position, to pin a subcommand with an anchored `argv_tail` test (`== "status"` or `like "status *"`) because membership cannot express position, and that an `argv_tail` glob beginning with a wildcard belongs only in a `forbid`
+
+#### Scenario: The raw-path caveat is documented
+
+- **WHEN** a policy author consults the documentation on matching `resource.path`
+- **THEN** they are told the path is the raw request target (unnormalised, still percent-encoded, query string included), that the daemon does not normalise it, and that a path whose meaning depends on normalisation — a `.`/`..` segment at any decode depth, an undecodable escape — is denied before any policy is consulted
 
 #### Scenario: The shim-path shape of args[0] is documented
 
