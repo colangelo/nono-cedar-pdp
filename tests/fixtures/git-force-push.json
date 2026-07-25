@@ -1,0 +1,3 @@
+{"backend":"cedar","request":{"capability_type":"command","request_id":"r2",
+"command":"git","args":["git","push","--force"],"caller":"session",
+"intercept_rule":"push","reason":null,"child_pid":42,"session_id":"s1"}}
