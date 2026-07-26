@@ -61,17 +61,26 @@ async fn post(dir: &tempfile::TempDir, body: &str) -> (StatusCode, serde_json::V
 
 /// Post to an existing router, so a test can send two requests to *one* daemon
 /// — the only way to observe what happens to long-lived state between decisions.
+/// Carries the content-type nono's webhook client sends, because every test but the
+/// header-gate ones is about what happens to a request that came from nono.
 async fn post_to(app: &axum::Router, body: &str) -> (StatusCode, serde_json::Value) {
+    post_with_headers(app, &[("content-type", "application/json")], body).await
+}
+
+/// Post with *exactly* the headers given and nothing implied, so a test can send what
+/// nono's client sends, what a browser would send, or no headers at all.
+async fn post_with_headers(
+    app: &axum::Router,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (StatusCode, serde_json::Value) {
+    let mut request = Request::builder().method("POST").uri("/v1/approve");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
     let response = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/approve")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
         .await
         .unwrap();
     let status = response.status();
@@ -806,22 +815,15 @@ async fn a_malformed_body_is_audited_without_context() {
 #[tokio::test]
 async fn logged_identifiers_carry_no_raw_control_bytes() {
     let hostile = "approve-git\u{1b}[2K\rINFO forged_line allow=true";
-    let sink = CapturedLog::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_writer(sink.clone())
-        .finish();
-
     let dir = tempfile::tempdir().unwrap();
     let allowed = command_body_with_request_id(hostile, "git", &[SHIM_GIT, "status"]);
     let refused = capability_body(hostile);
-    {
-        let _guard = tracing::subscriber::set_default(subscriber);
+    let text = {
+        let capture = capture();
         let _ = post(&dir, &allowed).await;
         let _ = post(&dir, &refused).await;
-    }
-
-    let text = sink.text();
+        capture.text()
+    };
     assert!(
         text.contains("approve-git"),
         "the decision must be logged at all: {text:?}"
@@ -867,18 +869,12 @@ async fn a_payload_that_cannot_become_a_cedar_request_is_denied_and_logged() {
     })
     .to_string();
 
-    let sink = CapturedLog::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_writer(sink.clone())
-        .finish();
-
     let dir = tempfile::tempdir().unwrap();
-    let (status, response) = {
-        let _guard = tracing::subscriber::set_default(subscriber);
-        post(&dir, &body).await
+    let (status, response, logs) = {
+        let capture = capture();
+        let (status, response) = post(&dir, &body).await;
+        (status, response, capture.text())
     };
-    let logs = sink.text();
 
     assert_eq!(
         status,
@@ -955,6 +951,82 @@ async fn a_panicking_handler_becomes_an_error_response() {
         StatusCode::OK,
         "the daemon must stay available after a panic"
     );
+}
+
+/// Serializes the log-capturing tests in this binary against each other, and pins the
+/// process-wide `tracing` max-level hint for the whole run.
+///
+/// Both halves are load-bearing, for the reason `src/test_log.rs` documents at length:
+/// `set_default` installs a subscriber *thread-locally*, but `tracing` also keeps a
+/// process-wide max-level hint that is recalculated whenever any thread installs or
+/// drops a subscriber — so another test finishing mid-window can lower the hint,
+/// silence our events before they reach the thread-local sink, and hand back an empty
+/// capture. That is not hypothetical: it cost a 3/3 failure in the unit tests. This
+/// file cannot use `crate::test_log` (it is `#[cfg(test)]` inside the library), so the
+/// mechanism is repeated here — and it matters more now, because the DEBUG capture
+/// below is the only test that raises the hint above INFO.
+static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
+/// A permanent global subscriber that discards output, so the max-level hint stays at
+/// TRACE no matter what other threads are doing. Discarding, not printing: this must
+/// not add noise to test output.
+fn pin_global_level() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // Ignore the error: another harness may legitimately have set one first.
+        let _ = tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(std::io::sink)
+                .finish(),
+        );
+    });
+}
+
+/// A live capture window. Capture ends when this is dropped, so read [`Capture::text`]
+/// before then.
+struct Capture {
+    sink: CapturedLog,
+    // Declaration order is drop order: release the subscriber before the lock, so no
+    // other capturing test can start while ours is still installed.
+    _subscriber: tracing::subscriber::DefaultGuard,
+    _serialized: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Capture {
+    fn text(&self) -> String {
+        self.sink.text()
+    }
+}
+
+/// Begin capturing at the daemon's default level — `main.rs` defaults its
+/// `EnvFilter` to `info`, so this is what an operator who set nothing sees.
+fn capture() -> Capture {
+    capture_at(tracing::Level::INFO)
+}
+
+/// Begin capturing everything up to `level`, for the events that are off by default.
+fn capture_at(level: tracing::Level) -> Capture {
+    pin_global_level();
+    let serialized = match CAPTURE_LOCK.lock() {
+        Ok(guard) => guard,
+        // A panicking capture test must not wedge every later one.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let sink = CapturedLog::default();
+    let subscriber = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(level)
+            .with_writer(sink.clone())
+            .finish(),
+    );
+    Capture {
+        sink,
+        _subscriber: subscriber,
+        _serialized: serialized,
+    }
 }
 
 /// `tracing` output captured into memory, so a test can assert what an operator
