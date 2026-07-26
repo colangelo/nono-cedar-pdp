@@ -91,9 +91,10 @@ shipped policy pack and the schema comments SHALL direct anchored matching at `a
 
 ### Requirement: Report the argument-matching hazards that survive the schema
 
-Removing the whole-argv attribute eliminates the anchoring hazard only. Two hazards remain
-and SHALL be reported as load-time diagnostics naming the policy identifier (which carries
-its file), advisory rather than fatal:
+Removing the whole-argv attribute eliminates the anchoring hazard only. Three hazards
+remain. The first two SHALL be reported as load-time diagnostics naming the policy
+identifier (which carries its file), advisory rather than fatal. The third is not
+detectable at load time or at decision time and SHALL be documented instead:
 
 1. **Flattening.** `argv_tail` is still a joined string, so it cannot distinguish
    `["push --force"]` from `["push", "--force"]`, and `git commit -m "do not --force this"`
@@ -111,6 +112,22 @@ its file), advisory rather than fatal:
    membership test against a value containing a path separator can never match the
    program — fail-open when it appears in a `forbid`. The loader SHALL report such a test
    for either effect and direct the author at `resource.command`.
+3. **Dropped arguments.** Upstream builds `args` by discarding every argv entry that is
+   not valid UTF-8 rather than converting it, so such an entry is **absent** from `args`
+   and from `argv_tail` alike — not displaced, absent. A rule cannot match an argument it
+   cannot see, so a `forbid` naming an argument **fails open** for that invocation, and an
+   anchored `permit` still fires because the tail reads as the bare subcommand. The
+   dropped entry is dropped whole, so what matters is whether the matched bytes share an
+   argv entry with the invalid bytes: membership on a flag occupying its own entry
+   survives, while a glob over a `--flag=<value>` entry does not.
+
+   This hazard SHALL NOT be reported as a lint, because no policy exhibits it — the defect
+   is in the input, not in the rule. It SHALL NOT be presented as avoidable by careful
+   authoring either: the post-drop request is byte-identical to a legitimate request that
+   never carried the argument, so no policy, schema or code at this boundary can
+   distinguish them, and any rule that denied one would deny the other. It SHALL be
+   documented as an inherent limit of the decision input, naming what becomes
+   unreliable, and it closes only upstream, by preserving arity.
 
 #### Scenario: A permit with an unanchored argv_tail glob is reported
 
@@ -132,6 +149,12 @@ its file), advisory rather than fatal:
 - **THEN** loading reports a lint naming that policy, stating that `args[0]` is a per-run shim path no literal can match, and directing the author to `resource.command`
 - **AND WHEN** the literal contains no path separator, such as `resource.args.contains("--force")`
 - **THEN** no lint is reported
+
+#### Scenario: A dropped argument is not reported as a policy defect
+
+- **WHEN** the policy directory contains a `forbid` naming an argument, such as `resource.argv_tail like "*--exec-path*"`
+- **THEN** no lint is reported for the dropped-argument hazard, because the rule is well formed and the loader has no request to inspect
+- **AND** the documented guidance states that such a `forbid` does not fire when the argument's own entry carried invalid UTF-8, and that this is fail-open
 
 ### Requirement: Deny endpoint requests whose path is ambiguous
 
