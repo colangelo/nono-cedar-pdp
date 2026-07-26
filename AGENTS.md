@@ -98,3 +98,30 @@ disposable half.
   it names; every accepted entry states what would close it.
 - `openspec/changes/add-cedar-pdp-v1/` — proposal, design, four capability specs, tasks.
 - `README.md` — operator-facing: quick start, nono profile wiring, rollout postures.
+
+## Upstream source — read it at `../nono`
+
+`nolabs-ai/nono` is cloned at `../nono` — a sibling of this checkout — as a **read-only
+reference**, so any claim about the upstream contract can be checked against source rather
+than recalled. If it is missing:
+`git clone https://github.com/nolabs-ai/nono.git ../nono`. It is not a fork, not a remote
+of this repo, and not a build input — ADR-001 keeps `nono` a dev-dependency, and
+`tests/conformance.rs` stays the mechanical drift guard.
+
+**It is checked out detached at `v0.69.0`, deliberately — do not switch it to `main` and
+read on.** Upstream tags releases on a release branch and had not merged v0.69.0 back:
+`v0.69.0` lives on `origin/release/v0.69.0` and is **not an ancestor of `main`** (v0.67.0
+and v0.68.0 are, so the pattern is easy to assume and wrong here). A default clone lands on
+`main`, which was 23 commits past v0.68.0 and a *different tree* from the one every fact in
+this repo was verified against. Reading `main` and calling it "the contract" is the failure
+mode this pin exists to prevent.
+
+| Where | What it settles |
+|---|---|
+| `crates/nono-cli/src/approval_runtime.rs` | the webhook **client** — `WebhookApproval`, the `WebhookApprovalRequest` wire shape, and the headers `just smoke` pins empirically |
+| `crates/nono/src/supervisor/types.rs` | `ApprovalRequest` / `ApprovalDecision` — the types `tests/conformance.rs` round-trips (re-exported at `nono::`) |
+| `crates/nono-proxy/src/reverse.rs` · `tls_intercept/handle.rs` | the only two places an `ApprovalRequest::Endpoint` is built — both hardcode `session_id: "proxy"` and `child_pid: 0`, which is *why* L7 has no session identity to key a policy on |
+
+On a version bump: `git -C ../nono fetch --tags && git -C ../nono checkout v<new>`, then
+re-read before touching `src/wire.rs`. If `just test` fails at `tests/conformance.rs` after
+a bump, that test is right and the assumption is stale — read the source here first.
