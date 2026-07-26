@@ -58,6 +58,25 @@ fn command_body(backend: &str, caller: &str, args: &[&str]) -> Vec<u8> {
     .into_bytes()
 }
 
+fn command_body_owned(backend: &str, caller: &str, args: &[String]) -> Vec<u8> {
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    command_body(backend, caller, &borrowed)
+}
+
+/// Upstream's argv → `args` conversion, in the shape it really has: entries that fail
+/// UTF-8 validation are **discarded**, not lossily converted. Verbatim from
+/// `filter_map(|a| std::str::from_utf8(a).ok().map(str::to_owned))` at
+/// `tool-sandbox/platform/{macos,linux}.rs` (nono 0.69.0, four call sites).
+///
+/// Modelled here rather than assumed so the tests that depend on the drop start from a
+/// real byte argv: an assertion written directly against the post-drop strings would be
+/// true by construction and would prove nothing.
+fn upstream_args(argv: &[&[u8]]) -> Vec<String> {
+    argv.iter()
+        .filter_map(|a| std::str::from_utf8(a).ok().map(str::to_owned))
+        .collect()
+}
+
 fn query(args: &[&str]) -> nono_cedar_pdp::query::PolicyQuery {
     nono_webhook::parse(&command_body("cedar", "session", args), &config()).unwrap()
 }
@@ -275,6 +294,110 @@ fn the_other_code_executing_git_flags_are_forbidden() {
             "{args:?} -> {decision:?}"
         );
     }
+}
+
+/// **This test asserts an `allow` that we would rather deny.** That is the point, and
+/// it is not a bug report — read this before "fixing" it.
+///
+/// Upstream builds `args` by *discarding* every argv entry that is not valid UTF-8
+/// instead of converting it (`filter_map(|a| std::str::from_utf8(a).ok()…)`, four call
+/// sites in `tool-sandbox/platform/{macos,linux}.rs` at 0.69.0). Reported privately as
+/// GHSA-p385-fvxh-xvgf. The entry is dropped *whole*, so whether a rule survives
+/// depends on one thing: does it match bytes that share an argv entry with the invalid
+/// bytes?
+///
+/// - `--exec-path=<bad>` is **one** entry, so the flag leaves with its value and the
+///   `argv_tail` glob has nothing to match. The anchored permit then approves, because
+///   the tail now reads as the bare subcommand.
+/// - `-c <bad>` is **two** entries, so the ASCII `-c` survives and exact membership
+///   still denies.
+///
+/// There is no decision-time mitigation — see
+/// `a_dropped_argv_entry_leaves_a_request_indistinguishable_from_a_legitimate_one`,
+/// which derives the collision from upstream's own conversion rather than asserting it.
+/// It closes upstream, by preserving arity — at which point the pre-drop argv is what we
+/// receive, and the deny asserted here first is what fires.
+///
+/// Recorded in `docs/audits/` as an accepted, not-ours-to-fix residual (#30).
+#[test]
+fn a_dropped_argv_entry_defeats_the_glob_forbid_but_not_the_membership_forbid() {
+    let bad = b"/tmp/evil\xff";
+
+    // Valid UTF-8 throughout: nothing is dropped, and the glob sees the flag.
+    let visible = upstream_args(&[SHIM_GIT.as_bytes(), b"--exec-path=/tmp/evil", b"status"]);
+    let decision = decide(&command_body_owned("cedar", "session", &visible));
+    assert!(!decision.allow, "{visible:?} -> {decision:?}");
+    assert!(
+        decision
+            .matched
+            .contains(&"10-git:no-code-executing-git-flags".to_string()),
+        "the glob forbid must deny while the flag is still observable: {decision:?}"
+    );
+
+    // The same invocation with a non-UTF-8 path. Flag and value share one argv entry,
+    // so upstream discards them together and nothing is left for the glob to match.
+    let mut joined = b"--exec-path=".to_vec();
+    joined.extend_from_slice(bad);
+    let dropped = upstream_args(&[SHIM_GIT.as_bytes(), &joined, b"status"]);
+    assert_eq!(
+        dropped,
+        vec![SHIM_GIT.to_string(), "status".to_string()],
+        "the flag must have left with its value, or this test is not exercising the drop"
+    );
+    let decision = decide(&command_body_owned("cedar", "session", &dropped));
+    assert!(
+        decision.allow,
+        "the fail-open this pins has closed — if upstream now preserves arity, update \
+         docs/audits/ and the README before changing this: {decision:?}"
+    );
+    assert_eq!(
+        decision.matched,
+        vec!["10-git:git-read-only".to_string()],
+        "{decision:?}"
+    );
+
+    // `-c` takes its value as a separate argv entry, so only the value is discarded and
+    // the ASCII flag survives for exact membership to match.
+    let dash_c = upstream_args(&[SHIM_GIT.as_bytes(), b"-c", bad, b"status"]);
+    assert_eq!(
+        dash_c,
+        vec![SHIM_GIT.to_string(), "-c".to_string(), "status".to_string()],
+        "only the value should have been discarded"
+    );
+    let decision = decide(&command_body_owned("cedar", "session", &dash_c));
+    assert!(!decision.allow, "{decision:?}");
+    assert!(
+        decision
+            .matched
+            .contains(&"10-git:no-code-executing-git-flags".to_string()),
+        "membership on a flag that is its own argv entry must survive the drop: \
+         {decision:?}"
+    );
+}
+
+/// Why the case above cannot be decided differently: after the drop there is nothing
+/// left to decide *on*. Running upstream's conversion over the hostile argv and over a
+/// plain `git status` yields the same `args`, so the two requests are the same bytes on
+/// the wire — and a decision function, being a function of its input, cannot return two
+/// answers for one input.
+#[test]
+fn a_dropped_argv_entry_leaves_a_request_indistinguishable_from_a_legitimate_one() {
+    let hostile = upstream_args(&[
+        SHIM_GIT.as_bytes(),
+        b"--exec-path=/tmp/evil\xff",
+        b"status",
+    ]);
+    let legitimate = upstream_args(&[SHIM_GIT.as_bytes(), b"status"]);
+    assert_eq!(
+        hostile, legitimate,
+        "upstream's conversion must collide these, or the premise of #30 is wrong"
+    );
+    assert_eq!(
+        command_body_owned("cedar", "session", &hostile),
+        command_body_owned("cedar", "session", &legitimate),
+        "if these ever differ, the wire gained something that survives the drop and a \
+         mitigation may exist — revisit docs/audits/ and #30"
+    );
 }
 
 #[test]
