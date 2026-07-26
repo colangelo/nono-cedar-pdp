@@ -169,16 +169,18 @@ async fn run_serve(config_path: &std::path::Path) -> Result<(), String> {
     // `at_risk` is decided here because this is the only place that has the
     // advisory warnings — `isolation::check` returns them and nothing deeper down
     // sees them.
+    let last_reload = Arc::new(arc_swap::ArcSwapOption::empty());
     let provenance = nono_cedar_pdp::watcher::Provenance {
         audit: Arc::clone(&audit),
         at_risk: !warnings.is_empty(),
+        last_reload: Arc::clone(&last_reload),
     };
     // The bootstrap load already happened above; record it now that there is
     // somewhere durable to record it. The checks still gate everything — a load
     // that fails at bootstrap exits with its error and writes nothing, because
     // creating an audit log as a side effect of refusing to serve would be worse
     // than the silence.
-    provenance.record_loaded(&engine.snapshot());
+    provenance.record_bootstrap(&engine.snapshot());
     // Bound to `_watcher`, not `_`: dropping it here would silently stop the
     // watch and every later policy edit would be ignored until a restart.
     let _watcher = nono_cedar_pdp::watcher::spawn(Arc::clone(&engine), provenance)
@@ -188,6 +190,7 @@ async fn run_serve(config_path: &std::path::Path) -> Result<(), String> {
         engine,
         config: Arc::new(config),
         audit,
+        last_reload,
     };
     server::serve(state, bind)
         .await

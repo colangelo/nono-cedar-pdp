@@ -133,9 +133,31 @@ Endpoints:
     --data @tests/fixtures/git-status.json
   ```
 
-- `GET /healthz` — `{"generation":1,"policies":5,"policy_dir":"/Users/you/.config/nono-cedar-pdp/policies"}`.
+- `GET /healthz` —
+  `{"generation":3,"policies":5,"loaded_at":"2026-07-26T18:47:58.792669Z","last_reload":{"outcome":"refused","at":"2026-07-26T19:02:11.401Z"}}`.
   `503` if no policies are loaded, so "PDP broken" is distinguishable from
   "policy said no".
+
+  `last_reload` is `null` until a reload has been attempted, and otherwise reports
+  `loaded`, `refused` (the pre-reload trust re-check refused) or `failed` (invalid
+  Cedar, an unreadable directory). **Alert on that field, not on the status code.** A
+  daemon whose last reload failed still answers `200`, because it is serving correctly
+  from its last-known-good set — that is the designed behaviour, and it is fail-closed.
+  Reporting unavailable would invite your supervisor to restart it, and the restart
+  re-runs the *startup* load against the same broken policy directory, fails and exits,
+  after which nono gets connection refused and denies everything. The cure would be far
+  worse than the disease, and it would fire exactly when you have just mistyped a policy
+  file.
+
+  **This endpoint deliberately reports no path and no reload-error text**, and that is
+  not an oversight to be helpfully corrected. It is unauthenticated, like everything on
+  the loopback listener, and your policy directory is the exact target of the
+  policy-rewrite escalation the isolation checks exist to close; a reload error names the
+  file it failed on, which gives away the same thing by another route. A basename or a
+  hash is not a middle ground — the set of plausible policy directory paths is small
+  enough to enumerate, so neither withholds anything from a local attacker while both
+  read as though they do. For the detail, read the audit log's `policy-set` lines or the
+  daemon's stdout; both sit behind file permissions.
 
 Policies live in `policy_dir/*.cedar`, loaded in filename order. A matched policy is
 reported as `<file stem>:<@id annotation or ordinal>`, which is what makes a deny

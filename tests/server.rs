@@ -8,7 +8,7 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use nono_cedar_pdp::{audit::AuditLog, cedar, config::Config, server};
+use nono_cedar_pdp::{audit::AuditLog, cedar, config::Config, server, watcher};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
@@ -52,7 +52,27 @@ fn state(dir: &tempfile::TempDir) -> server::AppState {
         engine: Arc::new(engine),
         audit: Arc::new(AuditLog::open(&config.audit_log).unwrap()),
         config: Arc::new(config),
+        last_reload: Arc::new(arc_swap::ArcSwapOption::empty()),
     }
+}
+
+/// `GET /healthz` on a state the caller has already shaped, so a test can set the
+/// last-reload cell before asking.
+async fn healthz_of(state: server::AppState) -> (StatusCode, serde_json::Value) {
+    let response = server::router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
 }
 
 async fn post(dir: &tempfile::TempDir, body: &str) -> (StatusCode, serde_json::Value) {
@@ -1892,4 +1912,111 @@ async fn control_bytes_in_the_refused_headers_are_escaped_in_the_log() {
         audit_lines(&dir).is_empty(),
         "a refusal must not be audited"
     );
+}
+
+/// #7. `/healthz` is unauthenticated, and the absolute policy directory it used to
+/// report is precisely the target of the policy-rewrite escalation the isolation
+/// checks exist to close. Asserted on a daemon whose reload was **refused**, because
+/// that is the state in which an error string — which names the file it failed on —
+/// would leak the same thing back through the new field.
+#[tokio::test]
+async fn healthz_names_no_path_and_no_reload_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(&dir);
+    st.last_reload.store(Some(Arc::new(watcher::LastReload {
+        outcome: "refused",
+        at: "2026-07-26T19:00:00Z".to_string(),
+    })));
+    let policy_dir = dir.path().display().to_string();
+    let (status, json) = healthz_of(st).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let body = json.to_string();
+    assert!(
+        !body.contains(&policy_dir),
+        "the policy directory must not be disclosed by an unauthenticated \
+         endpoint: {body}"
+    );
+    assert!(
+        !body.contains(".cedar"),
+        "no policy file path may appear either: {body}"
+    );
+    assert!(
+        json.get("policy_dir").is_none(),
+        "the field must be gone, not merely empty: {body}"
+    );
+}
+
+/// Design §7 promised operators "generation + load time". `loaded_at` has been
+/// written on every load since the engine was built; this is the first thing that
+/// ever read it.
+#[tokio::test]
+async fn healthz_reports_when_the_active_set_was_loaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_status, json) = healthz_of(state(&dir)).await;
+    let loaded_at = json["loaded_at"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no loaded_at: {json}"));
+    assert!(
+        loaded_at.contains('T') && loaded_at.ends_with('Z'),
+        "want RFC 3339 UTC: {loaded_at}"
+    );
+}
+
+#[tokio::test]
+async fn healthz_reports_no_reload_before_one_has_been_attempted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_status, json) = healthz_of(state(&dir)).await;
+    assert!(
+        json["last_reload"].is_null(),
+        "a synthesised record of the bootstrap load would make \"has anything \
+         happened since startup\" unanswerable: {json}"
+    );
+}
+
+/// The monitoring gap this change exists to close: a refused or failed reload keeps
+/// the last-known-good set deciding — correct, and fail-closed — while the
+/// generation and count look exactly like a healthy daemon.
+#[tokio::test]
+async fn healthz_reports_a_refused_reload_while_the_last_good_set_keeps_deciding() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(&dir);
+    st.last_reload.store(Some(Arc::new(watcher::LastReload {
+        outcome: "refused",
+        at: "2026-07-26T19:00:00Z".to_string(),
+    })));
+    let (status, json) = healthz_of(st).await;
+
+    assert_eq!(json["last_reload"]["outcome"], "refused", "{json}");
+    assert_eq!(json["last_reload"]["at"], "2026-07-26T19:00:00Z");
+    assert_eq!(
+        json["generation"], 1,
+        "the generation must still describe the set that is deciding: {json}"
+    );
+    assert_eq!(json["policies"], 2, "{json}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a daemon serving its last-known-good set is healthy"
+    );
+}
+
+/// Kept as its own test because it is the thing a future reader is most likely to
+/// "fix" the wrong way. A failed reload must NOT make this 503: that invites an
+/// orchestrator to restart the daemon, the restart re-runs the bootstrap load
+/// against the same broken directory, startup fails and the process exits — and
+/// nono then gets connection refused and fails closed on every action. The remedy
+/// would be far worse than the condition, and it would fire exactly when an
+/// operator has just mistyped a policy file.
+#[tokio::test]
+async fn a_failed_reload_does_not_make_the_daemon_report_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(&dir);
+    st.last_reload.store(Some(Arc::new(watcher::LastReload {
+        outcome: "failed",
+        at: "2026-07-26T19:00:00Z".to_string(),
+    })));
+    let (status, json) = healthz_of(st).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["last_reload"]["outcome"], "failed");
 }

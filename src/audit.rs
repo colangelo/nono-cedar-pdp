@@ -129,6 +129,18 @@ pub enum PolicySetOutcome<'a> {
     Failed { reason: String },
 }
 
+impl PolicySetOutcome<'_> {
+    /// The wire name, shared by the audit record and the health surface so the two
+    /// cannot drift into describing the same event differently.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Loaded { .. } => "loaded",
+            Self::Refused { .. } => "refused",
+            Self::Failed { .. } => "failed",
+        }
+    }
+}
+
 /// Where audit lines go. A trait so the partial-write recovery path can be
 /// tested without an out-of-space filesystem; [`LogFile`] is the only production
 /// impl.
@@ -449,7 +461,7 @@ impl AuditLog {
                 content_hash,
                 files,
             } => (
-                "loaded",
+                outcome.name(),
                 Some(*content_hash),
                 Some(
                     files
@@ -460,13 +472,13 @@ impl AuditLog {
                 None,
             ),
             PolicySetOutcome::Refused { reason } => (
-                "refused",
+                outcome.name(),
                 None,
                 None,
                 Some(crate::sanitize::control_escape(reason)),
             ),
             PolicySetOutcome::Failed { reason } => (
-                "failed",
+                outcome.name(),
                 None,
                 None,
                 Some(crate::sanitize::control_escape(reason)),
@@ -600,7 +612,7 @@ fn tighten_permissions(path: &Path, file: &File) {
     }
 }
 
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "unknown".to_string())
@@ -1167,6 +1179,7 @@ mod tests {
         // Zero bytes of space: every record fails, and there is nothing to roll back.
         let full = FullDisk::with_budget(0);
         let state = crate::server::AppState {
+            last_reload: Arc::new(arc_swap::ArcSwapOption::empty()),
             engine: Arc::new(engine),
             config: Arc::new(config),
             audit: Arc::new(AuditLog::with_sink(Box::new(full.clone()), false)),

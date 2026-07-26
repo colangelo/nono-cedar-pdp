@@ -78,21 +78,67 @@ const DEBOUNCE_CEILING: Duration = Duration::from_secs(2);
 pub struct Provenance {
     pub audit: Arc<crate::audit::AuditLog>,
     pub at_risk: bool,
+    /// The most recent reload attempt, for the health surface. `None` until one has
+    /// been attempted — the bootstrap load is described by the generation and load
+    /// time `/healthz` already reports, and synthesising a reload record for it
+    /// would make "has anything happened since startup" unanswerable.
+    pub last_reload: Arc<arc_swap::ArcSwapOption<LastReload>>,
+}
+
+/// What happened to the policy set most recently, as `/healthz` reports it.
+///
+/// No reason text and no path, deliberately. `/healthz` is unauthenticated, and a
+/// reload error names the file it failed on — carrying it here would re-introduce
+/// the absolute-path disclosure that removing `policy_dir` exists to close. The
+/// outcome says *that* something was refused; the audit trail's `policy-set` record
+/// and stdout say *what*, and both sit behind filesystem permissions.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LastReload {
+    /// `"loaded"`, `"refused"` or `"failed"`.
+    pub outcome: &'static str,
+    /// RFC 3339 UTC.
+    pub at: String,
 }
 
 impl Provenance {
-    /// Record what a load attempt did. Kept here rather than on `AuditLog` so the
-    /// `at_risk` flag has exactly one owner.
+    /// Record what a load attempt did, to **both** surfaces that report it.
+    ///
+    /// One call updating the trail and the health status is the point rather than a
+    /// convenience: there is no code path that writes one without the other, so
+    /// `/healthz` and the audit record cannot disagree about the last reload. Two
+    /// independent updates would be two things to keep in step, and the failure —
+    /// monitoring saying "loaded" while the trail says "refused" — would be silent
+    /// and would discredit both.
     pub fn record(&self, generation: u64, outcome: &crate::audit::PolicySetOutcome<'_>) {
         self.audit
             .record_policy_set(generation, self.at_risk, outcome);
+        self.last_reload.store(Some(Arc::new(LastReload {
+            outcome: outcome.name(),
+            at: crate::audit::now_rfc3339(),
+        })));
     }
 
-    /// Record an adopted set from the engine's own snapshot, which is the only
+    /// Record an adopted **reload** from the engine's own snapshot, which is the only
     /// place the hash and the file list are guaranteed to belong to the same load.
     pub fn record_loaded(&self, loaded: &crate::cedar::engine::LoadedPolicies) {
         self.record(
             loaded.generation,
+            &crate::audit::PolicySetOutcome::Loaded {
+                content_hash: &loaded.content_hash,
+                files: &loaded.files,
+            },
+        );
+    }
+
+    /// Record the **bootstrap** load: the trail only, never the reload status.
+    ///
+    /// `/healthz` already describes this load with `generation` and `loaded_at`.
+    /// Recording it as a reload as well would leave no way to ask "has anything
+    /// happened since startup", which is the question the field exists to answer.
+    pub fn record_bootstrap(&self, loaded: &crate::cedar::engine::LoadedPolicies) {
+        self.audit.record_policy_set(
+            loaded.generation,
+            self.at_risk,
             &crate::audit::PolicySetOutcome::Loaded {
                 content_hash: &loaded.content_hash,
                 files: &loaded.files,
@@ -297,6 +343,7 @@ mod tests {
             Provenance {
                 audit,
                 at_risk: false,
+                last_reload: Arc::new(arc_swap::ArcSwapOption::empty()),
             },
             dir,
             path,
@@ -856,6 +903,49 @@ mod tests {
         assert_eq!(
             last["generation"], 1,
             "the generation recorded is the one still deciding"
+        );
+    }
+
+    /// The link between the two halves of #7: the watcher's refusal has to reach the
+    /// health surface, not just the trail. Both ends are tested elsewhere — the
+    /// `policy-set` line here, the `/healthz` body in `tests/server.rs` — and without
+    /// this the *connection* between them is the untested part.
+    ///
+    /// It also pins the property that makes them trustworthy: one recording call
+    /// updates both, so monitoring cannot report "loaded" while the trail says
+    /// "refused".
+    #[test]
+    fn a_refusal_reaches_the_health_surface_and_agrees_with_the_trail() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = dir.path().join("p.cedar");
+        std::fs::write(&policy, POLICY).unwrap();
+        let schema = crate::cedar::schema::load().unwrap();
+        let engine = Arc::new(
+            crate::cedar::engine::Engine::bootstrap(schema, dir.path().to_path_buf()).unwrap(),
+        );
+        let (prov, _audit_dir, audit_path) = provenance();
+        let status = Arc::clone(&prov.last_reload);
+        assert!(
+            status.load().is_none(),
+            "nothing has been reloaded yet, so the health surface must say so"
+        );
+        let _watcher = spawn(Arc::clone(&engine), prov).unwrap();
+
+        chmod(dir.path(), 0o770);
+        std::fs::write(&policy, r#"forbid (principal, action, resource);"#).unwrap();
+
+        assert!(
+            within(Duration::from_secs(10), || status.load().is_some()),
+            "the refusal never reached the health surface"
+        );
+        let reported = status.load().as_ref().unwrap().outcome;
+        assert_eq!(reported, "refused");
+
+        let trail = policy_set_lines(&audit_path);
+        assert_eq!(
+            trail.last().unwrap()["outcome"], reported,
+            "the health surface and the trail must never disagree about the last \
+             reload: one call writes both"
         );
     }
 }

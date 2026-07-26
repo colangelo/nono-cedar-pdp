@@ -88,6 +88,11 @@ pub struct AppState {
     pub engine: Arc<Engine>,
     pub config: Arc<Config>,
     pub audit: Arc<AuditLog>,
+    /// The most recent reload attempt, written by the watcher through
+    /// `watcher::Provenance` — the same call that writes the audit record, so the
+    /// health surface and the trail cannot disagree about it. `None` until a reload
+    /// has been attempted.
+    pub last_reload: Arc<arc_swap::ArcSwapOption<crate::watcher::LastReload>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -318,13 +323,36 @@ async fn approve(State(state): State<AppState>, headers: HeaderMap, body: Body) 
     (StatusCode::OK, Json(decision.to_wire())).into_response()
 }
 
+/// The health surface: "is this daemon serving what you think it is".
+///
+/// **No path, and no reload-error text.** This endpoint is unauthenticated like
+/// everything on the loopback listener, and the absolute policy directory is
+/// precisely the target of the policy-rewrite escalation the isolation checks exist
+/// to close — it used to be reported here. A reload error names the file it failed
+/// on, so carrying one would give the same thing away by another route; the outcome
+/// says *that* a reload was refused and the audit trail's `policy-set` record says
+/// *what*, from behind filesystem permissions. Reducing the path to a basename or a
+/// hash is not a fix: the set of real policy directory paths is small and
+/// enumerable, so neither withholds it from a local attacker while both read as
+/// though they do.
+///
+/// **A failed reload does not make this 503.** Such a daemon is healthy: it answers
+/// correctly from the last-known-good set, which is the designed behaviour. 503
+/// invites an orchestrator to restart it, and a restart re-runs the *bootstrap* load
+/// against the same broken directory, fails startup and exits — after which nono
+/// gets connection refused and fails closed on everything. The remedy would be far
+/// worse than the condition, and would fire exactly when an operator has mistyped a
+/// policy file. Monitoring keys on `last_reload.outcome`, not on the status code.
+/// Zero policies stays 503 because that daemon really is not serving: it denies
+/// everything.
 async fn healthz(State(state): State<AppState>) -> Response {
     let snapshot = state.engine.snapshot();
     let count = snapshot.set.num_of_policies();
     let body = serde_json::json!({
         "generation": snapshot.generation,
         "policies": count,
-        "policy_dir": state.engine.policy_dir().display().to_string(),
+        "loaded_at": rfc3339(snapshot.loaded_at),
+        "last_reload": state.last_reload.load().as_deref(),
     });
     let status = if count == 0 {
         StatusCode::SERVICE_UNAVAILABLE
@@ -332,6 +360,15 @@ async fn healthz(State(state): State<AppState>) -> Response {
         StatusCode::OK
     };
     (status, Json(body)).into_response()
+}
+
+/// A `SystemTime` as RFC 3339 UTC, or `null` for a clock before the epoch — which
+/// is not a reason to fail a health check.
+fn rfc3339(t: std::time::SystemTime) -> Option<String> {
+    let unix = t.duration_since(std::time::UNIX_EPOCH).ok()?;
+    let odt = time::OffsetDateTime::from_unix_timestamp_nanos(unix.as_nanos() as i128).ok()?;
+    odt.format(&time::format_description::well_known::Rfc3339)
+        .ok()
 }
 
 pub async fn serve(state: AppState, bind: SocketAddr) -> std::io::Result<()> {
@@ -375,6 +412,7 @@ mod tests {
             empty,
         );
         AppState {
+            last_reload: Arc::new(arc_swap::ArcSwapOption::empty()),
             engine: Arc::new(engine),
             audit: Arc::new(AuditLog::open(&config.audit_log).unwrap()),
             config: Arc::new(config),
