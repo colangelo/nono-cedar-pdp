@@ -1566,6 +1566,16 @@ fn an_unparseable_tls_certificate_refuses_to_serve_without_binding() {
         !ok,
         "a daemon that cannot serve TLS must not serve: {output}"
     );
+    // The *branch*, not merely "some [tls] refusal happened". Every refusal on
+    // this path — the key check, the load's other arms, the startup self-test —
+    // says `[tls]` and names a file under `dir`, so an assertion that stops there
+    // is satisfied by any of them and the fixture's control can be deleted
+    // without the test noticing. Sibling reasoning in the two tests below.
+    assert!(
+        output.contains("cannot parse the certificate"),
+        "the refusal must be the certificate's *parse* failure — the branch this \
+         fixture's header-only PEM exists to reach: {output}"
+    );
     assert!(
         output.contains("[tls]"),
         "the refusal must send the operator to the configuration that caused it: {output}"
@@ -1587,6 +1597,15 @@ fn an_unparseable_tls_certificate_refuses_to_serve_without_binding() {
     drop(occupied);
 }
 
+/// The **read** arm of the load, pinned by its own message.
+///
+/// The fixture is the untrusted openssl pair, so this test needs no local CA and
+/// runs everywhere — but that means the startup self-test is standing right
+/// behind it, ready to refuse the same daemon for an unrelated reason with a
+/// message that also says `[tls]` and also names this certificate. Asserting
+/// only those two leaves a test that passes with the `chmod 000` deleted *and*
+/// with the read arm itself deleted, which is what it did before this line
+/// existed. The branch text is the whole control.
 #[test]
 fn an_unreadable_tls_certificate_refuses_to_serve_without_binding() {
     use std::os::unix::fs::PermissionsExt;
@@ -1610,6 +1629,13 @@ fn an_unreadable_tls_certificate_refuses_to_serve_without_binding() {
         "a daemon that cannot read its certificate must not serve: {output}"
     );
     assert!(
+        output.contains("cannot read the certificate"),
+        "the refusal must be the certificate's *read* failure. Any other [tls] \
+         refusal — the self-test's above all — also says `[tls]` and also names \
+         this file, so without this line the fixture's chmod could be deleted and \
+         the test would still pass: {output}"
+    );
+    assert!(
         output.contains("[tls]") && output.contains(&cert.display().to_string()),
         "the refusal must name the configuration and the file: {output}"
     );
@@ -1621,13 +1647,24 @@ fn an_unreadable_tls_certificate_refuses_to_serve_without_binding() {
     drop(occupied);
 }
 
+/// The case `src/server.rs` singles out as worth its own test: a key that belongs
+/// to a different certificate loads far enough to look correct and fails at
+/// *handshake* time — on every approval and never at startup — unless
+/// `with_single_cert` refuses it here.
+///
+/// So the mismatch's own message is the assertion. The fixture is the untrusted
+/// openssl pair (no local CA needed, runs everywhere), which means the startup
+/// self-test would refuse this daemon anyway: `!ok`, `[tls]`, no
+/// `address already in use` and no `listening` are all satisfied by that
+/// unrelated refusal, and were — the pair could be made to *match* and the test
+/// stayed green.
 #[test]
 fn a_mismatched_tls_pair_refuses_to_serve_without_binding() {
     let dir = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = occupied.local_addr().unwrap();
-    let (cert, _key) = untrusted_pair(dir.path());
+    let (cert, _unused) = untrusted_pair(dir.path());
     let (_other_cert, other_key) = untrusted_pair(other.path());
 
     let (ok, output) = serve_from(
@@ -1645,6 +1682,17 @@ fn a_mismatched_tls_pair_refuses_to_serve_without_binding() {
          every approval and never at startup — unless startup refuses it: {output}"
     );
     assert!(
+        output.contains("do not belong together"),
+        "the refusal must be the *mismatch*, not whatever else would have refused \
+         this daemon: {output}"
+    );
+    assert!(
+        output.contains(&cert.display().to_string())
+            && output.contains(&other_key.display().to_string()),
+        "and it must name both halves — the operator has two files and no way to \
+         tell which one is wrong otherwise: {output}"
+    );
+    assert!(
         output.contains("[tls]"),
         "the refusal must send the operator to the configuration: {output}"
     );
@@ -1653,6 +1701,82 @@ fn a_mismatched_tls_pair_refuses_to_serve_without_binding() {
         "the daemon reached the bind behind a mismatched pair: {output}"
     );
     assert!(!output.contains("listening"), "{output}");
+    drop(occupied);
+}
+
+/// The **key** half of the load, which the three cases above never reach: they
+/// all fail on the certificate or on the pairing, so every arm that reads and
+/// parses `tls.key` was uncovered — and an uncovered arm that returned `Ok` on a
+/// key it could not use would fall through to a listener, which is the silent
+/// downgrade T2 forbids.
+///
+/// All three arms are exercised because the operator-visible answers differ and
+/// the distinction is the whole value of the message: a file with no PEM section
+/// at all is "you pointed `key` at the wrong file", a truncated one is "this file
+/// is damaged", an unopenable one is neither. The certificate is the valid
+/// untrusted fixture, so no local CA is needed — and each assertion names its own
+/// arm, so the startup self-test standing behind it cannot satisfy any of them.
+///
+/// Mode `0000` reaches the read arm rather than the key-protection refusal, and
+/// that is not a gap in either: `refuse_a_readable_private_key` asks who *besides
+/// the owner* can reach the key (OpenSSH's `0o077` mask), and nobody can reach a
+/// `0000` file, so it passes honestly and the load is the next thing to fail.
+#[test]
+fn a_private_key_the_daemon_cannot_load_refuses_to_serve_without_binding() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = occupied.local_addr().unwrap();
+    let (cert, key) = untrusted_pair(dir.path());
+
+    for (content, mode, expected) in [
+        ("not a PEM file at all\n", 0o600, "holds no PRIVATE KEY block"),
+        // A section that opens and never closes: `rustls_pemfile` reports it as a
+        // parse failure rather than as an absent block.
+        (
+            "-----BEGIN PRIVATE KEY-----\n",
+            0o600,
+            "cannot parse the private key",
+        ),
+        // Last, because nothing can be written to it afterwards.
+        (
+            "-----BEGIN PRIVATE KEY-----\n",
+            0o000,
+            "cannot read the private key",
+        ),
+    ] {
+        // Rewritten in place, then re-moded: the key check demands owner-only.
+        std::fs::write(&key, content).unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(mode)).unwrap();
+
+        let (ok, output) = serve_from(
+            dir.path(),
+            &format!(
+                "policy_dir = \"{POLICY_DIR}\"\naudit_log = \"{}\"\nbind = \"{addr}\"\n{}",
+                dir.path().join("decisions.jsonl").display(),
+                tls_block_for(&cert, &key)
+            ),
+            None,
+        );
+        assert!(
+            !ok,
+            "a daemon that cannot load its private key must not serve: {output}"
+        );
+        assert!(
+            output.contains(expected),
+            "the refusal must be the private key's own {expected:?} arm, not some \
+             other [tls] refusal that happens to name the same table: {output}"
+        );
+        assert!(
+            output.contains("[tls]") && output.contains(&key.display().to_string()),
+            "the refusal must name the configuration and the file: {output}"
+        );
+        assert!(
+            !output.to_lowercase().contains("address already in use"),
+            "the daemon reached the bind behind an unusable private key: {output}"
+        );
+        assert!(!output.contains("listening"), "{output}");
+    }
     drop(occupied);
 }
 
@@ -1838,10 +1962,19 @@ fn a_certificate_that_does_not_cover_the_bind_address_refuses_to_serve() {
          {addr} — nono would reject the handshake, so the daemon must not \
          start: {output}"
     );
+    // The address has to be read out of the *self-test's own sentence*, not out
+    // of the output anywhere. `main` wraps every `serve` error as
+    // "serving on {bind}: …", so a bare `contains(addr.ip())` is satisfied by
+    // that wrapper no matter what the refusal itself says — measured by dropping
+    // `{ip}` from the message in `src/server.rs`, which left this test green.
     assert!(
-        output.contains("[tls]") && output.contains(&addr.ip().to_string()),
-        "the refusal must name the address the certificate failed to cover, or the \
-         operator reads it as a broken CA: {output}"
+        output.contains(&format!("refused for {}", addr.ip())),
+        "the refusal must itself name the address the certificate failed to cover, \
+         or the operator reads it as a broken CA: {output}"
+    );
+    assert!(
+        output.contains("[tls]"),
+        "and send them to the configuration: {output}"
     );
     assert!(
         !output.to_lowercase().contains("address already in use"),
