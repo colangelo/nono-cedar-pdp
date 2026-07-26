@@ -75,6 +75,8 @@ cargo run -- check tests/fixtures/git-status.json      # evaluate one saved payl
 just serve                 # run the daemon (release build, foreground)
 just serve-dev             # same, but with the repo-relative dev config (warns loudly)
 just smoke                 # end-to-end: a real `nono run` decided by Cedar
+just mint-cert             # optional: the TLS pair for https on loopback
+just smoke-tls             # end-to-end: a real `nono run` blocked when a squatter answers
 ```
 
 `nono-cedar-pdp.toml`:
@@ -87,6 +89,10 @@ audit_log = "~/.local/state/nono-cedar-pdp/decisions.jsonl"   # created 0600, pa
 [agents]                         # nono approval-backend name -> Cedar Agent
 cedar = "claude-code"
 ```
+
+An optional `[tls]` table turns the listener into https — see
+[Serving https on loopback](#serving-https-on-loopback). Absent, the daemon serves
+plaintext exactly as it always has, and says so in one startup WARN.
 
 A backend name absent from `[agents]` always resolves to the fixed identity
 `unknown`, which the shipped baseline pack denies explicitly
@@ -363,6 +369,166 @@ already composes backends better than a flag could:
 | Endgame | `cedar` | Cedar alone decides. Unattended runs work; a policy gap is a hard deny. |
 | Paranoid | `cedar-and-ask` | `chain` / `mode: "all"` over `["cedar", "terminal"]` — Cedar **and** a human must allow. |
 
+## Serving https on loopback
+
+Optional, off by default, and the only thing that makes a port squatter's answer
+useless to nono: nono's webhook client verifies the server certificate against the
+**platform** trust store, so a process that cannot read the private key cannot be
+believed, even when it wins the race for the port. What this does **not** buy is
+[further down](#what-tls-does-not-buy) and deserves more of your attention than what
+it does.
+
+```bash
+brew install mkcert && mkcert -install   # once per machine; the second needs an admin password
+just mint-cert                           # ~/.config/nono-cedar-pdp/tls/{cert,key}.pem
+```
+
+Then the block in `nono-cedar-pdp.toml`:
+
+```toml
+[tls]                                             # absent ⇒ plaintext, exactly as before
+cert = "~/.config/nono-cedar-pdp/tls/cert.pem"    # the leaf, plus any intermediates
+key  = "~/.config/nono-cedar-pdp/tls/key.pem"     # 0600, and outside every read grant
+```
+
+and the scheme in the nono profile's approval backend:
+
+```json
+"url": "https://127.0.0.1:8181/v1/approve"
+```
+
+Both keys are required together: a `[tls]` naming only one of them is a load error,
+not a partial application. And everything that can go wrong with the pair is a
+**refusal to start**, never a quiet fall back to plaintext — unreadable, unparseable
+or mismatched files, a key other local users can read, or a certificate the platform
+verifier does not accept for the address in `bind`. An operator who believes the
+transport is authenticated when it is not is worse off than one who never configured
+it, because the belief is what the deployment was built on.
+
+That last check runs **before the listener binds**, through the same crate nono's
+client uses. So "will nono accept this certificate?" is answered at startup by the
+code that decides it rather than by a runbook, and a daemon nobody could believe
+never accepts a connection at all. It also catches what no minting procedure can: an
+expired leaf, a CA removed from the trust store since, a `bind` moved to an address
+the certificate does not cover.
+
+### The URL names the literal address, never `localhost`
+
+`https://127.0.0.1:8181/v1/approve` for the default `bind`. The minted certificate
+covers `localhost`, `127.0.0.1` and `::1` together, so the hostname *works* — which
+is exactly why this has to be said out loud.
+
+On macOS `localhost` resolves `::1` before `127.0.0.1`. A daemon bound to
+`127.0.0.1:8181` and a squatter bound to `[::1]:8181` therefore both start cleanly,
+neither logs anything unusual, and every `https://localhost:8181` request reaches
+the squatter. TLS still saves the outcome — the squatter has no key, so nono's
+handshake fails and the command is blocked — but a URL whose listener is picked by
+resolver order makes "which process am I talking to" unanswerable from the
+configuration, which is a poor property in the one artifact whose whole purpose is
+knowing who answered.
+
+The daemon cannot enforce this; it never sees nono's URL. What it can do is refuse
+to serve a certificate that does not cover the address it binds, and it does.
+
+### Why `mkcert -install`, and why a certificate in a keychain is not the same thing
+
+`mkcert -install` puts a local CA into the system trust store as a **user-added
+trust anchor**. That status is what makes locally-minted certificates work at all: a
+chain to a user-added anchor is exempt from the Certificate Transparency requirement
+macOS applies to publicly-issued certificates, and from the 398-day validity cap
+(the minted leaf runs about 27 months). A self-signed leaf dropped into a keychain
+**is not a substitute** — it is not an anchor, so the CT policy still applies and
+the verifier still refuses it. That is also why this daemon never generates a
+certificate on first run: it would start happily and then fail every approval closed
+for a reason nobody could see.
+
+**Do not check any of this with `security verify-cert`.** Measured 2026-07-26: it
+reports a Certificate Transparency failure for an mkcert leaf *with the mkcert CA
+installed in the System keychain*, and reports the identical error for a name the
+certificate does not carry at all — so it never reaches name matching, and answers
+uniformly wrong in a way that reads as authoritative. The CLI applies a CT policy
+the library path does not. The daemon's own startup self-test is the check.
+
+### Without mkcert: an `openssl` fallback
+
+The same shape with more steps — a local CA, a leaf signed by it, and the CA
+installed as an anchor. A bare self-signed leaf is not a shortcut, for the reason
+just above.
+
+```bash
+TLS_DIR="${TLS_DIR:-$HOME/.config/nono-cedar-pdp/tls}"
+mkdir -p "$TLS_DIR" && chmod 700 "$TLS_DIR" && cd "$TLS_DIR"
+
+# 1. The local CA. This is what gets installed, and what a bare leaf can never be.
+openssl req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 \
+  -keyout ca-key.pem -out ca.pem -subj "/CN=nono-cedar-pdp local CA" \
+  -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
+
+# 2. The leaf. Both extensions are load-bearing: without serverAuth the verifier
+#    refuses it outright, and an address missing from the SANs is refused for that
+#    address (NotValidForName) — which you find out at the next startup, after the
+#    admin-password step below.
+openssl req -newkey rsa:2048 -nodes -keyout key.pem -out leaf.csr \
+  -subj "/CN=nono-cedar-pdp"
+openssl x509 -req -in leaf.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial \
+  -days 825 -sha256 -out cert.pem -extfile <(printf '%s\n' \
+    "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1" \
+    "extendedKeyUsage=serverAuth" \
+    "basicConstraints=critical,CA:FALSE")
+
+chmod 600 key.pem ca-key.pem && chmod 644 cert.pem ca.pem
+```
+
+Then the step that needs an administrator — the one `mkcert -install` does for you:
+
+```bash
+sudo security add-trusted-cert -d -r trustRoot \
+  -k /Library/Keychains/System.keychain "$TLS_DIR/ca.pem"
+```
+
+`cert.pem` and `key.pem` are what the `[tls]` block names. `ca-key.pem` signs future
+leaves and belongs nowhere near the daemon: anyone holding it can mint a certificate
+this machine trusts for any name at all.
+
+### What TLS does not buy
+
+Written in the voice of the [accepted-risk register](docs/audits/), and for its
+reason: a control that gets remembered by its headline is a control whose
+preconditions get dropped.
+
+- **Nothing against same-uid code that can read the private key.** Such a process
+  completes a valid handshake and *is* this daemon, perfectly. Seatbelt and Landlock
+  are path-based and do not change uid, so the sandboxed agent runs as the same user
+  we do; what keeps the key away from it is the key's **location** relative to the
+  read grants in your profile — the identical argument to the one for the policy
+  directory, failing in the identical way if a profile grants read on the tree the
+  key sits in. The key's mode, ownership and ancestor refusals defend against
+  **other local users** only, like every other permission check here.
+- **Nothing about nono's identity.** The webhook is unauthenticated in *both*
+  directions and this closes one of them. nono still presents no credential, so a
+  local process can still POST a decision request and forge an audit record here —
+  see [what the header checks do and do not
+  buy](#what-the-header-checks-do-and-do-not-buy). That direction needs an upstream
+  change.
+- **Not availability — that is traded away on purpose.** A squatter that takes the
+  port first still denies service: this daemon fails to bind and exits loudly, or
+  nono's handshake fails and every intercepted action is blocked. A fail-closed
+  daemon prefers an outage to a silent bypass, which makes that the right direction,
+  but it is a real cost rather than a free win.
+- **No record of its own when a squatter is caught.** nono sees a *transport* error
+  — `Sandbox initialization failed: approval webhook 'cedar' failed: …`, and the
+  command exits 126 — not a denial carrying one of our reasons, because we were
+  never asked. Nothing lands in this daemon's audit log either. Both outcomes are
+  closed; they simply read differently, and whoever reads nono's audit after a squat
+  will find a sandbox error rather than a policy decision.
+
+`just smoke-tls` is the end-to-end proof of the paragraph above: it holds the port
+with a certificate whose key it does not have, runs a real intercepted command under
+`nono run`, and asserts the command was blocked by the transport path rather than by
+a policy. It **skips loudly** when no local CA is installed, because a skip that
+reads like a pass has stopped being a verification.
+
 ## Schema caveats you must know before writing policies
 
 The schema is [`nono.cedarschema`](nono.cedarschema) — the load-bearing design
@@ -588,18 +754,22 @@ above).
 ## Security posture
 
 The webhook is **unauthenticated in both directions**. nono sends no credential, so
-the PDP cannot authenticate the caller; the PDP presents no credential, so nono cannot
-authenticate the decider. Any local process that binds `127.0.0.1:8181` before the
-daemon does can answer `allow` to everything. Two consequences:
+the PDP cannot authenticate the caller; over plaintext the PDP presents no credential
+either, so nono cannot authenticate the decider, and any local process that binds
+`127.0.0.1:8181` before the daemon does can answer `allow` to everything. Two
+consequences:
 
 - A non-loopback `bind` is a hard config error, not a warning. Being unreachable from
-  other hosts is the only access control this daemon has.
-- The first follow-up is **https on loopback with a locally-trusted certificate**: a
-  port squatter without the key fails TLS, which nono treats as a transport error and
-  therefore denies. Upstream ask: bearer-token or Unix-socket support in the webhook
-  backend config.
+  other hosts is the only access control this daemon has by default.
+- **https on loopback with a locally-trusted certificate** closes the outbound half,
+  and ships: a port squatter without the key fails TLS, which nono treats as a
+  transport error and therefore blocks. It is opt-in — see [Serving https on
+  loopback](#serving-https-on-loopback), and read [what TLS does not
+  buy](#what-tls-does-not-buy) before relying on it. The inbound half — verifying
+  that the caller really is nono — is still the upstream ask: bearer-token or
+  Unix-socket support in the webhook backend config.
 
-Until then, treat the port as part of the trusted local surface, and remember that the
+Over plaintext, treat the port as part of the trusted local surface. Either way the
 audit log is the record of what was actually decided — `matched` names the policy, so a
 suspicious allow is traceable. That role is why the log is kept `0600`, why the daemon
 notices a rotation instead of writing into a detached inode, and why its path belongs
@@ -641,6 +811,8 @@ which is the worse failure for a fail-closed daemon.
 ## Docs
 
 - **Design spec:** [`docs/superpowers/specs/2026-07-25-nono-cedar-pdp-design.md`](docs/superpowers/specs/2026-07-25-nono-cedar-pdp-design.md)
+- **https on loopback (decisions T1–T11):** [`docs/superpowers/specs/2026-07-26-https-on-loopback-design.md`](docs/superpowers/specs/2026-07-26-https-on-loopback-design.md)
+  — including the measured IP-SAN result and what the control does not close
 - **Implementation plan:** [`docs/superpowers/plans/2026-07-25-nono-cedar-pdp-v1.md`](docs/superpowers/plans/2026-07-25-nono-cedar-pdp-v1.md)
 - **ADR-001 — Rust + embedded `cedar-policy`:** [`docs/adr/ADR-001-rust-and-cedar-crate.md`](docs/adr/ADR-001-rust-and-cedar-crate.md)
 - **Research:** [`docs/research/00-groundwork.md`](docs/research/00-groundwork.md) — groundwork

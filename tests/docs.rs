@@ -340,6 +340,67 @@ fn the_documented_caveats_and_risks_are_still_in_the_readme() {
             "the ownership rule",
             "owned by neither the daemon's user nor root",
         ),
+        // The https-on-loopback operator path: the block to write, and the two
+        // things about it a reader will otherwise get wrong.
+        (
+            "the [tls] block, with the home-anchored default paths",
+            "cert = \"~/.config/nono-cedar-pdp/tls/cert.pem\"",
+        ),
+        (
+            "the URL names the literal bind address, never a hostname (T5)",
+            "names the literal address",
+        ),
+        (
+            "why `localhost` is not that address — the resolver picks the listener",
+            "resolves `::1` before `127.0.0.1`",
+        ),
+        (
+            "and what that costs: every localhost request reaches the squatter",
+            "reaches the squatter",
+        ),
+        (
+            "a locally-minted certificate is trusted through a user-added anchor (T7)",
+            "user-added trust anchor",
+        ),
+        (
+            "a self-signed leaf dropped in a keychain is not one",
+            "is not a substitute",
+        ),
+        (
+            "and `security verify-cert` is not the way to check any of it",
+            "security verify-cert",
+        ),
+        // What TLS does not buy, in the accepted-risk register's voice. The
+        // wording is the control here for the same reason it is in A02: the
+        // failure mode of this feature is a reader who remembers the headline.
+        (
+            "TLS buys nothing against same-uid code that can read the key",
+            "same-uid code that can read the private key",
+        ),
+        (
+            "TLS says nothing about nono's identity",
+            "Nothing about nono's identity",
+        ),
+        (
+            "availability is traded away deliberately, not overlooked",
+            "prefers an outage to a silent bypass",
+        ),
+        (
+            "a caught squatter is a transport error, not a recorded denial (T1)",
+            "the command exits 126",
+        ),
+        // The openssl fallback for operators without mkcert. Both extensions are
+        // load-bearing: without the EKU or without the address in the SANs the
+        // verifier refuses the leaf, and the operator learns that at startup,
+        // after the trust-store step that needed an admin password.
+        (
+            "the fallback leaf carries the serverAuth EKU",
+            "extendedKeyUsage=serverAuth",
+        ),
+        (
+            "the fallback leaf carries all three loopback names",
+            "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1",
+        ),
     ] {
         // Matched against the README with every whitespace run collapsed, so
         // re-wrapping a paragraph is not a test failure — only deleting the guidance
@@ -354,4 +415,134 @@ fn the_documented_caveats_and_risks_are_still_in_the_readme() {
 /// `text` with every run of whitespace collapsed to one space.
 fn flowed(text: &str) -> String {
     text.split_whitespace().collect::<Vec<&str>>().join(" ")
+}
+
+/// The fenced block whose body contains `needle`, without its fence lines.
+fn fenced_block_containing(needle: &str) -> String {
+    let mut current: Option<String> = None;
+    for line in README.lines() {
+        match (line.trim_start().starts_with("```"), &mut current) {
+            (true, None) => current = Some(String::new()),
+            (true, Some(block)) => {
+                if block.contains(needle) {
+                    return block.clone();
+                }
+                current = None;
+            }
+            (false, Some(block)) => {
+                block.push_str(line);
+                block.push('\n');
+            }
+            (false, None) => {}
+        }
+    }
+    panic!("no fenced block in README.md contains {needle:?}");
+}
+
+/// The `openssl` fallback for operators without `mkcert` — **run**, not read.
+///
+/// A minting recipe fails in two ways the daemon's refusal cannot help an operator
+/// debug, because both arrive at startup and long after the admin-password step: a
+/// leaf without the `serverAuth` EKU, and a leaf missing the loopback address the
+/// daemon binds. Neither is visible in the files it produced. So the documented
+/// block is executed here into a temporary directory, and the leaf it wrote is put
+/// in front of a real webpki verifier — the code path that decides, rather than a
+/// grep over `openssl x509 -text`, which would pass on a certificate carrying the
+/// right words in the wrong place.
+///
+/// Only the *minting* half runs. Installing the CA as a trust anchor needs an
+/// administrator, and it is the daemon's own T6 self-test that tells the operator
+/// whether that step worked — this test cannot do it and must not try.
+///
+/// The verifier is given the block's own CA as its only root, which is what makes
+/// this a test of the recipe rather than of this machine's trust store: it asks
+/// "would a verifier that trusts this CA accept this leaf for `127.0.0.1`", which
+/// is exactly what the operator's platform verifier will be asked once the anchor
+/// is installed.
+#[test]
+fn the_documented_openssl_fallback_mints_a_leaf_a_verifier_accepts() {
+    use rustls::client::danger::ServerCertVerifier;
+
+    // Selected on the CA's subject rather than on either extension: both
+    // extensions are things this test has to be able to *see removed*, and a
+    // selector that is itself the mutation target turns a verification failure
+    // into "no such block", which is red for the wrong reason.
+    let block = fenced_block_containing("nono-cedar-pdp local CA");
+    let dir = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&block)
+        .env("TLS_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "the README's openssl fallback does not run: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let read_pem = |name: &str| {
+        let pem = std::fs::read(dir.path().join(name)).unwrap_or_else(|e| {
+            panic!("the documented fallback wrote no {name} ({e}): {}", &block)
+        });
+        rustls_pemfile::certs(&mut pem.as_slice())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|e| panic!("{name} is not a certificate: {e}"))
+    };
+    let mut chain = read_pem("cert.pem");
+    assert!(!chain.is_empty(), "the fallback wrote an empty cert.pem");
+    let leaf = chain.remove(0);
+
+    let mut roots = rustls::RootCertStore::empty();
+    for ca in read_pem("ca.pem") {
+        roots.add(ca).unwrap();
+    }
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        std::sync::Arc::new(roots),
+        provider,
+    )
+    .build()
+    .unwrap();
+    // Every address the shipped configuration accepts. `127.0.0.1` is the
+    // documented default; `::1` is the one an operator reaches by writing
+    // `localhost` anywhere, which T5 is about.
+    for name in [
+        rustls::pki_types::ServerName::IpAddress(std::net::Ipv4Addr::LOCALHOST.into()),
+        rustls::pki_types::ServerName::IpAddress(std::net::Ipv6Addr::LOCALHOST.into()),
+        rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+    ] {
+        verifier
+            .verify_server_cert(
+                &leaf,
+                &chain,
+                &name,
+                &[],
+                rustls::pki_types::UnixTime::now(),
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "the leaf the documented fallback mints is refused for {name:?}: {e} \
+                     — an operator following it installs a CA with an admin password and \
+                     then gets a daemon that will not start"
+                )
+            });
+    }
+    // The negative row, for the same reason the IP-SAN measurement has one: it is
+    // what proves the three above mean "this certificate covers these names"
+    // rather than "this verifier accepts anything from that CA".
+    assert!(
+        verifier
+            .verify_server_cert(
+                &leaf,
+                &chain,
+                &rustls::pki_types::ServerName::try_from("example.com").unwrap(),
+                &[],
+                rustls::pki_types::UnixTime::now(),
+            )
+            .is_err(),
+        "the fallback's leaf is accepted for a name it does not carry, so the rows \
+         above prove nothing about its SANs"
+    );
 }
