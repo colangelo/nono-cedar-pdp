@@ -188,12 +188,19 @@ proves nothing. It does not authenticate the caller and is not a credential.
 protections.** At the default level the per-decision log line carries the identifiers
 and the outcome only — `request_id`, `session_id`, `backend`, the action, allow/deny,
 the matched policy ids and the timing — which is enough to correlate it with the audit
-line. `RUST_LOG=debug` adds a second event carrying the resource summary, i.e. the
-command line an agent attempted or the API path it requested. That is genuinely the
-first thing you want when a policy will not match, but **DEBUG output inherits the
-audit log's sensitivity without its permissions**: the log is `0600`, while stdout goes
-wherever you redirected it — a shared journal, a log aggregator, terminal scrollback.
-The audit log is unchanged at any level and remains the complete record.
+line. Nothing the daemon logs by default carries the resource summary: the one other
+default-level line about a request, the WARN that refuses an endpoint path as
+ambiguous, names the ambiguity it found and the `request_id`, not the path. (The path
+is still in the deny reason nono receives and in the audit line — this is about what
+reaches *stdout*.)
+
+`RUST_LOG=debug` adds a second event, keyed by the same `request_id`, carrying the
+resource summary: the command line an agent attempted, or the API path — query string
+included — it requested. That is genuinely the first thing you want when a policy will
+not match, but **DEBUG output inherits the audit log's sensitivity without its
+permissions**: the log is `0600`, while stdout goes wherever you redirected it — a
+shared journal, a log aggregator, terminal scrollback. The audit log is unchanged at
+any level and remains the complete record.
 
 The log is safe to rotate under a running daemon. An append handle survives a
 `rename`, and its writes keep succeeding, so the naive version silently stops
