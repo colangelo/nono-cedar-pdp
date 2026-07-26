@@ -449,6 +449,7 @@ async fn serve_https(
         key = %tls.key.display(),
         "loaded the TLS certificate and private key"
     );
+    verify_our_own_certificate(Arc::clone(&server_config), bind.ip(), &tls.cert)?;
 
     let listener = std::net::TcpListener::bind(bind)?;
     // `from_tcp` hands the socket to tokio, which requires it non-blocking.
@@ -554,6 +555,91 @@ fn load_pair(tls: &crate::config::Tls) -> std::io::Result<rustls::ServerConfig> 
     Ok(config)
 }
 
+
+/// How long either end of the self-test waits before giving up. Generous for a
+/// handshake against a socket on this machine, and bounded so that a wedged peer
+/// cannot leave the daemon neither serving nor exiting.
+const SELF_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// T6 — prove the certificate before binding anything.
+///
+/// A throwaway TLS listener on `127.0.0.1:0` gets the configured certificate; a
+/// client built the way nono's webhook client is built — rustls over the
+/// **platform** verifier, which is what `ureq`'s `platform-verifier` feature is —
+/// connects to it and has to complete the handshake. This is not a model of
+/// nono's verifier; it is nono's verifier, so it answers the operator's real
+/// question ("will nono accept this certificate?") with the code that decides it,
+/// at startup rather than in a runbook. It also catches what no minting procedure
+/// can: an expired leaf, a CA removed from the trust store since, a `bind` moved
+/// to an address the certificate does not cover.
+///
+/// **The throwaway listener is the point, and it is not the obvious
+/// simplification.** Connecting to the *real* listener would need the real
+/// listener to exist, which leaves a window — however small — in which this
+/// daemon is accepting approvals it has not established anyone can trust; and
+/// "refuse to serve" after having served is not a refusal. It works because
+/// rustls verifies against the `ServerName` the client is handed, not the socket
+/// it connected through, so asserting the name derived from `bind` while dialling
+/// an ephemeral port is a genuine test of the address we are about to serve on.
+///
+/// The client connects *before* the accepting thread is spawned: a handshake that
+/// never arrives would otherwise leave that thread parked for the life of the
+/// process.
+fn verify_our_own_certificate(
+    server_config: Arc<rustls::ServerConfig>,
+    ip: std::net::IpAddr,
+    cert: &std::path::Path,
+) -> std::io::Result<()> {
+    use rustls_platform_verifier::BuilderVerifierExt;
+
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    let throwaway = listener.local_addr()?;
+    let mut socket = std::net::TcpStream::connect(throwaway)?;
+    socket.set_read_timeout(Some(SELF_TEST_TIMEOUT))?;
+    socket.set_write_timeout(Some(SELF_TEST_TIMEOUT))?;
+
+    let peer = std::thread::spawn(move || -> std::io::Result<()> {
+        let (mut socket, _) = listener.accept()?;
+        socket.set_read_timeout(Some(SELF_TEST_TIMEOUT))?;
+        socket.set_write_timeout(Some(SELF_TEST_TIMEOUT))?;
+        let mut conn =
+            rustls::ServerConnection::new(server_config).map_err(std::io::Error::other)?;
+        conn.complete_io(&mut socket)?;
+        Ok(())
+    });
+
+    let mut client = rustls::ClientConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(std::io::Error::other)?
+        .with_platform_verifier()
+        .map_err(std::io::Error::other)?
+        .with_no_client_auth();
+    client.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let name = rustls::pki_types::ServerName::IpAddress(ip.into());
+    let outcome = rustls::ClientConnection::new(Arc::new(client), name)
+        .map_err(std::io::Error::other)
+        .and_then(|mut conn| conn.complete_io(&mut socket).map(|_| ()));
+    // Close our end so the peer's handshake cannot outlive the answer, then reap
+    // it: its error, if any, is the same failure from the other side and adds
+    // nothing to the message below.
+    drop(socket);
+    let _ = peer.join();
+
+    outcome.map_err(|e| {
+        tls_refusal(format!(
+            "[tls] this daemon's own certificate {} was refused for {ip} by the same \
+             platform verifier nono's webhook client uses, so nono would fail the \
+             handshake on every approval and block the command instead of asking: {e}. \
+             Refusing to serve rather than bind a listener nobody can believe. Mint a \
+             certificate covering the bind address and install the local CA — \
+             `mkcert -install`, then `mkcert localhost 127.0.0.1 ::1`. A self-signed \
+             leaf added to a keychain is not a substitute: only a user-added trust \
+             *anchor* is exempt from the Certificate Transparency requirement this \
+             check applies.",
+            cert.display()
+        ))
+    })
+}
 
 /// The fail-closed matrix is exercised over HTTP in `tests/server.rs`. What lives
 /// here is the one branch that cannot be driven from outside the crate: the

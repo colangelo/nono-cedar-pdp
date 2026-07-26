@@ -1627,3 +1627,142 @@ fn a_mismatched_tls_pair_refuses_to_serve_without_binding() {
     assert!(!output.contains("listening"), "{output}");
     drop(occupied);
 }
+
+/// T6: a certificate this platform does not trust is a refusal to serve, decided
+/// by the daemon at startup rather than by nono on every approval afterwards.
+///
+/// Without it the failure mode is a daemon that starts happily, logs nothing
+/// unusual, and blocks every intercepted command — because nono's handshake fails
+/// and a transport failure is `Err`, not a recorded `Denied`, so the operator sees
+/// sandbox errors with no policy trail to read. That is T7's trap arrived at from
+/// the other side: an untrusted certificate is indistinguishable from a working
+/// one until something real depends on it.
+///
+/// The port is held for the whole run, so `Address already in use` is what a
+/// daemon that bound first would print. Its absence, with `listening` absent too,
+/// is a positive statement that no socket was ever created — which is stronger
+/// than probing the port afterwards, since a probe samples instants and this
+/// proves the call was never made.
+#[test]
+fn an_untrusted_tls_certificate_refuses_to_serve_without_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = occupied.local_addr().unwrap();
+    let (cert, key) = untrusted_pair(dir.path());
+
+    let (ok, output) = serve_from(
+        dir.path(),
+        &format!(
+            "policy_dir = \"{POLICY_DIR}\"\naudit_log = \"{}\"\nbind = \"{addr}\"\n{}",
+            dir.path().join("decisions.jsonl").display(),
+            tls_block_for(&cert, &key)
+        ),
+        None,
+    );
+    assert!(
+        !ok,
+        "a certificate nono's own verifier rejects makes this daemon unusable, so it \
+         must not start: {output}"
+    );
+    assert!(
+        output.contains("[tls]"),
+        "the refusal must send the operator to the configuration: {output}"
+    );
+    assert!(
+        output.contains("mkcert -install"),
+        "an untrusted certificate is not a bug the operator can read off a rustls \
+         error, so the refusal has to name the remedy: {output}"
+    );
+    assert!(
+        !output.to_lowercase().contains("address already in use"),
+        "the daemon reached the bind before it had established that anyone could \
+         trust its certificate — that window is the whole reason T6 tests before \
+         binding rather than after: {output}"
+    );
+    assert!(
+        !output.contains("listening"),
+        "the daemon logs `listening` right after a successful bind, so this run bound \
+         a port behind an untrusted certificate: {output}"
+    );
+    drop(occupied);
+}
+
+/// The load-bearing half of T6: **nothing is ever accepted on the bind address.**
+///
+/// "Refuse to serve" after having served is not a refusal, so the exit code is
+/// not the claim — the claim is that no socket existed to accept anything. The
+/// kernel picks the port (`127.0.0.1:0`) and the daemon reports what it got, so
+/// this needs no guess: the daemon's own `listening` line *is* the announcement
+/// that a socket exists, and the address it names is dialled the moment it
+/// appears. A daemon that binds first and self-tests second passes through that
+/// state, and is caught whether or not the dial wins the race, because the line
+/// itself is the evidence.
+///
+/// Its sibling above states the same rule from the other side, by holding the
+/// port: absence of `Address already in use` proves `bind` was never called.
+/// Neither subsumes the other — one proves the syscall never happened, this one
+/// proves no client could ever have been answered — and the pair is what makes
+/// moving the self-test after the bind impossible to do quietly.
+#[test]
+fn an_untrusted_tls_certificate_never_lets_anything_connect_to_the_bind_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = untrusted_pair(dir.path());
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, tls_config(dir.path(), &cert, &key)).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nono-cedar-pdp"))
+        .arg("serve")
+        .arg("--config")
+        .arg(&config)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let readers = vec![
+        pump(child.stdout.take().unwrap(), std::sync::Arc::clone(&logs)),
+        pump(child.stderr.take().unwrap(), std::sync::Arc::clone(&logs)),
+    ];
+
+    let mut answered: Option<SocketAddr> = None;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        let snapshot = logs.lock().unwrap().clone();
+        if answered.is_none() {
+            if let Some(addr) = bound_addr(&snapshot) {
+                if TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok() {
+                    answered = Some(addr);
+                }
+            }
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            child.kill().ok();
+            child.wait().ok();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    for reader in readers {
+        reader.join().ok();
+    }
+    let output = strip_ansi(&logs.lock().unwrap().clone());
+
+    assert!(
+        matches!(status, Some(status) if !status.success()),
+        "an untrusted certificate must exit the daemon, not leave it serving: {output}"
+    );
+    assert!(
+        bound_addr(&output).is_none(),
+        "the daemon announced a bound address behind an untrusted certificate, so a \
+         socket existed that could have answered an approval nobody could verify — \
+         the window T6 refuses before binding in order to close: {output}"
+    );
+    assert!(
+        answered.is_none(),
+        "something accepted a connection on {answered:?}, the address this daemon \
+         reported binding: {output}"
+    );
+}
