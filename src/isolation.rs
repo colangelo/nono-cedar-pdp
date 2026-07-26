@@ -1375,6 +1375,16 @@ mod tests {
     /// D6's rule reaches the key too: an owner may chmod at will, so a tight
     /// mode on a key owned by someone else proves nothing about who can read
     /// it. Driven through the euid seam, since the suite cannot chown.
+    ///
+    /// The path assertion is the load-bearing one, for the reason
+    /// `a_policy_directory_owned_by_another_uid_refuses_to_serve` carries the
+    /// same line: the euid seam makes *every* component of the chain foreign, so
+    /// the ancestor walk raises its own `ForeignOwner` about the parent
+    /// directory whose message satisfies both of the other two assertions
+    /// ("ancestor of the TLS private key …" contains "private key", and the uid
+    /// is the same uid). Without pinning the path, this test stays green with
+    /// the key's own D6 rule deleted — and that rule is the only thing that
+    /// catches a foreign-owned key sitting inside a directory we own at 0700.
     #[test]
     fn a_private_key_owned_by_another_uid_refuses_to_serve() {
         let root = tempfile::tempdir().unwrap();
@@ -1394,6 +1404,10 @@ mod tests {
         assert!(
             text.contains(&owner.to_string()),
             "the owning uid must be named: {text}"
+        );
+        assert!(
+            text.contains(&absolutize(&key, None).display().to_string()),
+            "the refusal must land on the key itself, not an ancestor: {text}"
         );
     }
 

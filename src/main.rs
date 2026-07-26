@@ -188,12 +188,23 @@ async fn run_serve(config_path: &std::path::Path) -> Result<(), String> {
         // the transport is authenticated — precisely the silent downgrade T2
         // forbids, and the worst of the available behaviours. A refusal is the
         // fail-closed answer until the listener lands.
+        //
+        // Pinned by `a_tls_configured_daemon_refuses_rather_than_downgrade_to_plaintext`
+        // in `tests/cli.rs`. Deleting this block without repointing that test is
+        // how the rule stops being enforced at either end.
+        //
+        // Both paths are named because they are the *resolved* ones (D7), and
+        // that is what makes them worth printing: the operator sees the chain the
+        // listener would have read rather than the one they typed, and
+        // `a_symlinked_tls_pair_is_resolved_before_serving` reads them back to
+        // prove the resolution happened at all.
         return Err(format!(
-            "[tls] names {} but the https listener is not implemented yet — refusing to \
-             serve, because serving plaintext behind a configuration that asks for TLS \
-             would leave the operator believing the transport is authenticated when it \
-             is not",
-            tls.cert.display()
+            "[tls] names cert {} and key {} but the https listener is not implemented \
+             yet — refusing to serve, because serving plaintext behind a configuration \
+             that asks for TLS would leave the operator believing the transport is \
+             authenticated when it is not",
+            tls.cert.display(),
+            tls.key.display()
         ));
     }
 

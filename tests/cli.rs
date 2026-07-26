@@ -543,25 +543,92 @@ fn a_group_readable_tls_key_refuses_to_start_without_binding() {
     drop(occupied);
 }
 
-/// The key check has to run over the chain the listener will read, not the one
-/// the operator typed (D7). A `~/`-relative or symlinked path resolved twice —
-/// once for the check, once for the read — is two different objects, and the
-/// gap between them is where a repoint lands. Driven through a symlinked
-/// directory, which is the shape that made this a real defect for `policy_dir`.
+/// T2, and the reason `[tls]` is allowed to fail a startup at all: a daemon that
+/// cannot establish the transport its configuration asks for **refuses to serve**.
+/// It never falls back to plaintext, because an operator who configured TLS and
+/// got a listening daemon has no way to tell the two apart — the worst of the
+/// available behaviours, worse than never having had TLS.
+///
+/// The load-bearing half is not the exit code: with the guard gone the daemon
+/// *also* exits non-zero here, because the port it would have bound is held. It
+/// is that the daemon is proved never to have reached the bind, which the held
+/// port turns into a positive assertion — `Address already in use` is what a
+/// fall-through prints, so its absence (with `listening` absent too) is the proof
+/// that no socket existed behind the `[tls]` config. The pair is valid: an
+/// owner-only `0600` key under a `0700` directory, so the key check passes and
+/// the *only* thing left to stop the plaintext listener is the rule under test.
+///
+/// **Stage 4 must repoint this test, not delete it.** The transitional refusal
+/// goes away when the axum-server arm lands and a valid pair starts serving
+/// https — so the message assertion moves to task 4.2's client-side one (a
+/// plaintext request to a TLS daemon is refused). What must survive the swap is
+/// the claim in the name: never plaintext behind `[tls]`. Covered at neither end
+/// is how this rule was left unpinned in the first place.
+#[test]
+fn a_tls_configured_daemon_refuses_rather_than_downgrade_to_plaintext() {
+    let dir = tempfile::tempdir().unwrap();
+    // Held for the whole run, like `a_group_readable_tls_key_refuses_to_start_
+    // without_binding` holds its own: a daemon that fell through to the plaintext
+    // listener would collide with it and say so.
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = occupied.local_addr().unwrap();
+    let block = tls_block(dir.path(), 0o600);
+
+    let (ok, output) = serve_from(
+        dir.path(),
+        &format!(
+            "policy_dir = \"{POLICY_DIR}\"\naudit_log = \"{}\"\nbind = \"{addr}\"\n{block}",
+            dir.path().join("decisions.jsonl").display()
+        ),
+        None,
+    );
+    assert!(!ok, "a daemon that cannot serve TLS must not serve: {output}");
+    assert!(
+        !output.to_lowercase().contains("address already in use"),
+        "the daemon fell through to the plaintext listener behind a [tls] config — \
+         it reached the bind, which is the silent downgrade T2 forbids: {output}"
+    );
+    assert!(
+        !output.contains("listening"),
+        "the daemon logs `listening` right after a successful bind, so this run \
+         served plaintext behind a [tls] config: {output}"
+    );
+    assert!(
+        output.contains("[tls]"),
+        "the refusal must send the operator to the configuration that caused it: {output}"
+    );
+    drop(occupied);
+}
+
+/// The pair a config names through a symlinked directory, with the key at
+/// `mode`. Returns the `[tls]` block written in terms of `link`, the resolved
+/// directory the daemon should end up holding, and the symlink path it must not.
+fn symlinked_tls_block(dir: &Path, mode: u32) -> (String, std::path::PathBuf, std::path::PathBuf) {
+    let actual = dir.join("actual");
+    let link = dir.join("link");
+    let block = tls_block(&actual, mode);
+    std::os::unix::fs::symlink(&actual, &link).unwrap();
+    let linked = block.replace(&actual.display().to_string(), &link.display().to_string());
+    (linked, actual, link)
+}
+
+/// The key check itself runs over the resolved chain: a `0644` key reached
+/// through a symlinked directory is still refused, and the refusal names the
+/// real file rather than the link the operator typed.
+///
+/// **This does not pin D7.** It is satisfied by `isolation`'s own `absolutize`,
+/// which resolves the path again inside the check — so it stays green with
+/// `serve`'s resolution deleted, and that is exactly the two-objects gap D7
+/// exists to close. `a_symlinked_tls_pair_is_resolved_before_serving` below is
+/// the one that pins the value `serve` holds; keep them apart, because a single
+/// test that looks like it covers both is how this was missed the first time.
 #[test]
 fn a_symlinked_tls_key_is_checked_on_the_chain_it_resolves_to() {
     let dir = tempfile::tempdir().unwrap();
     // Held rather than probed-and-released, for the reason the test above gives.
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = occupied.local_addr().unwrap();
-    // The real pair lives under `actual/`; the config names it through `link`.
-    let actual = dir.path().join("actual");
-    let block = tls_block(&actual, 0o644);
-    std::os::unix::fs::symlink(&actual, dir.path().join("link")).unwrap();
-    let linked = block.replace(
-        &actual.display().to_string(),
-        &dir.path().join("link").display().to_string(),
-    );
+    let (linked, actual, _link) = symlinked_tls_block(dir.path(), 0o644);
 
     let (ok, output) = serve_from(
         dir.path(),
@@ -580,6 +647,52 @@ fn a_symlinked_tls_key_is_checked_on_the_chain_it_resolves_to() {
         output.contains(&actual.join("tls/key.pem").display().to_string()),
         "the message must name the resolved path, since that is the one the \
          listener will read: {output}"
+    );
+    drop(occupied);
+}
+
+/// D7 for the TLS pair: `serve` resolves `tls.cert` and `tls.key` **once**, at
+/// startup and before the key check, and everything downstream holds only the
+/// resolved values. A path resolved twice — once for the check, once for the
+/// read — is two different objects, and the gap between them is where a repoint
+/// lands.
+///
+/// Asserted on the values `serve` itself carries, not on a refusal message the
+/// check happens to produce: the check re-resolves internally, so a message it
+/// wrote proves nothing about `config.tls`. The key is therefore `0600` and
+/// *passes*, which leaves the transitional `[tls]` refusal — the one thing
+/// downstream of the resolution that prints both paths — as the observable.
+///
+/// **Stage 4 must repoint this, not delete it.** When the axum-server arm lands,
+/// the observable becomes whatever the listener logs or loads; the claim being
+/// pinned is unchanged, and it is the claim, not the message, that matters.
+#[test]
+fn a_symlinked_tls_pair_is_resolved_before_serving() {
+    let dir = tempfile::tempdir().unwrap();
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = occupied.local_addr().unwrap();
+    let (linked, actual, link) = symlinked_tls_block(dir.path(), 0o600);
+
+    let (ok, output) = serve_from(
+        dir.path(),
+        &format!(
+            "policy_dir = \"{POLICY_DIR}\"\naudit_log = \"{}\"\nbind = \"{addr}\"\n{linked}",
+            dir.path().join("decisions.jsonl").display()
+        ),
+        None,
+    );
+    assert!(!ok, "startup must fail: {output}");
+    for what in ["cert.pem", "key.pem"] {
+        assert!(
+            output.contains(&actual.join("tls").join(what).display().to_string()),
+            "serve must hold the resolved {what}, since that is the chain the \
+             listener will read: {output}"
+        );
+    }
+    assert!(
+        !output.contains(&link.display().to_string()),
+        "serve is still holding the configured symlink path, so the chain the key \
+         check walked and the chain the listener would read are two objects: {output}"
     );
     drop(occupied);
 }
