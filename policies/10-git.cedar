@@ -44,6 +44,9 @@ permit (
 // argv entries, so argument positions shift. Membership over a flag is also exact
 // where a joined-string glob would not be: `argv_tail like "*--force*"` would also
 // fire on `git commit -m "do not --force this"`.
+//
+// Membership here also survives the drop: `--force` is its own argv entry and is
+// ASCII, so it is never the entry that gets discarded.
 @id("no-history-rewrites")
 forbid (
   principal,
@@ -75,6 +78,19 @@ forbid (
 //     over-match (they also fire on the same text inside one argument, e.g.
 //     `git log --grep="--exec-path"`), which is why they live in a `forbid`, where
 //     over-matching denies rather than approves.
+//
+// The two spellings do NOT fail the same way, and the difference is a known hole.
+// nono discards a non-UTF-8 argv entry whole rather than converting it, so:
+//   * `-c` survives — its value is a SEPARATE entry, so only the value is discarded
+//     and the ASCII `-c` remains for membership to match.
+//   * the `--flag=<value>` forms do NOT — flag and value share one entry, so an
+//     invalid value takes the flag with it and the glob has nothing to match. The
+//     permit above then approves, because `argv_tail` reads as the bare subcommand.
+// So `git --exec-path=<dir whose name is not valid UTF-8> status` is ALLOWED here.
+// Nothing in this file can close that: the request is byte-identical to a plain
+// `git status`, so any rule denying it denies the invocation this permit exists for.
+// It closes upstream by preserving arity (GHSA-p385-fvxh-xvgf). Pinned by
+// `tests/policies.rs`, recorded in `docs/audits/`. Do not "fix" it here.
 //
 // Deliberate over-denial: `-c` is also a subcommand flag meaning something harmless
 // elsewhere (`git log -c`, `git show -c` = combined diff; `git branch -c` = copy),

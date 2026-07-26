@@ -41,6 +41,15 @@ pub struct CommandRequest {
     pub command: String,
     /// Includes argv[0]. Upstream drops non-UTF-8 entries, so positions shift:
     /// never match on index.
+    ///
+    /// The entry is **dropped, not converted**, so it is absent from `args` and from
+    /// `argv_tail` — not merely displaced. A rule that names an argument cannot match
+    /// one it cannot see; in a `forbid` that is fail-open. Membership on a flag that
+    /// occupies its own argv entry survives (only the adjacent value is discarded); a
+    /// glob over a `--flag=<value>` entry does not. Nothing here can detect it: the
+    /// post-drop request is byte-identical to one that never carried the argument.
+    /// Closes upstream only, by preserving arity — `GHSA-p385-fvxh-xvgf`. Pinned by
+    /// `tests/policies.rs`, recorded in `docs/audits/`.
     pub args: Vec<String>,
     /// `"session"` for a direct agent launch, otherwise the intercepted command
     /// that chained this one.

@@ -240,6 +240,34 @@ fn the_documented_caveats_and_risks_are_still_in_the_readme() {
             "a policy reading argv will not load",
             "fails strict validation",
         ),
+        // The dropped-argument blind spot. "Positions shift" was the weaker thing this
+        // repo used to say; these pin the stronger, true one — the entry is gone, so a
+        // forbid naming it fails open, and no authoring care avoids it.
+        (
+            "a non-UTF-8 argv entry is dropped rather than converted",
+            "dropped, not converted",
+        ),
+        (
+            "a dropped entry is absent from both attributes",
+            "absent from `args` and from `argv_tail`",
+        ),
+        (
+            "a rule cannot match an argument it cannot see",
+            "cannot match one it cannot see",
+        ),
+        (
+            "an argument-naming forbid fails open, not merely over- or under-denies",
+            "in a `forbid` that is fail-open",
+        ),
+        (
+            "which matching shapes survive the drop",
+            "occupies its own argv entry",
+        ),
+        (
+            "the drop is not avoidable by careful authoring",
+            "byte-identical",
+        ),
+        ("the drop closes only upstream", "preserving arity"),
         // The raw-path caveat.
         ("endpoint paths arrive raw", "denied outright"),
         // The header gate: what an operator driving the endpoint by hand must send,

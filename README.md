@@ -314,12 +314,32 @@ The schema is [`nono.cedarschema`](nono.cedarschema) — the load-bearing design
 artifact, embedded in the binary. Six of its shapes are deliberate constraints, not
 oversights.
 
-1. **`args` is a `Set<String>`, so positional matching is unexpressible.** Upstream
-   builds `args` with `filter_map(|a| from_utf8(a).ok())`: a non-UTF-8 argv entry is
-   *silently dropped* and every later position shifts. Cedar sets have no index
-   access, so a policy physically cannot say "the second argument is `push`". Test
-   flag presence instead: `resource.args.contains("--force")`. (A runtime test for the
-   lossy case is impossible from this side — the bytes are gone before we see them.)
+1. **`args` is a `Set<String>`, so positional matching is unexpressible — and an
+   argument that is not valid UTF-8 is not in it at all.** Upstream builds `args` with
+   `filter_map(|a| from_utf8(a).ok())`, so such an entry is **dropped, not converted**:
+   it is **absent from `args` and from `argv_tail`**, not merely displaced. Two separate
+   consequences, and the second is the dangerous one.
+
+   *Positions shift.* Cedar sets have no index access, so a policy physically cannot say
+   "the second argument is `push`" — which is the intended shape. Test flag presence
+   instead: `resource.args.contains("--force")`.
+
+   *A rule that names an argument cannot match one it cannot see, and **in a `forbid`
+   that is fail-open**.* An anchored `permit` still fires, because after the drop the tail reads
+   as the bare subcommand. Whether a given rule survives depends on one thing — does it
+   match bytes sharing an argv entry with the invalid bytes? Membership on a flag that
+   **occupies its own argv entry** survives, because only the adjacent value is
+   discarded (`git -c <non-UTF-8> status` still trips `args.contains("-c")`). A glob over
+   a `--flag=<value>` entry does not: `git --exec-path=<dir whose name is not valid
+   UTF-8> status` reaches this daemon as a bare `git status`, so the `forbid` never fires
+   and the read-only permit approves it.
+
+   **This is not something careful authoring avoids, and no policy you can write helps.**
+   The post-drop request is **byte-identical** to one from a plain `git status`, so any
+   rule denying the first denies the second — that is, denies the invocation the pack
+   exists to approve. It closes only upstream, by **preserving arity** (reported as
+   `GHSA-p385-fvxh-xvgf`); until then it is an accepted residual, recorded in
+   [`docs/audits/`](docs/audits/) and pinned by a test in `tests/policies.rs`.
 2. **There is no whole-argv attribute — anchor on `argv_tail`.** `args[0]` is a per-run
    shim path, so a pattern anchored over the whole argv (`like "git commit *"`) can
    never match a real payload: fail-safe in a `permit`, **fail-open in a `forbid`**.
@@ -530,6 +550,13 @@ suspicious allow is traceable. That role is why the log is kept `0600`, why the 
 notices a rotation instead of writing into a detached inode, and why its path belongs
 outside every write grant in your profile (see
 [Keep the policy directory out of the sandbox](#keep-the-policy-directory-out-of-the-sandbox)).
+
+There is also a limit that no configuration here reaches: **the daemon can only decide on
+the argv it is given, and one class of argument never arrives.** An entry that is not
+valid UTF-8 is dropped upstream before the request is built, so an argument-naming
+`forbid` does not fire for it (caveat 1 above). It is not mitigable at this boundary and
+is tracked as an accepted residual in [`docs/audits/`](docs/audits/) — read that register
+before concluding the pack denies everything it names.
 
 ### What the header checks do and do not buy
 
