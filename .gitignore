@@ -1,2 +1,5 @@
 /target
 /decisions.jsonl
+
+# Private working notes. Never publishable: this repo has a public remote.
+/.private/
