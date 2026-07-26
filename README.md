@@ -161,10 +161,13 @@ an invalid or empty policy directory refuses to run — as does startup with a p
 directory (or policy file) that is group- or world-writable, since another local user
 could otherwise add a `permit`.
 
-Each decision appends one line to the audit log:
+The audit log carries two record shapes, and every line names its own in `kind`, so a
+consumer selects on an explicit value instead of guessing from which keys are present.
+
+Each decision appends one `kind: "decision"` line:
 
 ```json
-{"ts":"2026-07-25T14:36:37.569566Z","request_id":"tool-sandbox-approve-git-1784990197567145000",
+{"kind":"decision","ts":"2026-07-25T14:36:37.569566Z","request_id":"tool-sandbox-approve-git-1784990197567145000",
  "session_id":"35abc0894927242e","backend":"cedar","agent":"claude-code",
  "principal":"Nono::Caller::\"session\"","action":"launchCommand",
  "resource":"git [/private/.../shims/git status]","child_pid":13820,
@@ -173,10 +176,40 @@ Each decision appends one line to the audit log:
  "reason":"permitted by 10-git:git-read-only","eval_us":1670}
 ```
 
-The key set is identical on every line, so a consumer can tell "not known" from "not
-recorded": a command line carries a null `rule_label`, an endpoint line a null
-`intercept_rule`, and a line for a request that never parsed carries nulls for
+The key set is identical on every line *of a given kind*, so a consumer can tell "not
+known" from "not recorded": a command line carries a null `rule_label`, an endpoint line
+a null `intercept_rule`, and a line for a request that never parsed carries nulls for
 `child_pid` and both rule fields.
+
+Every load attempt appends a `kind: "policy-set"` line, so each decision can be tied to
+the exact policy set that produced it — take the most recent `loaded` line before it:
+
+```json
+{"kind":"policy-set","ts":"2026-07-25T14:36:31.101204Z","outcome":"loaded","generation":1,
+ "content_hash":"sha256:fa570171a2b4c8423763e6ed7135c4c63f9a6bb5c94ddcaa1923043695df39b5",
+ "files":["/Users/you/.config/nono-cedar-pdp/policies/00-baseline.cedar",
+          "/Users/you/.config/nono-cedar-pdp/policies/10-git.cedar"],
+ "at_risk":false,"reason":null}
+```
+
+`outcome` is `loaded`, `refused` (the pre-reload trust re-check refused — see "Keep the
+policy directory out of the sandbox") or `failed` (invalid Cedar, an unreadable
+directory). The two that adopt nothing carry a null `content_hash` and `files`, because
+there is no set to name, and record the generation *still deciding*. `at_risk` says
+whether the startup isolation check raised its advisory warnings.
+
+Attempts that adopt nothing are recorded deliberately: a refused reload is the detection
+event for someone having changed your policy directory, and stdout is telemetry that
+goes wherever you redirected it. This trail sits outside every write grant your nono
+profile gives the agent, so an agent that tampers with the policy directory cannot erase
+the record of having done so.
+
+`content_hash` is **evidence, not an integrity control**. It is written by the same
+process that read the files, so it lets you ask "is the policy directory still what
+decided that request" and says nothing whatever about *authorship* — anyone who could
+rewrite the policies could also have caused the hash of their version to be recorded.
+Policy signing is the control, and is not built yet. Do not treat a matching hash as a
+signature.
 
 `user_agent` is what the caller presented, recorded verbatim — **evidence, not
 verification**. Browser JavaScript cannot set `User-Agent` at all, so a line whose

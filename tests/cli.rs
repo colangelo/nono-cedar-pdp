@@ -557,17 +557,51 @@ fn a_started_daemon_answers_healthz_and_approve_over_a_real_socket() {
     // which no in-process router test can show.
     let trail = std::fs::read_to_string(&audit_log)
         .unwrap_or_else(|e| panic!("nothing at the configured audit log: {e} (log: {logs})"));
-    let lines: Vec<&str> = trail.lines().collect();
-    assert_eq!(lines.len(), 2, "{trail}");
-    let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-    assert_eq!(first["decision"], "allow");
-    assert_eq!(
-        first["matched"],
-        serde_json::json!(["10-git:git-read-only"]),
-        "{first}"
+    let records: Vec<serde_json::Value> = trail
+        .lines()
+        .map(|l| {
+            serde_json::from_str(l).unwrap_or_else(|e| panic!("unparseable audit line {l:?}: {e}"))
+        })
+        .collect();
+
+    // The real binary's bootstrap load is on the record, ahead of any decision.
+    // Only an out-of-process run can show this: the provenance line is written by
+    // `main` after the audit log opens, so no in-process router test reaches it.
+    let provenance: Vec<&serde_json::Value> =
+        records.iter().filter(|r| r["kind"] == "policy-set").collect();
+    assert_eq!(provenance.len(), 1, "{trail}");
+    assert_eq!(provenance[0]["outcome"], "loaded");
+    assert_eq!(provenance[0]["generation"], 1);
+    assert!(
+        provenance[0]["content_hash"]
+            .as_str()
+            .is_some_and(|h| h.starts_with("sha256:")),
+        "the provenance line must name its algorithm: {}",
+        provenance[0]
     );
-    let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
-    assert_eq!(second["decision"], "deny");
+    assert_eq!(
+        provenance[0]["at_risk"], false,
+        "this fixture's policy dir is not inside the working directory: {}",
+        provenance[0]
+    );
+    assert_eq!(
+        records[0]["kind"], "policy-set",
+        "the set that decided must be on the record before the decisions it made, \
+         or the trail cannot be read forwards: {trail}"
+    );
+
+    // The decisions a socket produced must be on the record at the configured path.
+    let decisions: Vec<&serde_json::Value> =
+        records.iter().filter(|r| r["kind"] == "decision").collect();
+    assert_eq!(decisions.len(), 2, "{trail}");
+    assert_eq!(decisions[0]["decision"], "allow");
+    assert_eq!(
+        decisions[0]["matched"],
+        serde_json::json!(["10-git:git-read-only"]),
+        "{}",
+        decisions[0]
+    );
+    assert_eq!(decisions[1]["decision"], "deny");
 }
 
 /// D7: `serve` resolves the configured `policy_dir` once, before the isolation

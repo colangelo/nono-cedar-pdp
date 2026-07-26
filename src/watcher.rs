@@ -66,9 +66,52 @@ const DEBOUNCE: Duration = Duration::from_millis(150);
 /// directory read plus a re-validation.
 const DEBOUNCE_CEILING: Duration = Duration::from_secs(2);
 
+/// Everything needed to write a `policy-set` provenance line, bundled so the
+/// watcher takes one argument rather than growing a parameter per field.
+///
+/// `at_risk` is established once, by `isolation::check` at startup, and never
+/// changes for the life of the process — but it is carried on every line rather
+/// than looked up, because an audit line is supposed to be self-sufficient for
+/// review. A reader should not have to find the first line of the run to learn
+/// whether this daemon's policy directory sat somewhere an agent could write.
+#[derive(Clone)]
+pub struct Provenance {
+    pub audit: Arc<crate::audit::AuditLog>,
+    pub at_risk: bool,
+}
+
+impl Provenance {
+    /// Record what a load attempt did. Kept here rather than on `AuditLog` so the
+    /// `at_risk` flag has exactly one owner.
+    pub fn record(&self, generation: u64, outcome: &crate::audit::PolicySetOutcome<'_>) {
+        self.audit
+            .record_policy_set(generation, self.at_risk, outcome);
+    }
+
+    /// Record an adopted set from the engine's own snapshot, which is the only
+    /// place the hash and the file list are guaranteed to belong to the same load.
+    pub fn record_loaded(&self, loaded: &crate::cedar::engine::LoadedPolicies) {
+        self.record(
+            loaded.generation,
+            &crate::audit::PolicySetOutcome::Loaded {
+                content_hash: &loaded.content_hash,
+                files: &loaded.files,
+            },
+        );
+    }
+}
+
 /// Start watching `engine.policy_dir()`. Keep the returned watcher alive — its
 /// drop stops the watch.
-pub fn spawn(engine: Arc<Engine>) -> notify::Result<RecommendedWatcher> {
+///
+/// Takes the provenance recorder because a watcher that swaps the deciding policy
+/// set without being able to record what it adopted cannot satisfy
+/// `decision-audit-log`'s provenance requirement — including, and especially, on
+/// the attempts that adopt nothing.
+pub fn spawn(
+    engine: Arc<Engine>,
+    provenance: Provenance,
+) -> notify::Result<RecommendedWatcher> {
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
     let mut watcher = notify::recommended_watcher(tx)?;
     watcher.watch(engine.policy_dir(), RecursiveMode::NonRecursive)?;
@@ -137,16 +180,41 @@ pub fn spawn(engine: Arc<Engine>) -> notify::Result<RecommendedWatcher> {
                         "policy directory is no longer trusted; keeping the \
                          last-good policy set"
                     );
+                    // To the trail as well as to stdout, and this is the line that
+                    // matters most: a refusal is the *detection event* for someone
+                    // having changed the policy directory. stdout is telemetry and
+                    // goes wherever the operator redirected it; the audit log sits
+                    // outside every write grant the agent holds, so this record
+                    // survives the tampering it evidences.
+                    provenance.record(
+                        engine.snapshot().generation,
+                        &crate::audit::PolicySetOutcome::Refused {
+                            reason: e.to_string(),
+                        },
+                    );
                     continue;
                 }
                 match engine.reload() {
                     Ok(generation) => {
-                        tracing::info!(generation, "policies reloaded from disk")
+                        tracing::info!(generation, "policies reloaded from disk");
+                        // From the snapshot, not from `generation` plus a re-read:
+                        // the hash and the file list have to come from the same load
+                        // that just became active, or the line describes a set that
+                        // never decided anything.
+                        provenance.record_loaded(&engine.snapshot());
                     }
-                    Err(e) => tracing::error!(
-                        error = %e,
-                        "policy reload failed; keeping previous policy set"
-                    ),
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "policy reload failed; keeping previous policy set"
+                        );
+                        provenance.record(
+                            engine.snapshot().generation,
+                            &crate::audit::PolicySetOutcome::Failed {
+                                reason: e.to_string(),
+                            },
+                        );
+                    }
                 }
             }
         })
@@ -173,7 +241,8 @@ mod tests {
         let engine = Arc::new(
             crate::cedar::engine::Engine::bootstrap(schema, dir.path().to_path_buf()).unwrap(),
         );
-        let _watcher = spawn(Arc::clone(&engine)).unwrap();
+        let (prov, _audit_dir, _audit_path) = provenance();
+        let _watcher = spawn(Arc::clone(&engine), prov).unwrap();
 
         std::fs::write(
             dir.path().join("p.cedar"),
@@ -209,6 +278,38 @@ mod tests {
                 child_pid: 42,
             },
         }
+    }
+
+
+    /// A provenance recorder writing to a real audit log, plus the path so a test
+    /// can read back what the watcher recorded.
+    ///
+    /// The log gets its **own** temp dir, never the policy directory. That is the
+    /// production rule (D13 — the trail must sit outside anything the agent can
+    /// write), and here it is also load-bearing for the test itself: an audit log
+    /// inside the watched directory would make every recorded line a filesystem
+    /// event, and the watcher would reload forever off its own output.
+    fn provenance() -> (Provenance, tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decisions.jsonl");
+        let audit = Arc::new(crate::audit::AuditLog::open(&path).unwrap());
+        (
+            Provenance {
+                audit,
+                at_risk: false,
+            },
+            dir,
+            path,
+        )
+    }
+
+    /// The `policy-set` lines in a trail, in order.
+    fn policy_set_lines(path: &std::path::Path) -> Vec<serde_json::Value> {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        text.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["kind"] == "policy-set")
+            .collect()
     }
 
     /// Wait until `predicate` holds, or give up. Returns whether it held.
@@ -271,7 +372,8 @@ mod tests {
         let engine = Arc::new(
             crate::cedar::engine::Engine::bootstrap(schema, dir.path().to_path_buf()).unwrap(),
         );
-        let _watcher = spawn(Arc::clone(&engine)).unwrap();
+        let (prov, _audit_dir, _audit_path) = provenance();
+        let _watcher = spawn(Arc::clone(&engine), prov).unwrap();
 
         assert!(
             engine.evaluate(&git_status()).allow,
@@ -330,7 +432,8 @@ mod tests {
         // inherits the dispatcher of whoever spawned it, so a capture installed
         // later would never see its refusal.
         let capture = crate::test_log::capture();
-        let _watcher = spawn(Arc::clone(&engine)).unwrap();
+        let (prov, _audit_dir, _audit_path) = provenance();
+        let _watcher = spawn(Arc::clone(&engine), prov).unwrap();
         assert!(
             engine.evaluate(&git_status()).allow,
             "the last-good set permits git status before the loosening"
@@ -381,7 +484,8 @@ mod tests {
             crate::cedar::engine::Engine::bootstrap(schema, dir.path().to_path_buf()).unwrap(),
         );
         let capture = crate::test_log::capture();
-        let _watcher = spawn(Arc::clone(&engine)).unwrap();
+        let (prov, _audit_dir, _audit_path) = provenance();
+        let _watcher = spawn(Arc::clone(&engine), prov).unwrap();
         assert!(
             engine.evaluate(&git_status()).allow,
             "the last-good set permits git status before the loosening"
@@ -434,7 +538,8 @@ mod tests {
         let engine =
             Arc::new(crate::cedar::engine::Engine::bootstrap(schema, dir.clone()).unwrap());
         let capture = crate::test_log::capture();
-        let _watcher = spawn(Arc::clone(&engine)).unwrap();
+        let (prov, _audit_dir, _audit_path) = provenance();
+        let _watcher = spawn(Arc::clone(&engine), prov).unwrap();
         assert!(
             engine.evaluate(&git_status()).allow,
             "the last-good set permits git status before the loosening"
@@ -486,7 +591,8 @@ mod tests {
             crate::cedar::engine::Engine::bootstrap(schema, dir.path().to_path_buf()).unwrap(),
         );
         let capture = crate::test_log::capture();
-        let _watcher = spawn(Arc::clone(&engine)).unwrap();
+        let (prov, _audit_dir, _audit_path) = provenance();
+        let _watcher = spawn(Arc::clone(&engine), prov).unwrap();
 
         // Write+execute, no read: a new file can still be created (the watch
         // event), but the listing fails with EACCES — the closest hermetic
@@ -534,7 +640,8 @@ mod tests {
             crate::cedar::engine::Engine::bootstrap(schema, dir.path().to_path_buf()).unwrap(),
         );
         let capture = crate::test_log::capture();
-        let _watcher = spawn(Arc::clone(&engine)).unwrap();
+        let (prov, _audit_dir, _audit_path) = provenance();
+        let _watcher = spawn(Arc::clone(&engine), prov).unwrap();
 
         chmod(dir.path(), 0o770);
         std::fs::write(&policy, r#"forbid (principal, action, resource);"#).unwrap();
@@ -592,7 +699,8 @@ mod tests {
             crate::cedar::engine::Engine::bootstrap(schema, dir.path().to_path_buf()).unwrap(),
         );
         let capture = crate::test_log::capture();
-        let _watcher = spawn(Arc::clone(&engine)).unwrap();
+        let (prov, _audit_dir, _audit_path) = provenance();
+        let _watcher = spawn(Arc::clone(&engine), prov).unwrap();
 
         let stop = Arc::new(AtomicBool::new(false));
         let churn = {
@@ -635,6 +743,119 @@ mod tests {
             "a drain ended by the ceiling must be reported, so sustained traffic in \
              the policy directory is visible rather than inferred from reloads that \
              merely seem late: {log:?}"
+        );
+    }
+
+    /// The trail could name which policy *id* decided a request and not which
+    /// content that id had, so after a reload nothing answered "which policies were
+    /// live when this decision was made". These tests pin that every load attempt
+    /// leaves that answer behind — including the attempts that adopt nothing, which
+    /// is where the value is: a refusal is the detection event for someone having
+    /// changed the policy directory.
+    #[test]
+    fn an_adopted_reload_records_a_loaded_line_with_a_changed_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = dir.path().join("p.cedar");
+        std::fs::write(&policy, POLICY).unwrap();
+        let schema = crate::cedar::schema::load().unwrap();
+        let engine = Arc::new(
+            crate::cedar::engine::Engine::bootstrap(schema, dir.path().to_path_buf()).unwrap(),
+        );
+        let before = engine.snapshot().content_hash.clone();
+        let (prov, _audit_dir, audit_path) = provenance();
+        let _watcher = spawn(Arc::clone(&engine), prov).unwrap();
+
+        std::fs::write(&policy, r#"forbid (principal, action, resource);"#).unwrap();
+        assert!(
+            within(Duration::from_secs(5), || !policy_set_lines(&audit_path)
+                .is_empty()),
+            "the adopted reload was never recorded"
+        );
+
+        let lines = policy_set_lines(&audit_path);
+        let last = lines.last().unwrap();
+        assert_eq!(last["kind"], "policy-set");
+        assert_eq!(last["outcome"], "loaded");
+        assert_eq!(last["generation"], 2);
+        assert_ne!(
+            last["content_hash"].as_str().unwrap(),
+            before,
+            "the content changed, so the recorded hash must differ — otherwise the \
+             line cannot distinguish the set that decided"
+        );
+        assert!(last["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f.as_str().unwrap().ends_with("p.cedar")));
+    }
+
+    /// The line that matters most. Before this existed, a refused reload was
+    /// visible only on stdout — which `pdp-operations` classifies as telemetry
+    /// rather than the record, and which goes wherever the operator redirected it.
+    #[test]
+    fn a_refused_reload_is_recorded_in_the_trail_not_only_on_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = dir.path().join("p.cedar");
+        std::fs::write(&policy, POLICY).unwrap();
+        let schema = crate::cedar::schema::load().unwrap();
+        let engine = Arc::new(
+            crate::cedar::engine::Engine::bootstrap(schema, dir.path().to_path_buf()).unwrap(),
+        );
+        let (prov, _audit_dir, audit_path) = provenance();
+        let _watcher = spawn(Arc::clone(&engine), prov).unwrap();
+
+        chmod(dir.path(), 0o770);
+        std::fs::write(&policy, r#"forbid (principal, action, resource);"#).unwrap();
+
+        assert!(
+            within(Duration::from_secs(10), || !policy_set_lines(&audit_path)
+                .is_empty()),
+            "the refusal never reached the audit trail"
+        );
+        let lines = policy_set_lines(&audit_path);
+        let last = lines.last().unwrap();
+        assert_eq!(last["outcome"], "refused");
+        assert!(
+            last["content_hash"].is_null(),
+            "nothing was adopted, so there is no set to name"
+        );
+        assert_eq!(
+            last["generation"], 1,
+            "the generation recorded is the one still deciding"
+        );
+        assert!(
+            last["reason"].as_str().unwrap().contains("0770"),
+            "the reason must name the offending mode: {last}"
+        );
+    }
+
+    #[test]
+    fn a_failed_reload_is_recorded_in_the_trail() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = dir.path().join("p.cedar");
+        std::fs::write(&policy, POLICY).unwrap();
+        let schema = crate::cedar::schema::load().unwrap();
+        let engine = Arc::new(
+            crate::cedar::engine::Engine::bootstrap(schema, dir.path().to_path_buf()).unwrap(),
+        );
+        let (prov, _audit_dir, audit_path) = provenance();
+        let _watcher = spawn(Arc::clone(&engine), prov).unwrap();
+
+        std::fs::write(&policy, "permit (principal, action").unwrap();
+
+        assert!(
+            within(Duration::from_secs(10), || !policy_set_lines(&audit_path)
+                .is_empty()),
+            "the failed reload never reached the audit trail"
+        );
+        let lines = policy_set_lines(&audit_path);
+        let last = lines.last().unwrap();
+        assert_eq!(last["outcome"], "failed");
+        assert!(last["content_hash"].is_null());
+        assert_eq!(
+            last["generation"], 1,
+            "the generation recorded is the one still deciding"
         );
     }
 }

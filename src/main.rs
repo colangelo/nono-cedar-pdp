@@ -162,14 +162,27 @@ async fn run_serve(config_path: &std::path::Path) -> Result<(), String> {
         cedar::engine::Engine::bootstrap(schema, config.policy_dir.clone())
             .map_err(|e| e.to_string())?,
     );
-    // Bound to `_watcher`, not `_`: dropping it here would silently stop the
-    // watch and every later policy edit would be ignored until a restart.
-    let _watcher = nono_cedar_pdp::watcher::spawn(Arc::clone(&engine))
-        .map_err(|e| format!("starting policy watcher: {e}"))?;
     let audit = Arc::new(
         AuditLog::open(&config.audit_log)
             .map_err(|e| format!("opening audit log {}: {e}", config.audit_log.display()))?,
     );
+    // `at_risk` is decided here because this is the only place that has the
+    // advisory warnings — `isolation::check` returns them and nothing deeper down
+    // sees them.
+    let provenance = nono_cedar_pdp::watcher::Provenance {
+        audit: Arc::clone(&audit),
+        at_risk: !warnings.is_empty(),
+    };
+    // The bootstrap load already happened above; record it now that there is
+    // somewhere durable to record it. The checks still gate everything — a load
+    // that fails at bootstrap exits with its error and writes nothing, because
+    // creating an audit log as a side effect of refusing to serve would be worse
+    // than the silence.
+    provenance.record_loaded(&engine.snapshot());
+    // Bound to `_watcher`, not `_`: dropping it here would silently stop the
+    // watch and every later policy edit would be ignored until a restart.
+    let _watcher = nono_cedar_pdp::watcher::spawn(Arc::clone(&engine), provenance)
+        .map_err(|e| format!("starting policy watcher: {e}"))?;
     let bind = config.bind;
     let state = server::AppState {
         engine,
