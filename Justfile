@@ -118,4 +118,13 @@ smoke:
       || { echo "FAIL: no Cedar allow from 10-git:git-read-only"; exit 1; }
     echo "$NEW" | grep -q '"decision":"deny".*10-git:no-history-rewrites' \
       || { echo "FAIL: no Cedar deny from 10-git:no-history-rewrites"; exit 1; }
+    # The upstream header contract, checked empirically — the one place it can be.
+    # The decide endpoint requires `Content-Type: application/json`, and the `nono`
+    # dev-dependency is the sandboxing library, so no unit test can observe what the
+    # `nono-cli` webhook client actually sends (see tests/conformance.rs). Here a real
+    # client sent the requests: had it stopped sending that content-type, both greps
+    # above would already have failed with a 415 and no audit line at all, and this
+    # line pins the other header, recorded verbatim as evidence on every decision.
+    echo "$NEW" | grep -q '"user_agent":"nono-cli/' \
+      || { echo "FAIL: the real webhook client did not present a nono-cli User-Agent — read crates/nono-cli/src/approval_runtime.rs, the header contract has changed"; exit 1; }
     echo "SMOKE PASSED"

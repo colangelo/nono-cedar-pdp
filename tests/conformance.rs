@@ -152,9 +152,16 @@ fn filesystem_capability_requests_are_unsupported() {
 ///    a CORS-simple cross-origin POST may carry, which is the mechanism that closes
 ///    the browser vector (design D1).
 ///
+/// What *does* observe the real values is `just smoke`, and that is deliberate: a real
+/// `nono run` drives the endpoint there, so a client that stopped sending the
+/// content-type would fail it with a 415 and no audit line, and the recipe additionally
+/// greps the resulting audit line for `"user_agent":"nono-cli/`. Both halves are
+/// therefore empirically checked once per smoke run — verified on nono 0.69.0, whose
+/// lines read `"user_agent":"nono-cli/0.69.0"` — while this test is what fails in CI
+/// on a version bump alone.
+///
 /// The `User-Agent` is recorded as evidence only (design D5) and nothing depends on
-/// its value, so there is nothing to fail closed if it changes — which is why the
-/// version pin is the guard for that half.
+/// its value, so there is nothing to fail closed if it changes.
 #[test]
 fn the_webhook_header_contract_is_pinned_to_the_nono_version_it_was_read_from() {
     const MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));

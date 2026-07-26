@@ -263,7 +263,10 @@ fn the_documented_caveats_and_risks_are_still_in_the_readme() {
             "a local process as the same user can still forge a record",
             "forge an audit record",
         ),
-        ("the User-Agent is evidence, not verification", "not verification"),
+        (
+            "the User-Agent is evidence, not verification",
+            "not verification",
+        ),
         // Raising the log level relocates the audit log's content into a stream with
         // none of its permissions.
         (

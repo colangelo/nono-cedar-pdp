@@ -41,7 +41,25 @@ tracing max-level trap that once made filtered runs lie.
 
 ## 6. Verification
 
-- [ ] 6.1 `just test` full and filtered green; `just lint` clean
-- [ ] 6.2 **`just smoke` against real nono must pass** — this is the load-bearing check for this change, since a wrong content-type comparison would refuse every real request while every unit test passed
-- [ ] 6.3 Manual probe recorded in the task notes: `curl` without the header (expect 415), with `Origin` (expect 403), with correct header (expect a decision), and confirm the audit log gained **no** line for the two refusals
-- [ ] 6.4 `openspec validate --changes harden-decide-endpoint-surface` passes
+- [x] 6.1 `just test` full and filtered green; `just lint` clean
+- [x] 6.2 **`just smoke` against real nono must pass** — this is the load-bearing check for this change, since a wrong content-type comparison would refuse every real request while every unit test passed
+- [x] 6.3 Manual probe recorded in the task notes: `curl` without the header (expect 415), with `Origin` (expect 403), with correct header (expect a decision), and confirm the audit log gained **no** line for the two refusals
+
+  Run against a real daemon (`serve` on `127.0.0.1:8199`, shipped policy pack, temp
+  audit log), observed:
+
+  | probe | status | body | audit lines added |
+  |---|---|---|---|
+  | no `Content-Type` | `415` | `{"error":"this endpoint requires Content-Type: application/json"}` | 0 |
+  | `Origin: https://evil.example` + `Content-Type: application/json` | `403` | `{"error":"this endpoint refuses requests carrying an Origin header"}` | 0 |
+  | `Content-Type: text/plain` | `415` | as the 415 above | 0 |
+  | `Content-Type: application/json`, `User-Agent: nono-cli/0.69.0` | `200` | `{"decision":"allow"}` | 1, `"user_agent":"nono-cli/0.69.0"` |
+  | `Content-Type: application/json; charset=utf-8` | `200` | `{"decision":"deny","reason":"denied by 10-git:no-history-rewrites"}` | 1, `"user_agent":"curl/8.7.1"` |
+
+  The audit log held **0 lines after the two refusals** and 2 after the two decisions.
+  Both refusals logged at WARN naming the observed values
+  (`content_type=-`, `content_type=text/plain`, `origin=https://evil.example`,
+  `user_agent=curl/8.7.1`), and every INFO decision line carried identifiers and
+  outcome with no command line in it. Daemon killed afterwards; nothing left behind
+  in the tree.
+- [x] 6.4 `openspec validate --changes harden-decide-endpoint-surface` passes
