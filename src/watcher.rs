@@ -23,14 +23,48 @@
 //! **other local users**: the sandboxed agent runs as the same uid as the daemon
 //! and was never constrained by mode bits, only by its nono profile's write
 //! grants.
+//!
+//! The debounce is bounded at both ends: it ends on [`DEBOUNCE`] of quiet, or at
+//! [`DEBOUNCE_CEILING`] from the burst's first event, whichever comes first, and a
+//! drain the ceiling ends is reported at WARN. Only the quiet period is under the
+//! daemon's control, so without the ceiling a continuous event stream postponed
+//! every reload for as long as it lasted and a policy edit made during one was
+//! never picked up (Gitea #10). Kept in proportion: that is **liveness, not
+//! correctness** — a postponed reload leaves the last-known-good set deciding,
+//! which is fail-closed by construction, so no wrong decision is produced. What it
+//! defeats is hot-reload itself, silently, while the operator believes the edit
+//! took effect.
+//!
+//! Events are deliberately **not** filtered to the `*.cedar` paths the loader would
+//! actually load, even though that would skip a directory read per unrelated write.
+//! The trust re-check runs on the same wakeups and cares about things no such filter
+//! would pass: a `chmod` that loosens the policy directory produces an event naming
+//! the *directory*, not a policy file. Filtering would defer that re-check until
+//! something happened to touch a `.cedar` file — a narrower version of the "adopted
+//! silently" hole the re-check exists to close. The ceiling already bounds the cost
+//! the filter would have saved.
 
 use crate::cedar::engine::Engine;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+/// Quiet period that ends a burst under normal conditions.
 const DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// Upper bound on how long a burst may postpone a reload, measured from its first
+/// event.
+///
+/// [`DEBOUNCE`] alone ends the drain on a property of the *event stream* rather than
+/// of the daemon, so a stream that never goes quiet postpones every reload for as long
+/// as it lasts (Gitea #10). Well above `DEBOUNCE`, so an ordinary multi-write save —
+/// or `just install-policies` copying the starter pack, the largest legitimate burst —
+/// never reaches it; low enough that the resulting staleness stays under the threshold
+/// where an operator re-saves a policy file to check whether it took. Under sustained
+/// churn the daemon now reloads on this cadence instead of never, which is a bounded
+/// directory read plus a re-validation.
+const DEBOUNCE_CEILING: Duration = Duration::from_secs(2);
 
 /// Start watching `engine.policy_dir()`. Keep the returned watcher alive — its
 /// drop stops the watch.
@@ -54,8 +88,40 @@ pub fn spawn(engine: Arc<Engine>) -> notify::Result<RecommendedWatcher> {
                     tracing::warn!(error = %e, "policy watch error");
                     continue;
                 }
-                // Drain the burst an editor save produces.
-                while rx.recv_timeout(DEBOUNCE).is_ok() {}
+                // Drain the burst an editor save produces — but never past the
+                // ceiling. `while rx.recv_timeout(DEBOUNCE).is_ok() {}` exits only on
+                // quiet, which the event stream controls and the daemon does not, so a
+                // stream that never goes quiet postponed every reload for as long as
+                // it lasted. Waiting `min(DEBOUNCE, remaining)` rather than a flat
+                // `DEBOUNCE` matters: without it the bound could be overshot by up to
+                // one debounce on the last iteration.
+                let burst_started = Instant::now();
+                let cut_short = loop {
+                    let elapsed = burst_started.elapsed();
+                    if elapsed >= DEBOUNCE_CEILING {
+                        break true;
+                    }
+                    let wait = DEBOUNCE.min(DEBOUNCE_CEILING - elapsed);
+                    if rx.recv_timeout(wait).is_err() {
+                        // A wait the ceiling had to truncate is not the debounce's
+                        // quiet period, so it counts as the ceiling ending the drain
+                        // rather than the burst ending on its own.
+                        break wait < DEBOUNCE;
+                    }
+                };
+                if cut_short {
+                    // WARN, not INFO and not ERROR: nothing has failed and the active
+                    // set is intact, so ERROR would overstate it and break this repo's
+                    // rule that ERROR means the operator must act — but continuous
+                    // traffic in a policy directory is either a misconfiguration or a
+                    // symptom, and INFO would bury it in reload chatter. One line per
+                    // truncated drain, because the condition really is ongoing.
+                    tracing::warn!(
+                        ceiling = ?DEBOUNCE_CEILING,
+                        "policy reload debounce cut short by its ceiling; the policy \
+                         directory is producing continuous filesystem events"
+                    );
+                }
                 // Re-check trust after the drain and BEFORE the reload touches the
                 // directory, so nothing read from a loosened tree can become the
                 // active set. On refusal the in-memory set predates the loosening
@@ -490,6 +556,85 @@ mod tests {
         assert!(
             !engine.evaluate(&git_status()).allow,
             "the repaired edit must be the one deciding"
+        );
+    }
+
+    /// The drain used to end only on `DEBOUNCE` of quiet, which is a property of the
+    /// event stream and not of the daemon: while events kept arriving the reload was
+    /// postponed indefinitely, so a policy edit made during a stream was never picked
+    /// up and nothing said so (Gitea #10).
+    ///
+    /// Severity, stated honestly rather than inflated: this is **liveness, not
+    /// correctness**. A postponed reload leaves the last-known-good set deciding,
+    /// which is fail-closed by construction, so no wrong decision is ever produced.
+    /// What it defeats is hot-reload itself, silently, while the operator's mental
+    /// model says the edit took effect.
+    ///
+    /// The churn file is deliberately **not** a `*.cedar` file: events the loader
+    /// would ignore still drive the drain, which is half of what made the unbounded
+    /// version so easy to trip. It is also why the assertion is on the **decision**
+    /// rather than the generation — churn-driven reloads advance the generation on
+    /// their own, so only a flipped decision proves *this edit* was adopted.
+    ///
+    /// The 20 ms churn rate is not a guess. Measured on this platform before the test
+    /// was written: it kept an unbounded 150 ms drain alive across 853 delivered
+    /// events for a full 5 s probe, never once terminating. Without that margin the
+    /// test could pass against unfixed code and prove nothing.
+    #[test]
+    fn a_continuous_event_stream_cannot_postpone_a_reload_forever() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let policy = dir.path().join("p.cedar");
+        std::fs::write(&policy, POLICY).unwrap();
+        let schema = crate::cedar::schema::load().unwrap();
+        let engine = Arc::new(
+            crate::cedar::engine::Engine::bootstrap(schema, dir.path().to_path_buf()).unwrap(),
+        );
+        let capture = crate::test_log::capture();
+        let _watcher = spawn(Arc::clone(&engine)).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let churn = {
+            let stop = Arc::clone(&stop);
+            let churn_file = dir.path().join("churn.txt");
+            std::thread::spawn(move || {
+                let mut i = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    // Ignored: the tempdir may already be gone if the test panicked.
+                    let _ = std::fs::write(&churn_file, i.to_string());
+                    i = i.wrapping_add(1);
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            })
+        };
+
+        // Let the drain be well underway before the edit lands, so the edit is made
+        // into a stream rather than before one.
+        std::thread::sleep(Duration::from_millis(300));
+        std::fs::write(&policy, r#"forbid (principal, action, resource);"#).unwrap();
+
+        let adopted = within(Duration::from_secs(5), || {
+            !engine.evaluate(&git_status()).allow
+        });
+        // Stop the churn before asserting: a live thread writing into a tempdir being
+        // dropped by a panicking unwind is a distraction in the failure output.
+        stop.store(true, Ordering::Relaxed);
+        churn.join().unwrap();
+
+        assert!(
+            adopted,
+            "a policy edit made during a continuous event stream must still be \
+             adopted within the debounce ceiling, not held until the stream stops; \
+             generation {}",
+            engine.snapshot().generation
+        );
+        let log = capture.text();
+        assert!(
+            log.contains("cut short"),
+            "a drain ended by the ceiling must be reported, so sustained traffic in \
+             the policy directory is visible rather than inferred from reloads that \
+             merely seem late: {log:?}"
         );
     }
 }
