@@ -196,7 +196,9 @@ fn run_check(
     let decision = engine.evaluate(&query);
     if audit {
         match nono_cedar_pdp::audit::AuditLog::open(&config.audit_log) {
-            Ok(log) => log.record(&query, &decision),
+            // No HTTP request behind a `check`, so there is no observed
+            // `User-Agent` to record: the line carries an explicit null.
+            Ok(log) => log.record(&query, &decision, None),
             Err(e) => eprintln!(
                 "warning: audit log {} unavailable: {e}",
                 config.audit_log.display()

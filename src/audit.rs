@@ -44,6 +44,20 @@ pub struct AuditRecord<'a> {
     /// `intercept_rule` on purpose: they are different upstream fields with
     /// different grammars, and the line's job is fidelity.
     pub rule_label: Option<&'a str>,
+    /// The `User-Agent` the request presented, control-escaped, as sent. A real
+    /// request carries `nono-cli/<version>`.
+    ///
+    /// **Evidence, not verification.** Both halves are true and both matter: browser
+    /// JavaScript cannot set this header at all, so a line whose agent is absent or
+    /// unexpected is a signal worth having; a local process running as the same user
+    /// sets it to whatever it likes, so a line whose agent looks right proves
+    /// nothing. Recording it does not authenticate the caller and must never be
+    /// described as doing so — a field that *looks* like authentication is worse
+    /// than no field at all.
+    ///
+    /// Null when the request carried no `User-Agent`, and on lines written by
+    /// something other than an HTTP request (the `check` CLI's what-if).
+    pub user_agent: Option<&'a str>,
     pub decision: &'static str,
     pub matched: &'a [String],
     pub reason: &'a str,
@@ -241,14 +255,21 @@ impl AuditLog {
 
     /// Record a decision. A logging failure must never change a decision, so
     /// errors are traced and swallowed.
-    pub fn record(&self, query: &PolicyQuery, decision: &Decision) {
+    ///
+    /// `user_agent` is the header the request presented, or `None` when there was no
+    /// HTTP request behind the call (the `check` CLI's what-if). It is recorded as
+    /// **evidence, not verification** — see [`AuditRecord::user_agent`] for both
+    /// halves of why.
+    pub fn record(&self, query: &PolicyQuery, decision: &Decision, user_agent: Option<&str>) {
         // The boundary rule: every request-derived value on the line is
         // control-escaped here, at the recording boundary, rather than left to
         // serde — JSON string encoding escapes only C0 controls (U+0000..U+001F),
         // so a DEL or C1 control (CSI among them) would land in the JSONL raw
         // and replay in the terminal of whoever reads the trail. That covers the
-        // routing fields below and the wire-chosen identifiers (`request_id`,
-        // `session_id`, `backend`); the remaining values are covered elsewhere:
+        // routing fields below, the wire-chosen identifiers (`request_id`,
+        // `session_id`, `backend`) and the observed `user_agent`, which arrives from
+        // a *header* and is therefore the one such value that never passed through
+        // the body-scraping boundary; the remaining values are covered elsewhere:
         // `agent` comes from our own config, `principal` goes through `{:?}`
         // (which escapes controls), and `resource` is escaped inside
         // `resource_summary`. Honest values contain no control bytes, so they
@@ -258,6 +279,7 @@ impl AuditLog {
         let request_id = crate::sanitize::control_escape(&query.request_id);
         let session_id = crate::sanitize::control_escape(&query.session_id);
         let backend = crate::sanitize::control_escape(&query.backend);
+        let user_agent = user_agent.map(crate::sanitize::control_escape);
         let (child_pid, intercept_rule, rule_label) = match &query.target {
             crate::query::Target::Command {
                 intercept_rule,
@@ -290,6 +312,7 @@ impl AuditLog {
             child_pid,
             intercept_rule: intercept_rule.as_deref(),
             rule_label: rule_label.as_deref(),
+            user_agent: user_agent.as_deref(),
             decision: if decision.allow { "allow" } else { "deny" },
             matched: &decision.matched,
             reason: &decision.reason,
@@ -302,7 +325,16 @@ impl AuditLog {
     /// no Cedar principal or action for these, so those fields are null; the
     /// refused variant stands in as the resource, because it is the only "what was
     /// asked" the wire gave us.
-    pub fn record_rejected(&self, context: &RejectedContext, decision: &Decision) {
+    pub fn record_rejected(
+        &self,
+        context: &RejectedContext,
+        decision: &Decision,
+        user_agent: Option<&str>,
+    ) {
+        // Escaped here, on this path too: the context's own fields were escaped at
+        // the adapter boundary by `scrape_context`, but the agent never went through
+        // it — it comes from a header, not the body.
+        let user_agent = user_agent.map(crate::sanitize::control_escape);
         self.append(&AuditRecord {
             ts: now_rfc3339(),
             request_id: context.request_id.as_deref(),
@@ -320,6 +352,7 @@ impl AuditLog {
             child_pid: None,
             intercept_rule: None,
             rule_label: None,
+            user_agent: user_agent.as_deref(),
             decision: if decision.allow { "allow" } else { "deny" },
             matched: &decision.matched,
             reason: &decision.reason,
@@ -514,7 +547,7 @@ mod tests {
         let path = dir.path().join("decisions.jsonl");
         let log = AuditLog::open(&path).unwrap();
 
-        log.record(&query(), &crate::decision::Decision::deny("nope"));
+        log.record(&query(), &crate::decision::Decision::deny("nope"), None);
 
         let line = &lines(&path)[0];
         assert_eq!(line["child_pid"], 42, "{line:#}");
@@ -538,7 +571,11 @@ mod tests {
         let path = dir.path().join("decisions.jsonl");
         let log = AuditLog::open(&path).unwrap();
 
-        log.record(&endpoint_query(), &crate::decision::Decision::deny("nope"));
+        log.record(
+            &endpoint_query(),
+            &crate::decision::Decision::deny("nope"),
+            None,
+        );
 
         let line = &lines(&path)[0];
         assert_eq!(
@@ -575,8 +612,16 @@ mod tests {
             *rule_label = "rl\u{7f}\u{9b}0m".to_string();
         }
 
-        log.record(&hostile_command, &crate::decision::Decision::deny("nope"));
-        log.record(&hostile_endpoint, &crate::decision::Decision::deny("nope"));
+        log.record(
+            &hostile_command,
+            &crate::decision::Decision::deny("nope"),
+            None,
+        );
+        log.record(
+            &hostile_endpoint,
+            &crate::decision::Decision::deny("nope"),
+            None,
+        );
 
         let raw = std::fs::read(&path).unwrap();
         let csi = "\u{9b}".as_bytes(); // 0xC2 0x9B in UTF-8
@@ -598,7 +643,11 @@ mod tests {
             "{:#}",
             lines[0]
         );
-        assert_eq!(lines[1]["rule_label"], "rl\\u{007f}\\u{009b}0m", "{:#}", lines[1]);
+        assert_eq!(
+            lines[1]["rule_label"], "rl\\u{007f}\\u{009b}0m",
+            "{:#}",
+            lines[1]
+        );
     }
 
     /// The same boundary rule, for the identifier fields the first fix stopped
@@ -618,7 +667,7 @@ mod tests {
         hostile.session_id = "s\u{7f}1".to_string();
         hostile.backend = "cedar\u{9b}0m\u{7f}".to_string();
 
-        log.record(&hostile, &crate::decision::Decision::deny("nope"));
+        log.record(&hostile, &crate::decision::Decision::deny("nope"), None);
 
         let raw = std::fs::read(&path).unwrap();
         let csi = "\u{9b}".as_bytes(); // 0xC2 0x9B in UTF-8
@@ -642,6 +691,53 @@ mod tests {
         );
         assert_eq!(line["session_id"], "s\\u{007f}1", "{line:#}");
         assert_eq!(line["backend"], "cedar\\u{009b}0m\\u{007f}", "{line:#}");
+    }
+
+    /// The `User-Agent` is request-derived text like any other, so the delta spec's
+    /// escape SHALL covers it — and it is the one such value that arrives from a
+    /// *header* rather than a body, i.e. from a different module. Pinned at the
+    /// recording boundary, on the raw file bytes, on **both** record paths: DEL is
+    /// unreachable through a real header (HTTP parsers reject 0x7F) while C1 is not,
+    /// so a test that only sent what a socket can carry would leave the DEL half of
+    /// the rule unasserted — and the rule has to hold for whatever the extraction
+    /// path becomes, not only for what today's parser admits.
+    #[test]
+    fn del_and_c1_controls_in_the_user_agent_never_reach_the_file_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decisions.jsonl");
+        let log = AuditLog::open(&path).unwrap();
+
+        let hostile = "nono-cli/0.69.0\u{9b}31mDENY\u{7f} OVERRIDDEN";
+        log.record(
+            &query(),
+            &crate::decision::Decision::deny("nope"),
+            Some(hostile),
+        );
+        log.record_rejected(
+            &crate::adapter::nono_webhook::RejectedContext::default(),
+            &crate::decision::Decision::deny("unsupported"),
+            Some(hostile),
+        );
+
+        let raw = std::fs::read(&path).unwrap();
+        let csi = "\u{9b}".as_bytes(); // 0xC2 0x9B in UTF-8
+        assert!(
+            !raw.windows(csi.len()).any(|window| window == csi),
+            "a raw CSI byte reached the audit file: {:?}",
+            String::from_utf8_lossy(&raw)
+        );
+        assert!(
+            !raw.contains(&0x7f),
+            "a raw DEL byte reached the audit file: {:?}",
+            String::from_utf8_lossy(&raw)
+        );
+
+        // Escaped, not truncated or dropped: an odd User-Agent is exactly the
+        // evidence an investigator came for.
+        let lines = lines(&path);
+        let escaped = "nono-cli/0.69.0\\u{009b}31mDENY\\u{007f} OVERRIDDEN";
+        assert_eq!(lines[0]["user_agent"], escaped, "{:#}", lines[0]);
+        assert_eq!(lines[1]["user_agent"], escaped, "{:#}", lines[1]);
     }
 
     /// The rejected path's escaping lives in `scrape_context`, one module away
@@ -673,7 +769,11 @@ mod tests {
         })
         .to_string();
         let context = crate::adapter::nono_webhook::scrape_context(body.as_bytes(), &config);
-        log.record_rejected(&context, &crate::decision::Decision::deny("unsupported"));
+        log.record_rejected(
+            &context,
+            &crate::decision::Decision::deny("unsupported"),
+            None,
+        );
 
         let raw = std::fs::read(&path).unwrap();
         let csi = "\u{9b}".as_bytes(); // 0xC2 0x9B in UTF-8
@@ -702,30 +802,46 @@ mod tests {
     /// A rejected request never became a `PolicyQuery`, so none of the three
     /// routing fields is known — and each must still be an explicit null, because
     /// the fixed key set is the invariant a consumer leans on. All three line
-    /// kinds go through one log so the equality is asserted, not implied.
+    /// kinds go through one log so the equality is asserted, not implied. The first
+    /// line carries a `User-Agent` and the others do not, so key-set parity is
+    /// asserted across lines whose *values* differ: a key that appeared only when
+    /// its value was known would break every consumer that reads a fixed schema.
     #[test]
     fn every_line_kind_carries_the_same_key_set_with_nulls_for_the_unknown() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("decisions.jsonl");
         let log = AuditLog::open(&path).unwrap();
 
-        log.record(&query(), &crate::decision::Decision::deny("command"));
-        log.record(&endpoint_query(), &crate::decision::Decision::deny("endpoint"));
+        log.record(
+            &query(),
+            &crate::decision::Decision::deny("command"),
+            Some("nono-cli/0.69.0"),
+        );
+        log.record(
+            &endpoint_query(),
+            &crate::decision::Decision::deny("endpoint"),
+            None,
+        );
         log.record_rejected(
             &crate::adapter::nono_webhook::RejectedContext::default(),
             &crate::decision::Decision::deny("rejected"),
+            None,
         );
 
         let lines = lines(&path);
         assert_eq!(lines.len(), 3, "{lines:#?}");
+        assert_eq!(lines[0]["user_agent"], "nono-cli/0.69.0", "{:#}", lines[0]);
 
         let rejected = &lines[2];
-        for key in ["child_pid", "intercept_rule", "rule_label"] {
+        for key in ["child_pid", "intercept_rule", "rule_label", "user_agent"] {
             assert!(
                 rejected.as_object().unwrap().contains_key(key),
                 "a rejected line must still carry {key} as an explicit null: {rejected:#}"
             );
-            assert!(rejected[key].is_null(), "{key} on a rejected line: {rejected:#}");
+            assert!(
+                rejected[key].is_null(),
+                "{key} on a rejected line: {rejected:#}"
+            );
         }
 
         let key_set = |line: &serde_json::Value| -> Vec<String> {
@@ -751,8 +867,12 @@ mod tests {
         let path = dir.path().join("nested/decisions.jsonl");
         let log = AuditLog::open(&path).unwrap();
 
-        log.record(&query(), &crate::decision::Decision::deny("nope"));
-        log.record(&query(), &crate::decision::Decision::deny("still nope"));
+        log.record(&query(), &crate::decision::Decision::deny("nope"), None);
+        log.record(
+            &query(),
+            &crate::decision::Decision::deny("still nope"),
+            None,
+        );
 
         let text = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = text.lines().collect();
@@ -795,7 +915,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         let log = AuditLog::open(&path).unwrap();
-        log.record(&query(), &crate::decision::Decision::deny("nope"));
+        log.record(&query(), &crate::decision::Decision::deny("nope"), None);
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
@@ -862,9 +982,17 @@ mod tests {
         let disk = FullDisk::with_budget(120);
         let log = AuditLog::with_sink(Box::new(disk.clone()), false);
 
-        log.record(&query(), &crate::decision::Decision::deny("full disk"));
+        log.record(
+            &query(),
+            &crate::decision::Decision::deny("full disk"),
+            None,
+        );
         disk.set_budget(usize::MAX);
-        log.record(&query(), &crate::decision::Decision::deny("after recovery"));
+        log.record(
+            &query(),
+            &crate::decision::Decision::deny("after recovery"),
+            None,
+        );
 
         let text = disk.text();
         for line in text.lines() {
@@ -983,7 +1111,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
 
         let log = AuditLog::open(&path).unwrap();
-        log.record(&query(), &crate::decision::Decision::deny("nope"));
+        log.record(&query(), &crate::decision::Decision::deny("nope"), None);
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -1001,7 +1129,11 @@ mod tests {
         std::fs::write(&path, truncated).unwrap();
 
         let log = AuditLog::open(&path).unwrap();
-        log.record(&query(), &crate::decision::Decision::deny("after recovery"));
+        log.record(
+            &query(),
+            &crate::decision::Decision::deny("after recovery"),
+            None,
+        );
 
         let text = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = text.lines().collect();
@@ -1029,9 +1161,14 @@ mod tests {
             log.record(
                 &query(),
                 &crate::decision::Decision::deny("before rotation"),
+                None,
             );
             std::fs::rename(&path, &rotated).unwrap();
-            log.record(&query(), &crate::decision::Decision::deny("after rotation"));
+            log.record(
+                &query(),
+                &crate::decision::Decision::deny("after rotation"),
+                None,
+            );
         });
 
         let current = std::fs::read_to_string(&path)
@@ -1080,9 +1217,17 @@ mod tests {
         let path = dir.path().join("decisions.jsonl");
 
         let log = AuditLog::open(&path).unwrap();
-        log.record(&query(), &crate::decision::Decision::deny("before delete"));
+        log.record(
+            &query(),
+            &crate::decision::Decision::deny("before delete"),
+            None,
+        );
         std::fs::remove_file(&path).unwrap();
-        log.record(&query(), &crate::decision::Decision::deny("after delete"));
+        log.record(
+            &query(),
+            &crate::decision::Decision::deny("after delete"),
+            None,
+        );
 
         let current = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("nothing readable at the configured path: {e}"));
@@ -1107,12 +1252,17 @@ mod tests {
             log.record(
                 &query(),
                 &crate::decision::Decision::deny("before rotation"),
+                None,
             );
             std::fs::rename(&path, &rotated).unwrap();
             // Owner-execute only: the directory can be traversed but nothing new
             // created in it, so the reopen cannot succeed.
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
-            log.record(&query(), &crate::decision::Decision::deny("after rotation"));
+            log.record(
+                &query(),
+                &crate::decision::Decision::deny("after rotation"),
+                None,
+            );
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         });
 
@@ -1147,9 +1297,14 @@ mod tests {
             log.record(
                 &query(),
                 &crate::decision::Decision::deny("before truncate"),
+                None,
             );
             File::create(&path).unwrap(); // O_TRUNC on the same inode
-            log.record(&query(), &crate::decision::Decision::deny("after truncate"));
+            log.record(
+                &query(),
+                &crate::decision::Decision::deny("after truncate"),
+                None,
+            );
         });
 
         let current = std::fs::read_to_string(&path).unwrap();

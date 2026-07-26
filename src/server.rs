@@ -204,6 +204,9 @@ async fn approve(State(state): State<AppState>, headers: HeaderMap, body: Body) 
     if let Some(refusal) = header_gate(&headers) {
         return refusal;
     }
+    // Recorded on every line below as evidence and trusted for nothing — see
+    // `AuditRecord::user_agent`.
+    let user_agent = observed(&headers, USER_AGENT);
 
     // Defence in depth: bootstrap refuses an empty policy dir, so this should be
     // unreachable. If it ever fires, 503 tells nono "PDP broken", which is a
@@ -226,9 +229,11 @@ async fn approve(State(state): State<AppState>, headers: HeaderMap, body: Body) 
                 "approval request body was unreadable or above the \
                  {MAX_REQUEST_BYTES}-byte limit; failing closed"
             ));
-            state
-                .audit
-                .record_rejected(&RejectedContext::default(), &decision);
+            state.audit.record_rejected(
+                &RejectedContext::default(),
+                &decision,
+                user_agent.as_deref(),
+            );
             tracing::warn!(
                 error = %crate::sanitize::control_escape(&e.to_string()),
                 limit = MAX_REQUEST_BYTES,
@@ -245,7 +250,9 @@ async fn approve(State(state): State<AppState>, headers: HeaderMap, body: Body) 
             // with whatever context the refused body still yields.
             let context = crate::adapter::nono_webhook::scrape_context(&body, &state.config);
             let decision = Decision::deny(e.deny_reason());
-            state.audit.record_rejected(&context, &decision);
+            state
+                .audit
+                .record_rejected(&context, &decision, user_agent.as_deref());
             tracing::warn!(
                 // Cedar and serde error text can quote request-supplied values.
                 error = %crate::sanitize::control_escape(&e.to_string()),
@@ -260,7 +267,7 @@ async fn approve(State(state): State<AppState>, headers: HeaderMap, body: Body) 
     };
 
     let decision = state.engine.evaluate(&query);
-    state.audit.record(&query, &decision);
+    state.audit.record(&query, &decision, user_agent.as_deref());
     tracing::info!(
         // Upstream builds `request_id` from the intercepted command name, so an
         // agent chooses part of it: escape before it reaches an operator's

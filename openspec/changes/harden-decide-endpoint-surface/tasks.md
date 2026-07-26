@@ -21,10 +21,10 @@ tracing max-level trap that once made filtered runs lie.
 
 ## 3. Record the observed User-Agent as evidence (#8)
 
-- [ ] 3.1 Failing test: a decided line records `user_agent` verbatim; a request with no `User-Agent` records an explicit `null`
-- [ ] 3.2 Failing test: DEL/C1 control bytes in `User-Agent` are escaped on the raw bytes of the audit file (same standard as the other request-derived fields)
-- [ ] 3.3 Failing test: a rejected (malformed/unsupported) line carries the key too, with the observed value or `null`
-- [ ] 3.4 Implement: `AuditRecord.user_agent`, threaded from the request through both record paths; doc comment says **evidence, not verification**, naming both halves (browser JS cannot set it; a local process can)
+- [x] 3.1 Failing test: a decided line records `user_agent` verbatim; a request with no `User-Agent` records an explicit `null`
+- [x] 3.2 Failing test: DEL/C1 control bytes in `User-Agent` are escaped on the raw bytes of the audit file (same standard as the other request-derived fields)
+- [x] 3.3 Failing test: a rejected (malformed/unsupported) line carries the key too, with the observed value or `null`
+- [x] 3.4 Implement: `AuditRecord.user_agent`, threaded from the request through both record paths; doc comment says **evidence, not verification**, naming both halves (browser JS cannot set it; a local process can)
 
 ## 4. stdout becomes telemetry (#9)
 

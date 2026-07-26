@@ -508,6 +508,128 @@ async fn a_malformed_body_that_passes_the_gate_is_still_a_200_deny_on_the_record
     assert_eq!(lines[0]["decision"], "deny");
 }
 
+/// The `User-Agent` is recorded as **evidence, not verification**: browser
+/// JavaScript cannot set the header at all, so an absent or odd value is a real
+/// signal, while a local process sets it to anything it likes, so a value that looks
+/// right proves nothing. Both halves are why it is recorded verbatim and trusted for
+/// nothing — and why an absent one is an explicit `null` rather than a missing key: a
+/// consumer must be able to tell "presented nothing" from "we stopped recording it".
+#[tokio::test]
+async fn a_decided_line_records_the_user_agent_as_sent_and_null_when_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = server::router(state(&dir));
+
+    let (status, _) = post_with_headers(
+        &app,
+        NONO_HEADERS,
+        &command_body_with_request_id("with-agent", "git", &[SHIM_GIT, "status"]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = post_with_headers(
+        &app,
+        &[("content-type", "application/json")],
+        &command_body_with_request_id("no-agent", "git", &[SHIM_GIT, "status"]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let lines = audit_lines(&dir);
+    assert_eq!(lines.len(), 2, "{lines:#?}");
+    assert_eq!(
+        lines[0]["user_agent"], NONO_USER_AGENT,
+        "the line must record what the caller presented, verbatim: {:#?}",
+        lines[0]
+    );
+    assert!(
+        lines[1].as_object().unwrap().contains_key("user_agent"),
+        "a request with no User-Agent must record an explicit null, not omit the \
+         key — the key set is identical on every line: {:#?}",
+        lines[1]
+    );
+    assert!(lines[1]["user_agent"].is_null(), "{:#?}", lines[1]);
+}
+
+/// A rejected request never becomes a `PolicyQuery`, and its line must still carry the
+/// key — with the observed agent when the request presented one. The rejected path is
+/// the one a hostile caller controls, so it is the one where the evidence matters most.
+#[tokio::test]
+async fn a_rejected_line_records_the_user_agent_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = server::router(state(&dir));
+
+    let (status, response) = post_with_headers(&app, NONO_HEADERS, &capability_body("cap-1")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["decision"], "deny", "{response}");
+
+    let (status, response) = post_with_headers(&app, NONO_HEADERS, "{not json").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["decision"], "deny", "{response}");
+
+    // And one with nothing to record, so the null is asserted on this path too.
+    let (status, _) =
+        post_with_headers(&app, &[("content-type", "application/json")], "{not json").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let lines = audit_lines(&dir);
+    assert_eq!(lines.len(), 3, "{lines:#?}");
+    assert_eq!(
+        lines[0]["user_agent"], NONO_USER_AGENT,
+        "an unsupported variant is still a decision, with the same evidence on it: {:#?}",
+        lines[0]
+    );
+    assert_eq!(
+        lines[1]["user_agent"], NONO_USER_AGENT,
+        "a body that never parsed still presented a User-Agent: {:#?}",
+        lines[1]
+    );
+    assert!(
+        lines[2].as_object().unwrap().contains_key("user_agent")
+            && lines[2]["user_agent"].is_null(),
+        "{:#?}",
+        lines[2]
+    );
+}
+
+/// The same boundary rule the other request-derived fields follow, end to end: a
+/// `User-Agent` carrying a C1 control must not reach the audit file raw. C1
+/// specifically because serde's JSON encoding escapes only C0 (U+0000..U+001F), so a
+/// C0-based test would pass with no escaping at all — and because hyper accepts
+/// `0xC2 0x9B` (CSI) in a header value, so this is reachable over a real socket, not
+/// merely at the recording boundary. DEL is unreachable through a header (the HTTP
+/// parsers reject 0x7F), so it is pinned in `audit.rs`'s unit tests instead.
+#[tokio::test]
+async fn a_c1_control_in_the_user_agent_never_reaches_the_audit_file_raw() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = server::router(state(&dir));
+
+    let (status, _) = post_with_headers(
+        &app,
+        &[
+            ("content-type", "application/json"),
+            ("user-agent", "nono-cli/0.69.0\u{9b}31mDENY OVERRIDDEN"),
+        ],
+        &command_body("git", &[SHIM_GIT, "status"]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let raw = std::fs::read(dir.path().join("decisions.jsonl")).unwrap();
+    let csi = "\u{9b}".as_bytes(); // 0xC2 0x9B in UTF-8
+    assert!(
+        !raw.windows(csi.len()).any(|window| window == csi),
+        "a raw CSI byte reached the audit file: {:?}",
+        String::from_utf8_lossy(&raw)
+    );
+    let lines = audit_lines(&dir);
+    assert_eq!(
+        lines[0]["user_agent"], "nono-cli/0.69.0\\u{009b}31mDENY OVERRIDDEN",
+        "escaped, not truncated or dropped — the evidence has to survive: {:#?}",
+        lines[0]
+    );
+}
+
 #[tokio::test]
 async fn permitted_command_gets_allow() {
     let dir = tempfile::tempdir().unwrap();
