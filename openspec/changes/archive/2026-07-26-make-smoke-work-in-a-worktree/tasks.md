@@ -28,5 +28,5 @@ the recipe in both checkout shapes rather than a `cargo test` case.
 
 ## 4. Land
 
-- [ ] 4.1 Merge to `main`, archive the change, push to `internal` and `origin`
-- [ ] 4.2 Close #32 with the measurement that ruled out the command-line fix
+- [x] 4.1 Merged to `main`, change archived, pushed to `internal` and `origin`
+- [x] 4.2 #32 closed with the measurement that ruled out the command-line fix
