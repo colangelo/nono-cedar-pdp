@@ -268,19 +268,36 @@ async fn approve(State(state): State<AppState>, headers: HeaderMap, body: Body) 
 
     let decision = state.engine.evaluate(&query);
     state.audit.record(&query, &decision, user_agent.as_deref());
+    // Upstream builds `request_id` from the intercepted command name, so an agent
+    // chooses part of it: escape before it reaches an operator's terminal, where a
+    // raw ESC/CR would rewrite the line being read.
+    let request_id = crate::sanitize::control_escape(&query.request_id);
+    // Telemetry, not the decision record. stdout goes wherever the operator
+    // redirected it — a shared journal, a log aggregator, terminal scrollback — none
+    // of which inherit the audit log's 0600, so this line carries the identifiers and
+    // the outcome and nothing request-derived beyond them. The audit log is
+    // unchanged and remains the complete record: the detail is relocated, not lost.
     tracing::info!(
-        // Upstream builds `request_id` from the intercepted command name, so an
-        // agent chooses part of it: escape before it reaches an operator's
-        // terminal, where a raw ESC/CR would rewrite the line being read.
-        request_id = %crate::sanitize::control_escape(&query.request_id),
+        request_id = %request_id,
         session_id = %crate::sanitize::control_escape(&query.session_id),
         backend = %crate::sanitize::control_escape(&query.backend),
         action = query.action_name(),
-        resource = %query.resource_summary(),
         allow = decision.allow,
         matched = ?decision.matched,
         eval_us = decision.eval_us,
         "decision"
+    );
+    // A *separate* event rather than one more field above, because `tracing` fields
+    // are fixed per event: the resource summary — the command line an agent
+    // attempted, or the API path it requested — is the first thing wanted when a
+    // policy will not match, so it stays available, but only when an operator opts
+    // in. It repeats `request_id` on purpose: without it this cannot be joined to
+    // the decision line above, and joining is what makes relocating the detail
+    // costless.
+    tracing::debug!(
+        request_id = %request_id,
+        resource = %query.resource_summary(),
+        "decision detail"
     );
 
     (StatusCode::OK, Json(decision.to_wire())).into_response()

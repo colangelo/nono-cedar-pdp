@@ -1175,6 +1175,143 @@ async fn a_malformed_body_is_audited_without_context() {
     }
 }
 
+/// stdout and the audit log carry the same request-derived content and nothing like
+/// the same protection: the log is `0600`, tightened if it was looser and reattached
+/// across rotation, while stdout goes wherever the operator redirected it — a shared
+/// journal, a log aggregator, terminal scrollback. So the *identifiers and outcome*
+/// belong at INFO and the attempted command line does not.
+///
+/// The distinctive argument is what makes this assertion real: `git` also appears in
+/// the matched policy id, so asserting the absence of the command *name* would be
+/// unfalsifiable. The shim path is asserted absent too, since it is the other half of
+/// what `resource_summary` would have leaked.
+#[tokio::test]
+async fn the_default_decision_line_carries_identifiers_but_not_the_command_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret_argument = "--author=leaked-into-an-unprotected-stream";
+    let body =
+        command_body_with_request_id("telemetry-1", "git", &[SHIM_GIT, "status", secret_argument]);
+
+    let logs = {
+        let capture = capture();
+        let (status, response) = post(&dir, &body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        capture.text()
+    };
+
+    // The identifiers and the outcome: enough to correlate with the audit line and
+    // to watch the daemon work.
+    for field in [
+        "request_id=telemetry-1",
+        "session_id=s1",
+        "backend=cedar",
+        "action=\"launchCommand\"",
+        "allow=true",
+        "matched=",
+        "eval_us=",
+    ] {
+        assert!(
+            logs.contains(field),
+            "the INFO decision line must carry {field:?}: {logs:?}"
+        );
+    }
+
+    assert!(
+        !logs.contains(secret_argument),
+        "the attempted command line must not reach stdout at the default level — \
+         stdout has none of the audit log's permissions: {logs:?}"
+    );
+    assert!(
+        !logs.contains(SHIM_GIT),
+        "the argv must not reach stdout at the default level either: {logs:?}"
+    );
+}
+
+/// Relocated, not deleted (design D6): the resource summary is the first thing you
+/// want when a policy will not match, so DEBUG keeps it — as a *separate* event,
+/// because `tracing` fields are fixed per event. It must repeat `request_id` or it
+/// cannot be joined to the INFO line it belongs to, and it must stay control-escaped:
+/// the command line is chosen by whatever the agent ran.
+#[tokio::test]
+async fn at_debug_the_resource_summary_is_emitted_and_can_be_joined_by_request_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let hostile_argument = "commit\u{1b}[2K\rINFO forged allow=true";
+    let body = serde_json::json!({
+        "backend": "cedar",
+        "request": {
+            "capability_type": "command",
+            "request_id": "telemetry-2",
+            "command": "git",
+            "args": [SHIM_GIT, "status", hostile_argument],
+            "caller": "session",
+            "intercept_rule": "status",
+            "reason": null,
+            "child_pid": 42,
+            "session_id": "s1"
+        }
+    })
+    .to_string();
+
+    let logs = {
+        let capture = capture_at(tracing::Level::DEBUG);
+        let (status, response) = post(&dir, &body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        capture.text()
+    };
+
+    assert!(
+        logs.contains("DEBUG"),
+        "the detail must be emitted when the operator opts in: {logs:?}"
+    );
+    assert!(
+        logs.contains(SHIM_GIT),
+        "the resource summary is what DEBUG exists to provide: {logs:?}"
+    );
+    // Two events, so the identifier has to appear on the DEBUG one as well — count
+    // it rather than merely finding it, or a single INFO line would satisfy this.
+    assert!(
+        logs.matches("request_id=telemetry-2").count() >= 2,
+        "the DEBUG event must repeat request_id or it cannot be joined to the \
+         decision line: {logs:?}"
+    );
+    assert!(
+        !logs.contains('\u{1b}'),
+        "raw ESC reached the operator log: {logs:?}"
+    );
+    assert!(
+        logs.contains("\\u{001b}"),
+        "the escape must be visible, not dropped: {logs:?}"
+    );
+}
+
+/// Nothing is *lost* by the split, only relocated: the audit log is the complete
+/// record at any log level, so the detail removed from stdout is still recorded in
+/// the file that has permissions.
+#[tokio::test]
+async fn the_audit_line_keeps_the_full_resource_summary_at_the_default_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret_argument = "--author=only-in-the-audit-log";
+    let body =
+        command_body_with_request_id("telemetry-3", "git", &[SHIM_GIT, "status", secret_argument]);
+
+    let logs = {
+        let capture = capture();
+        let (status, _) = post(&dir, &body).await;
+        assert_eq!(status, StatusCode::OK);
+        capture.text()
+    };
+    assert!(!logs.contains(secret_argument), "{logs:?}");
+
+    let lines = audit_lines(&dir);
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    let resource = lines[0]["resource"].as_str().unwrap();
+    assert!(
+        resource.contains(secret_argument) && resource.contains(SHIM_GIT),
+        "the audit line must still carry the complete resource summary: {:#?}",
+        lines[0]
+    );
+}
+
 /// Upstream builds `request_id` as `…-approve-{command}-{nanos}`, so the agent
 /// picks part of it. Raw `ESC`/`CR` in an operator-facing log line lets a crafted
 /// name erase and rewrite the decision an operator is reading.

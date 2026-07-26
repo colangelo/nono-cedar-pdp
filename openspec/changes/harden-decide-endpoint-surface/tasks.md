@@ -28,10 +28,10 @@ tracing max-level trap that once made filtered runs lie.
 
 ## 4. stdout becomes telemetry (#9)
 
-- [ ] 4.1 Failing test: at the default level, the captured log for a decided command request contains the identifiers and outcome and does **not** contain the attempted command line or its arguments
-- [ ] 4.2 Failing test: at DEBUG, the resource summary is emitted, control-escaped, and carries `request_id` so it can be joined to the INFO line
-- [ ] 4.3 Failing test: the audit line still carries the full resource summary at the default level — relocating the detail must not reduce the record
-- [ ] 4.4 Implement the split as two events (D6): INFO with identifiers, separate DEBUG with `request_id` + resource
+- [x] 4.1 Failing test: at the default level, the captured log for a decided command request contains the identifiers and outcome and does **not** contain the attempted command line or its arguments
+- [x] 4.2 Failing test: at DEBUG, the resource summary is emitted, control-escaped, and carries `request_id` so it can be joined to the INFO line
+- [x] 4.3 Failing test: the audit line still carries the full resource summary at the default level — relocating the detail must not reduce the record
+- [x] 4.4 Implement the split as two events (D6): INFO with identifiers, separate DEBUG with `request_id` + resource
 
 ## 5. Documentation
 
