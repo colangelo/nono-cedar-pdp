@@ -32,16 +32,21 @@ from `bind` is a genuine test of the address we are about to serve on.
 certificate ceremony, and `just serve-dev` must keep working. Plaintext is a documented
 posture with a WARN, not a misconfiguration.
 
-## Open item carried into implementation
+## Settled before implementation: IP SANs verify
 
-Whether Apple's verifier matches an **IP SAN** is argued from source
-(`rustls-platform-verifier-0.7.0/src/verification/apple.rs:259` stringifies the
-`ServerName` for `SecPolicyCreateSSL`, with a comment saying that is exactly to make the
-IP match work) but **not yet measured** — `security verify-cert -r` cannot settle it,
-because it applies Certificate Transparency policy to an explicitly-supplied anchor and
-fails on missing SCTs before name matching is reached. A user-added trust anchor is exempt
-from CT, which is why `mkcert -install` is required to answer this at all.
+Task 1, done first because T5 rested on it. Measured through
+`Verifier::verify_server_cert` against an mkcert leaf with the CA installed:
+`127.0.0.1`, `::1` and `localhost` all **accepted**; `127.0.0.2` and `example.com` both
+rejected with `NotValidForName`. The negative rows are what make the positive ones mean
+something — they prove the verifier is matching names rather than waving through anything
+that chains to a trusted root. **T5 stands, no fallback needed.**
 
-Task 1 measures it. If it fails, T5's fallback is `bind = "[::1]:8181"` with
-`https://localhost:8181` — accepting the resolver in the path and documenting that trade
-rather than hiding it.
+**Do not "verify" this with `security verify-cert`.** It reports a Certificate Transparency
+failure for the same leaf *even with the CA in the System keychain*, and reports the
+identical CT error for a name the certificate does not carry — so name matching is never
+reached and the answer is uniformly wrong in a way that looks authoritative. The CLI
+applies a CT policy the library path does not.
+
+Same measurement confirms the two exemptions that make this workable: chains to a
+user-added anchor escape both CT and the 398-day validity cap (the accepted leaf runs 27
+months). That is why `mkcert -install` is a requirement, not a convenience.

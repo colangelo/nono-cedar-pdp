@@ -54,7 +54,22 @@ let server = server_name.to_str();
 — `rustls-platform-verifier-0.7.0/src/verification/apple.rs:259`
 
 So an IP literal in the URL becomes an IP-literal hostname for Apple's SSL policy, and
-matching an `iPAddress` SAN is on the supported path. This is what makes **T5** viable.
+matching an `iPAddress` SAN is on the supported path.
+
+**Measured 2026-07-26**, calling `Verifier::verify_server_cert` directly against an mkcert
+leaf carrying `DNS:localhost, IP:127.0.0.1, IP:::1`, with the mkcert CA installed:
+
+| Server name | SAN kind | Result |
+|---|---|---|
+| `127.0.0.1` | `iPAddress` | accepted |
+| `::1` | `iPAddress` | accepted |
+| `localhost` | `dNSName` | accepted |
+| `127.0.0.2` | — | rejected, `NotValidForName` |
+| `example.com` | — | rejected, `NotValidForName` |
+
+The last two rows are the point: they prove the verifier is actually matching names rather
+than accepting anything that chains to a trusted root, so the first three rows mean what
+they appear to. **T5 is confirmed** and needs no fallback.
 
 ## 3. What this closes, and what it does not
 
@@ -199,13 +214,21 @@ and denies every approval — the exact failure T2 exists to prevent, arrived at
 route. The certificate comes from `mkcert` (documented) or an `openssl` recipe (fallback),
 and T6 refuses to serve if it is not actually trusted.
 
-**Certificate Transparency is why a user-added anchor is required, not merely convenient.**
-Apple's trust evaluation applies CT policy to publicly-rooted chains: a locally-minted
-certificate handed to `security verify-cert -r` fails with *"Unable to find at least 2
-signed certificate timestamps (SCTs) from approved logs"* before name matching is even
-reached. Certificates chaining to a **user-added trust anchor are exempt** from CT — and
-from the 398-day validity cap — which is what makes `mkcert -install` work at all and why
-a bare self-signed leaf dropped in a keychain is not an equivalent substitute.
+**`security verify-cert` is not a valid way to check this, and it fails convincingly
+enough to mislead.** It reports *"Unable to find at least 2 signed certificate timestamps
+(SCTs) from approved logs"* for an mkcert leaf **even with the mkcert CA installed in the
+System keychain** — and it reports the identical CT error for a name the certificate does
+not carry at all (`127.0.0.2`), which shows name matching is never reached. The real
+verifier accepts the same leaf for all three of its SANs and rejects both non-SAN names
+with `NotValidForName` (§2). So the CLI applies a CT policy the library path does not, and
+using it as the check would produce a confident, uniform, wrong answer.
+
+The measurement also confirms the two exemptions that make locally-minted certificates
+workable at all: chains to a **user-added trust anchor** are exempt from CT, and from the
+398-day validity cap — the accepted mkcert leaf runs to October 2028, roughly 27 months.
+That exemption is why `mkcert -install` is required rather than merely convenient, and why
+a self-signed leaf dropped into a keychain without being a trust *anchor* is not a
+substitute.
 
 ### T8 — cert and key live beside the other home-anchored state
 
@@ -270,11 +293,9 @@ Every row is a refusal or a block. No row returns allow, and no row silently deg
 
 ## 7. Verification plan
 
-1. **Empirically confirm the IP SAN accepts** once `mkcert -install` has run. Source says
-   it is on the supported path (§2); this is the confirmation. If it fails, T5's fallback
-   is `bind = "[::1]:8181"` with `https://localhost:8181` — accepting the resolver in the
-   path, and documenting that trade rather than hiding it. Done **first**, because §4's
-   URL rule rests on it.
+1. ~~**Empirically confirm the IP SAN accepts.**~~ **Done 2026-07-26** — measured through
+   `Verifier::verify_server_cert` with the mkcert CA installed; all three SANs accepted,
+   both non-SAN names rejected with `NotValidForName` (§2). T5 needs no fallback.
 2. Unit: config strictness, the required-pair rule, path resolution.
 3. Unit: key-mode and ownership refusals, reusing `isolation.rs`'s existing coverage shape.
 4. Integration: no silent HTTP fallback — a daemon configured for TLS must not answer a
@@ -287,8 +308,8 @@ Every row is a refusal or a block. No row returns allow, and no row silently deg
 
 ## 8. Open items
 
-- Whether the IP SAN verifies in practice — item 1 above. The only fact in this document
-  that is argued from source rather than measured, and it is flagged rather than assumed.
+- ~~Whether the IP SAN verifies in practice.~~ **Closed 2026-07-26** by measurement (§2).
+  Every fact in this document is now measured or read from source; none is assumed.
 - Certificate rotation and expiry are out of scope. mkcert leaves are long-lived, T6 turns
   an expired certificate into a refusal at the next restart, and a daemon that reloads
   certificates on the fly is a larger change than the threat justifies today.

@@ -13,10 +13,11 @@ mutating, or the revert throws away real work.
 Deliberately first: T5's URL rule rests on it, and building the config, the self-test and the
 docs around an unmeasured assumption is how a spec hardens around a wrong fact.
 
-- [ ] 1.1 (**needs the operator**) `mkcert -install` — creates the local CA and installs it in the System keychain
-- [ ] 1.2 Mint a leaf for `localhost 127.0.0.1 ::1` and confirm with `security verify-cert -p ssl -s <name>` that all three now verify — the CT failure seen before install must be gone, since a user-added anchor is CT-exempt
-- [ ] 1.3 Confirm through `rustls-platform-verifier` itself, not just `security`: a throwaway rustls client with `ServerName` = `127.0.0.1` accepts the minted leaf. This is the fact T6 depends on; `security` is corroboration, not the authority
-- [ ] 1.4 If 1.3 fails for the IP literal, record the measurement and switch T5 to the `[::1]` + `https://localhost` fallback **in the design doc and the delta spec** before writing code against either
+- [x] 1.1 (**needed the operator**) `mkcert -install` — local CA created and installed in the System keychain
+- [x] 1.2 Mint a leaf for `localhost 127.0.0.1 ::1`. Note `TRUST_STORES=system` is required: mkcert probes the Java keystore on every invocation and aborts before issuing when `keytool` fails
+- [x] 1.3 **Measured through `rustls-platform-verifier` itself** — `127.0.0.1`, `::1`, `localhost` all accepted; `127.0.0.2` and `example.com` rejected `NotValidForName`. The negative rows prove the check is non-vacuous
+- [x] 1.4 Not needed — T5 confirmed. Design doc §2/§7/§8 and the change design updated with the measurement
+- [x] 1.5 **`security verify-cert` is disqualified as a check** and said so in both design docs: it reports a CT failure for the same leaf with the CA installed, *and* the identical error for a name the cert does not carry, so it never reaches name matching
 
 ## 2. Config surface
 
