@@ -7,8 +7,19 @@ check:
 test:
     cargo test
 
-lint:
+lint: lint-paths
     cargo clippy --all-targets -- -D warnings
+
+# Fail if a tracked file contains a real absolute home path
+lint-paths:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Key on the RUNTIME home/username — a literal /Users/<name> in the checker
+    # is itself the thing this forbids, and it only works on one machine.
+    if git grep -nI -F -e "$HOME" -e "/Users/$(id -un)" -- . ; then
+      echo "error: tracked file contains a real home path — use a relative path, \$HOME, or /Users/you" >&2
+      exit 1
+    fi
 
 fmt:
     cargo fmt
