@@ -367,6 +367,7 @@ mod tests {
             generation: 0,
             loaded_at: std::time::SystemTime::now(),
             files: Vec::new(),
+            content_hash: "sha256:test-fixture".to_string(),
         };
         let engine = Engine::from_loaded_unchecked(
             crate::cedar::schema::load().unwrap(),

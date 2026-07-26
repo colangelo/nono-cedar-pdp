@@ -66,6 +66,55 @@ pub(crate) fn is_loadable_policy_file(path: &Path) -> bool {
     policy_file_skip_reason(path).is_none()
 }
 
+/// Running digest over the bytes a load actually parsed, for the audit trail's
+/// provenance line.
+///
+/// **Fed during the load, never by re-reading the directory afterwards.** A re-read
+/// is a different moment: on a directory being edited it can digest content the
+/// daemon never enforced, and a record naming content that never decided anything is
+/// a false alibi — worse than no record at all.
+///
+/// Both the name and the contents of each file are length-prefixed. Plain
+/// concatenation is ambiguous: `ab.cedar` + `X` and `a.cedar` + `bX` would otherwise
+/// produce the same byte stream, so one policy set could impersonate another on the
+/// record, which is the one thing a provenance digest may not permit. Names are in
+/// because policy ids are `<file stem>:<@id or ordinal>` — a rename with identical
+/// content changes the reason string on every decision that file produces.
+///
+/// **Evidence, not an integrity control**: see [`LoadedPolicies::content_hash`].
+struct ContentDigest(sha2::Sha256);
+
+impl ContentDigest {
+    fn new() -> Self {
+        use sha2::Digest as _;
+        Self(sha2::Sha256::new())
+    }
+
+    fn file(&mut self, name: &std::ffi::OsStr, contents: &str) {
+        use sha2::Digest as _;
+        let name = name.as_encoded_bytes();
+        self.0.update((name.len() as u64).to_le_bytes());
+        self.0.update(name);
+        self.0.update((contents.len() as u64).to_le_bytes());
+        self.0.update(contents.as_bytes());
+    }
+
+    /// `sha256:<lowercase hex>` — the algorithm is on the record so that changing it
+    /// later cannot be misread as the content having changed.
+    fn finish(self) -> String {
+        use sha2::Digest as _;
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let digest = self.0.finalize();
+        let mut out = String::with_capacity("sha256:".len() + digest.len() * 2);
+        out.push_str("sha256:");
+        for b in digest {
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+        out
+    }
+}
+
 /// Operator lints for the two argument-matching hazards that survive the schema.
 ///
 /// The anchoring hazard is gone structurally: there is no whole-`argv` attribute,
@@ -287,6 +336,15 @@ pub struct LoadedPolicies {
     pub generation: u64,
     pub loaded_at: SystemTime,
     pub files: Vec<PathBuf>,
+    /// Digest of the bytes this set was parsed from, `sha256:<lowercase hex>`.
+    ///
+    /// **Evidence, not an integrity control.** It is written by the same process
+    /// that read the files, so it supports later comparison — "is the directory
+    /// still what decided that request" — and says nothing whatever about
+    /// authorship. Policy signing is the control and is unbuilt (#4). Describing
+    /// this as verifying anything would be worse than not recording it, for the
+    /// same reason the audit line's `user_agent` carries that warning.
+    pub content_hash: String,
 }
 
 /// Read every `*.cedar` file in `dir`, assign provenance-carrying policy ids,
@@ -351,11 +409,15 @@ fn load_entries(
     entries.sort();
 
     let mut set = PolicySet::new();
+    let mut digest = ContentDigest::new();
     for path in &entries {
         let text = std::fs::read_to_string(path).map_err(|source| PolicyLoadError::ReadFile {
             path: path.clone(),
             source,
         })?;
+        // Digest the same bytes this iteration is about to parse — see
+        // `ContentDigest` for why it is fed here and not by a later re-read.
+        digest.file(path.file_name().unwrap_or_default(), &text);
         let stem = path
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
@@ -379,7 +441,7 @@ fn load_entries(
         }
     }
 
-    checked(set, schema, dir, generation, entries)
+    checked(set, schema, dir, generation, entries, digest.finish())
 }
 
 /// The guards every set passes before it can decide anything, wherever the set came
@@ -395,6 +457,7 @@ fn checked(
     source: &Path,
     generation: u64,
     files: Vec<PathBuf>,
+    content_hash: String,
 ) -> Result<LoadedPolicies, PolicyLoadError> {
     // Count policies, not files: a directory of `.cedar` files that are all
     // comments, whitespace or templates yields exactly the deny-everything set
@@ -424,6 +487,7 @@ fn checked(
         generation,
         loaded_at: SystemTime::now(),
         files,
+        content_hash,
     })
 }
 
@@ -457,7 +521,16 @@ impl Engine {
         set: PolicySet,
         generation: u64,
     ) -> Result<Self, PolicyLoadError> {
-        let loaded = checked(set, &schema, &policy_dir, generation, Vec::new())?;
+        let loaded = checked(
+            set,
+            &schema,
+            &policy_dir,
+            generation,
+            Vec::new(),
+            // No files were read: the honest digest of zero files, computed the
+            // same way rather than special-cased into a sentinel.
+            ContentDigest::new().finish(),
+        )?;
         Ok(Self {
             schema,
             policy_dir,
@@ -1602,5 +1675,111 @@ when { resource.arg_count + 9223372036854775807 > 0 };
                 ))
                 .allow
         );
+    }
+
+    /// The provenance hash exists so an auditor can ask "is the policy directory
+    /// still the one that decided that request", so its whole value is that it
+    /// changes when — and only when — the loaded content changes.
+    #[test]
+    fn an_unchanged_policy_directory_hashes_the_same_twice() {
+        let d = dir_with(&[("a.cedar", GOOD)]);
+        let schema = crate::cedar::schema::load().unwrap();
+        let first = load_dir(d.path(), &schema, 1).unwrap();
+        let second = load_dir(d.path(), &schema, 2).unwrap();
+        assert_eq!(
+            first.content_hash, second.content_hash,
+            "the same bytes must hash the same, or the record is noise"
+        );
+        assert!(
+            first.content_hash.starts_with("sha256:"),
+            "the algorithm must be on the record so a future change of algorithm \
+             cannot be mistaken for a change of content: {}",
+            first.content_hash
+        );
+    }
+
+    #[test]
+    fn editing_a_policy_files_content_changes_the_hash() {
+        let d = dir_with(&[("a.cedar", GOOD)]);
+        let schema = crate::cedar::schema::load().unwrap();
+        let before = load_dir(d.path(), &schema, 1).unwrap().content_hash;
+        std::fs::write(
+            d.path().join("a.cedar"),
+            format!("{GOOD}\nforbid (principal, action, resource) when {{ 1 == 2 }};"),
+        )
+        .unwrap();
+        let after = load_dir(d.path(), &schema, 2).unwrap().content_hash;
+        assert_ne!(before, after, "an edited policy set must not hash the same");
+    }
+
+    /// A rename with no byte of content changed is a real change to what a decision
+    /// reports: policy ids are `<file stem>:<@id or ordinal>`, so the reason string
+    /// on every decision the file produces changes with it. A hash over contents
+    /// alone would call those two sets identical.
+    #[test]
+    fn renaming_a_policy_file_changes_the_hash_even_with_identical_content() {
+        let schema = crate::cedar::schema::load().unwrap();
+        let before = load_dir(dir_with(&[("a.cedar", GOOD)]).path(), &schema, 1)
+            .unwrap()
+            .content_hash;
+        let after = load_dir(dir_with(&[("b.cedar", GOOD)]).path(), &schema, 1)
+            .unwrap()
+            .content_hash;
+        assert_ne!(
+            before, after,
+            "a rename changes the policy ids a decision reports, so it must change \
+             the hash"
+        );
+    }
+
+    /// Framing, not just content: two sets whose name+content bytes concatenate to
+    /// the same string must still hash differently. Exercised on `ContentDigest`
+    /// directly rather than through the loader, because it is a property of the
+    /// digest and forcing it through `load_dir` would need both halves to be valid
+    /// Cedar across an arbitrary split, which tests the parser instead.
+    ///
+    /// A collision here is a policy set that can impersonate another on the record,
+    /// which is the one thing a provenance digest may not permit.
+    #[test]
+    fn the_hash_framing_is_unambiguous_across_the_name_content_boundary() {
+        use std::ffi::OsStr;
+        let mut split_one = ContentDigest::new();
+        split_one.file(OsStr::new("ab"), "c");
+        let mut split_two = ContentDigest::new();
+        split_two.file(OsStr::new("a"), "bc");
+        assert_ne!(
+            split_one.finish(),
+            split_two.finish(),
+            "unprefixed concatenation would digest \"ab\"+\"c\" and \"a\"+\"bc\" alike"
+        );
+    }
+
+    /// The same bytes in the same framing must agree, or the assertion above is
+    /// about instability rather than about framing.
+    #[test]
+    fn the_digest_agrees_with_itself_on_identical_input() {
+        use std::ffi::OsStr;
+        let mut one = ContentDigest::new();
+        one.file(OsStr::new("a.cedar"), GOOD);
+        let mut two = ContentDigest::new();
+        two.file(OsStr::new("a.cedar"), GOOD);
+        assert_eq!(one.finish(), two.finish());
+    }
+
+    /// Every loadable file must reach the digest. A set that grows a policy file
+    /// the hash ignores is a set whose record cannot detect the addition — the
+    /// exact tampering shape this exists to evidence.
+    #[test]
+    fn adding_a_second_policy_file_changes_the_hash() {
+        let schema = crate::cedar::schema::load().unwrap();
+        let one = dir_with(&[("a.cedar", GOOD)]);
+        let before = load_dir(one.path(), &schema, 1).unwrap().content_hash;
+        std::fs::write(
+            one.path().join("b.cedar"),
+            r#"forbid (principal, action, resource) when { 1 == 2 };"#,
+        )
+        .unwrap();
+        let after = load_dir(one.path(), &schema, 2).unwrap().content_hash;
+        assert_ne!(before, after, "an added policy file must change the hash");
     }
 }

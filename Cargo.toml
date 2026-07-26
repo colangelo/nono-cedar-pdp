@@ -32,6 +32,14 @@ time = { version = "0.3", features = ["formatting"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Content hash of the loaded policy set, for the audit trail's provenance line.
+# ADR-001 keeps `nono` a dev-dependency because a runtime dep would pull sigstore,
+# x509 and Keychain into a security daemon; that argument is about weight and blast
+# radius and does not reach a small pure-Rust digest with no I/O. Note the `libc`
+# comment above does NOT apply: sha2 reaches the tree today only via the `nono`
+# dev-dependency, which never ships, so this is a genuinely new runtime dependency
+# and is justified on its own terms rather than as already-paid-for.
+sha2 = "0.11"
 
 [dev-dependencies]
 nono = { version = "0.69.0", default-features = false }
