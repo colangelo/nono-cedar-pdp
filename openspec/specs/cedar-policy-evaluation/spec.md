@@ -8,9 +8,7 @@ validation against the schema, hot-reload that keeps the last known good set, an
 of a decision plus a reason an operator can act on. Its recurring theme: where a policy could be
 written in an unsound way, make it fail to load or fail to validate rather than documenting a
 caution.
-
 ## Requirements
-
 ### Requirement: Cedar schema models the nono approval domain
 
 The service SHALL embed a Cedar schema in the `Nono` namespace declaring a `Caller in Session in Agent` principal hierarchy, a `Command` resource (`command`, `args`, `argv_tail`, `arg_count`), an `HttpEndpoint` resource (`route_id`, `upstream`, `method`, `path`), and the actions `launchCommand` and `httpRequest` with their respective context types. The schema SHALL compile at startup and SHALL be the validation target for all policies.
@@ -146,6 +144,15 @@ it SHALL deny an endpoint request whose path's meaning depends on normalisation 
 **before any policy is consulted**, with a deny reason naming the ambiguity and the path
 as sent. Unambiguous paths SHALL continue to be evaluated with the raw path value.
 
+The guard SHALL NOT be bypassable through the library's public surface: the pieces
+that build an authorization request from a policy query and the pieces that convert a
+raw authorizer response into a decision SHALL NOT be publicly exported, so this
+library offers no route from a policy query to a decision that skips the ambiguity
+check. (A caller re-implementing entity construction against the `cedar-policy` crate
+directly is outside this guarantee — they are not on this library's decision path,
+and no visibility rule can bind code that does not call it.) This is the same
+closed-seam property the engine's constructors already have.
+
 The examined part of the target SHALL be everything before the first raw `?`, and no
 other truncation SHALL be applied. RFC 3986 §5.2.4 defines `remove_dot_segments` over the
 path component alone, so excluding the query is a specified boundary rather than an
@@ -177,49 +184,48 @@ decodes to `50%-done`, whose stray `%` is data.
 
 #### Scenario: A traversal after a raw `#` is denied
 
-- **WHEN** an endpoint request carries `path` `/repos/x#/../user/keys` and the policy set contains a permit guarded by `resource.path like "/repos/*"`
-- **THEN** the decision is deny with the ambiguous-path reason, because a raw `#` does not end the examined target
-- **AND WHEN** the path is `/issues/issue#5`, which contains no `.`/`..` segment
-- **THEN** the request is decided by policy as normal
+- **WHEN** an endpoint request's path is `/repos/foo#/../../user/keys`
+- **THEN** the decision is deny, because the scan does not stop at the `#` — treating it as a fragment delimiter would let everything after it escape inspection while an upstream that does not treat it as one still resolves the traversal
 
 #### Scenario: A traversal built from backslash separators is denied
 
-- **WHEN** an endpoint request carries `path` `/repos/..\..\user/keys`, or its encoded form `/repos/%5c..%5c/user/keys`
-- **THEN** the decision is deny with the ambiguous-path reason
-- **AND WHEN** the path is `/repos/foo\bar`, where no segment is `.` or `..`
-- **THEN** the request is decided by policy as normal
+- **WHEN** an endpoint request's path is `/repos/..%5C../user/keys` or `/repos/\..\user/keys`
+- **THEN** the decision is deny, because `\` separates segments wherever `/` does
 
 #### Scenario: A traversal inside the query string is not denied
 
-- **WHEN** an endpoint request carries `path` `/repos/foo/bar?path=../x`
-- **THEN** the request is decided by policy as normal, because the query is outside the path component `remove_dot_segments` is defined over
+- **WHEN** an endpoint request's path is `/search?q=..%2F..%2Fetc`
+- **THEN** the query part triggers no ambiguity refusal and the request is decided by policy on the raw path
 
 #### Scenario: A literal traversal segment is denied without policy evaluation
 
-- **WHEN** an endpoint request carries `path` `/repos/../user/keys` and the policy set contains a permit guarded by `resource.path like "/repos/*"`
-- **THEN** the decision is deny, the matched-policy list is empty, and the reason names the path as ambiguous rather than naming that permit
+- **WHEN** an endpoint request's path contains a literal `..` segment, such as `/repos/../user/keys`
+- **THEN** the decision is deny, the reason names the ambiguity and the path, and no policy is credited with the decision
 
 #### Scenario: A percent-encoded or parameterised traversal segment is denied
 
-- **WHEN** an endpoint request carries `path` `/repos/%2e%2e/user/keys`, or `/repos/%2E%2e/user/keys`, or `/repos/..;/user/keys`, or `/repos/%2E%2E%2Fuser/keys`, or the double-encoded `/repos/%252e%252e/user/keys`
-- **THEN** the decision is deny with the ambiguous-path reason, for the same reason as a literal `..`
+- **WHEN** an endpoint request's path encodes a traversal segment at any decode depth within the declared bound (`/repos/%2e%2e/user/keys`, `/repos/%252e%252e/user/keys`) or hides it behind `;`-parameters (`/repos/..;/user/keys`)
+- **THEN** the decision is deny with the ambiguity named in the reason
 
 #### Scenario: An undecodable path is denied rather than guessed at
 
-- **WHEN** an endpoint request carries a path containing a malformed percent-escape such as `/repos/%zz/foo`, or one that decodes to non-UTF-8 bytes such as `/repos/%c0%ae%c0%ae/user/keys`
-- **THEN** the decision is deny with a reason naming the path as ambiguous, because the daemon cannot know what the upstream will make of it
+- **WHEN** an endpoint request's path contains a malformed percent-escape as sent (`/repos/%zz/foo`) or decodes to non-UTF-8 bytes (`/repos/%c0%ae/foo`)
+- **THEN** the decision is deny, because the service cannot know what the upstream will resolve without guessing
 
 #### Scenario: An unambiguous path is still decided by policy
 
-- **WHEN** an endpoint request carries `path` `/repos/foo/bar` and a permit guarded by `resource.path like "/repos/*"` matches
-- **THEN** the decision is allow and the reason names that permit
-- **AND WHEN** the path is `/repos/foo/bar?path=../x`, `/repos/foo..bar/x` or `/repos/50%25-done`
-- **THEN** the request is still decided by policy, because none of those can move which resource the origin routes to
+- **WHEN** an endpoint request's path is `/repos/foo/bar` and a permit matches `resource.path like "/repos/*"`
+- **THEN** the decision is allow, with the raw path value visible to the policy
 
 #### Scenario: The ambiguity refusal is reproducible offline
 
-- **WHEN** an operator runs the `check` subcommand on a saved endpoint payload whose path contains a traversal segment
-- **THEN** the command reports a deny whose reason names the ambiguity and the path as sent, and exits non-zero
+- **WHEN** an operator replays a denied ambiguous-path request through the offline check command
+- **THEN** the same deny and reason are produced, because the check runs inside evaluation rather than in the HTTP layer
+
+#### Scenario: The bypass pieces are not exported
+
+- **WHEN** the library's public surface is inspected from outside the crate
+- **THEN** no public item builds a Cedar authorization request from a policy query or converts a raw authorizer response into a decision, and a visibility tripwire fails the suite if either is re-exported
 
 ### Requirement: Derive the principal hierarchy from request identity
 
@@ -239,7 +245,7 @@ For a `command` request the service SHALL build `Nono::Caller::"<caller>"` as a 
 
 ### Requirement: Resolve agent identity from the approval backend name
 
-The service SHALL map the envelope's `backend` name to a Cedar `Agent` identifier using operator configuration, and SHALL fall back to a configured unknown-agent identifier when the name is not mapped.
+The service SHALL map the envelope's `backend` name to a Cedar `Agent` identifier using operator configuration, and SHALL fall back to the fixed identifier `unknown` when the name is not mapped. The fallback SHALL NOT be configurable: the shipped baseline policy forbids `Nono::Agent::"unknown"` by that exact name, and the value the resolver falls back to and the value the baseline denies SHALL be the same constant, so an unmapped backend name is always an explicit, attributable deny rather than a fall-through to whatever else permits.
 
 #### Scenario: Mapped backend name yields its agent
 
@@ -249,13 +255,20 @@ The service SHALL map the envelope's `backend` name to a Cedar `Agent` identifie
 #### Scenario: Unmapped backend name falls back
 
 - **WHEN** a request arrives with a backend name absent from configuration
-- **THEN** the agent ancestor is the configured unknown-agent identifier, which policy can deny explicitly
+- **THEN** the agent ancestor is `Nono::Agent::"unknown"`, the identity the shipped baseline forbid denies explicitly
+
+#### Scenario: The fallback and the baseline forbid share one constant
+
+- **WHEN** the shipped baseline pack and the resolver's fallback are compared
+- **THEN** the identifier the baseline's `no-unknown-agents` forbid names is the same exported constant the resolver falls back to, so the two cannot drift apart silently
 
 ### Requirement: Load policies with traceable identifiers
 
 The service SHALL load every `*.cedar` file in the configured policy directory and assign each policy an identifier of the form `<file stem>:<id annotation or ordinal>`, so a decision names the file and rule that produced it. Duplicate identifiers SHALL be a load failure, never a silent overwrite. Files without the `.cedar` extension SHALL be ignored.
 
 Two shapes of `*.cedar` path SHALL be skipped rather than failing the load: a name starting with `.` or `#` (what editors give lock files and backups, which would otherwise abort every reload for the duration of an editing session), and anything that is not a regular file (a directory, a socket, a symlink with no target). Each skip SHALL be logged at WARN naming the path and the reason, because a skipped file is a policy the operator wrote that decides nothing — a silently ignored `.baseline.cedar` is a hole in the policy set with no trace.
+
+A directory entry the listing itself fails to yield — an entry whose name or metadata cannot be read — SHALL fail the load with an error naming the directory, never be silently dropped: the service cannot classify what it could not read, so it cannot know the entry was not a policy, and an unreadable entry in a policy directory is the shape of a tampering symptom. (At reload, the existing last-known-good requirement applies: the previous set is retained and the failure is logged.)
 
 #### Scenario: Policy identifiers carry file provenance
 
@@ -276,6 +289,11 @@ Two shapes of `*.cedar` path SHALL be skipped rather than failing the load: a na
 
 - **WHEN** the policy directory contains `.baseline.cedar`, an editor lock file `.#10-git.cedar`, or a directory named `archive.cedar`
 - **THEN** the load succeeds without them and each skip is logged at WARN naming the path and why it is not in force
+
+#### Scenario: An unreadable directory entry fails the load
+
+- **WHEN** enumerating the policy directory yields an entry that cannot be read
+- **THEN** the load fails with an error naming the directory, rather than continuing without the entry as though it did not exist
 
 ### Requirement: Refuse to run without a usable policy set
 
@@ -344,3 +362,4 @@ When Cedar reports any policy evaluation error, the service SHALL return a denia
 
 - **WHEN** evaluation produces an allow decision together with one or more evaluation errors
 - **THEN** the service returns deny with a reason naming the evaluation errors
+
