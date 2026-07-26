@@ -449,6 +449,16 @@ async fn serve_https(
         key = %tls.key.display(),
         "loaded the TLS certificate and private key"
     );
+    // Above the bind, and the only correct place for it (T6). Two tests in
+    // `tests/cli.rs` hold that line from opposite sides —
+    // `an_untrusted_tls_certificate_refuses_to_serve_without_binding` holds the
+    // port, so `Address already in use` is what a daemon that bound first
+    // reports, and
+    // `an_untrusted_tls_certificate_never_lets_anything_connect_to_the_bind_address`
+    // reads the `listening` line, which *is* the announcement that a socket
+    // exists. Both were verified by moving this call below the bind: both go red,
+    // while the exit code stays non-zero, which is why neither of them settles
+    // for asserting that.
     verify_our_own_certificate(Arc::clone(&server_config), bind.ip(), &tls.cert)?;
 
     let listener = std::net::TcpListener::bind(bind)?;
