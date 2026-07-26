@@ -42,9 +42,9 @@ that can actually detect a regression rather than underneath them.
 
 ## 6. Verify against reality, not just the suite
 
-- [ ] 6.1 `just test` full, and filtered `cargo test --lib watcher`
-- [ ] 6.2 `just lint` clean (clippy `-D warnings`; no `unwrap`/`expect`/`panic` outside tests)
-- [ ] 6.3 `just smoke` against a real `nono run` — the suite has agreed with itself and disagreed with nono three times in this project
-- [ ] 6.4 Repeat-run the full suite to check the reordered tests did not introduce a new flake
+- [x] 6.1 `just test` full (142 lib + 8 integration suites), and filtered `cargo test --lib watcher` — both green
+- [x] 6.2 `just lint` clean (clippy `-D warnings`; no `unwrap`/`expect`/`panic` outside tests)
+- [x] 6.3 `just smoke` against a real `nono run` (nono 0.69.0): **SMOKE PASSED** — `git status` allowed by `10-git:git-read-only`, `git push --force` denied by `10-git:no-history-rewrites`. It fails *inside a `wt` worktree*, but not for any reason of ours: `.git` is a pointer file there and the real git dir sits outside every profile grant, so `git` itself exits 128 after the PDP has already correctly returned allow. Verified by running the same commit from a normal clone, where it passes. Filed as #32 rather than dismissed as environmental — the house default is to work in worktrees, so this hits every agent here.
+- [x] 6.4 Repeat-run the full suite: 15/15 consecutive `cargo test --lib` runs green, no new flake
 - [x] 6.5 `openspec validate --changes bound-the-reload-drain-and-pin-its-evidence`
-- [ ] 6.6 Push to `internal` and `origin`; close #31 and #10 with the mutation evidence
+- [x] 6.6 Pushed to `internal` and `origin` (local `main` was 4 commits unpushed and went with it); #31 and #10 closed with the controlled-experiment and mutation evidence
