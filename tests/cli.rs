@@ -1233,7 +1233,9 @@ fn platform_trusted_pair(dir: &Path) -> Option<(std::path::PathBuf, std::path::P
 fn untrusted_pair(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let (cert, key) = pair_paths(dir);
     let out = Command::new("openssl")
-        .args(["req", "-x509", "-newkey", "rsa:2048", "-days", "30", "-noenc"])
+        .args([
+            "req", "-x509", "-newkey", "rsa:2048", "-days", "30", "-noenc",
+        ])
         .arg("-keyout")
         .arg(&key)
         .arg("-out")
@@ -1541,7 +1543,10 @@ fn an_unparseable_tls_certificate_refuses_to_serve_without_binding() {
         ),
         None,
     );
-    assert!(!ok, "a daemon that cannot serve TLS must not serve: {output}");
+    assert!(
+        !ok,
+        "a daemon that cannot serve TLS must not serve: {output}"
+    );
     assert!(
         output.contains("[tls]"),
         "the refusal must send the operator to the configuration that caused it: {output}"
@@ -1581,7 +1586,10 @@ fn an_unreadable_tls_certificate_refuses_to_serve_without_binding() {
         ),
         None,
     );
-    assert!(!ok, "a daemon that cannot read its certificate must not serve: {output}");
+    assert!(
+        !ok,
+        "a daemon that cannot read its certificate must not serve: {output}"
+    );
     assert!(
         output.contains("[tls]") && output.contains(&cert.display().to_string()),
         "the refusal must name the configuration and the file: {output}"
