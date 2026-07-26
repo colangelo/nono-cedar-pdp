@@ -445,7 +445,14 @@ smoke-tls:
     LINES_BEFORE=$(wc -l < "$AUDIT" 2>/dev/null || echo 0)
     echo
     echo "--- expect ALLOW over https: git status"
-    nono run --allow-cwd --profile "$PROFILE" -- git status >/dev/null
+    nono run --allow-cwd --profile "$PROFILE" -- git status >/dev/null || {
+      echo "FAIL: a command this pack allows was blocked while THIS daemon held the"
+      echo "  port. If the error above says 'invalid HTTP version', the profile's URL"
+      echo "  is http:// against an https listener — which is exactly the shape a"
+      echo "  deployment takes when [tls] is configured and the profile is not, and"
+      echo "  the daemon cannot see it: it never reads nono's URL."
+      exit 1
+    }
     NEW=$(tail -n +$((LINES_BEFORE + 1)) "$AUDIT")
     echo "$NEW" | grep -q '"decision":"allow".*10-git:git-read-only' \
       || { echo "FAIL: real nono did not get a Cedar allow over https"; echo "$NEW"; exit 1; }
