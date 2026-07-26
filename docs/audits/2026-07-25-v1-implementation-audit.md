@@ -124,9 +124,22 @@ and the config has no field for a token or custom headers. A shared secret is
 *impossible* today, not merely unimplemented. Peer-credential checking needs a Unix
 socket — macOS exposes no peer uid for TCP loopback.
 
-**What would close it.** Upstream support for a bearer token or a Unix socket (#13), or
-https on loopback with a locally-trusted certificate (#5), which at least makes a port
-squatter without the key fail TLS.
+**What would close it.** Upstream support for a bearer token or a Unix socket (#13).
+~~or https on loopback with a locally-trusted certificate (#5)~~ — see the revisit
+below: #5 has landed and does **not** touch this entry.
+
+**Revisited 2026-07-27 (`serve-https-on-loopback`, #5).** The two directions were
+listed together here and they close separately. What #5 closed is the *outbound* one:
+a process that cannot read the private key can no longer be believed by nono, because
+nono's client verifies the certificate against the platform trust store — so winning
+the race for the port now produces a blocked command instead of a silent full bypass.
+**This entry is untouched by that.** It is about the *inbound* direction, where nono
+still presents no credential, so any local process as this user can still POST a
+decision request and forge a record. TLS does not help: our listener does not
+authenticate its clients, and the record it writes for a forged request is
+byte-identical to a real one. Still open, still #13, and the residual TLS *does*
+introduce is filed separately as A04 rather than folded in here — two risks in one
+entry is how "we fixed #5" comes to read as "A02 is smaller now".
 
 **Pinned by.** `tests/docs.rs` asserts the README still says "none of this authenticates
 nono" and that the `User-Agent` is "not verification" — the wording is the control here,
@@ -144,6 +157,54 @@ because the risk is a reader believing the checks buy more than they do.
 **Why accepted for now.** Both are real and neither is a decision-correctness defect:
 the daemon still fails closed in every case. They are ordered behind the trust-boundary
 work rather than dismissed.
+
+### A04 — same-uid code that can read the private key *is* this daemon (residual of #5)
+
+**Filed on the day the control shipped**, because that is when a control's preconditions
+are known and the day they start being forgotten.
+
+https on loopback (#5, `serve-https-on-loopback`) stops a port squatter from being
+believed: nono verifies the certificate against the platform trust store, so a process
+without the key produces a handshake failure, which nono turns into a blocked command.
+A process that **can read the key** is not stopped at all — it completes a valid
+handshake and is this daemon, perfectly, with no trace anywhere that it was not.
+
+The key's mode, ownership and ancestor refusals do not reach this. They are the same
+rule as for the policy directory and they defend against **other local users** only:
+Seatbelt and Landlock are path-based and do not change uid, so the sandboxed agent runs
+as this user and is the owner already. What bounds the agent is the key's *location*
+relative to the read grants in the nono profile — which is why the shipped default is
+`~/.config/nono-cedar-pdp/tls/` and why a profile granting read on the tree the key sits
+in re-opens the whole control. Note the asymmetry with D13: for the policy directory the
+dangerous grant is **write**; here it is **read**, so an operator drilled on the write
+rule checks the wrong column.
+
+Two further residuals belong here rather than in a paragraph nobody re-reads:
+
+- **A caught squatter leaves no record of ours.** nono reports `Err(SandboxInit)` ⇒ exit
+  126, not a `Denied` carrying one of our reasons, and nothing lands in our audit log,
+  because we were never asked. Both outcomes are closed; someone reading nono's audit
+  after a squat sees a sandbox error rather than a policy decision (T1).
+- **Availability is traded away deliberately.** A squatter that takes the port first
+  still denies service — we fail to bind and exit, or nono's handshake fails and every
+  intercepted action is blocked. Correct for a fail-closed daemon, and still a cost.
+
+**Why accepted.** Not closable at this boundary. Defending a key from code running as
+its own owner needs something outside the process — a hardware-backed key, or a
+different uid for the daemon, which upends the "runs as you, on your loopback" model the
+rest of this design rests on. The honest control is the location rule plus the
+profile-checking procedure the README already gives.
+
+**What would close it.** Running the daemon as a separate uid with the key mode-0600 to
+*that* user (and the policy directory likewise), or a key the daemon can use but not
+read. Either would also close D13's residual, and both are larger changes than the
+threat justifies today.
+
+**Pinned by.** `tests/docs.rs`, on the wording, because that is where this risk actually
+lives: the README must keep the phrases "same-uid code that can read the private key",
+"prefers an outage to a silent bypass" and "the command exits 126". And `just smoke-tls`,
+which proves the half that *is* closed with a real `nono run` against a real squatter
+rather than with a test that agrees with us.
 
 ---
 

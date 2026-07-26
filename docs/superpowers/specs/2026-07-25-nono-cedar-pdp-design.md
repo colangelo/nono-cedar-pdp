@@ -132,6 +132,18 @@ treats as a transport error and denies. v1 ships plain loopback HTTP; the TLS
 hardening is the first follow-up (§10). Upstream ask: bearer-token or UDS support
 in the webhook backend config.
 
+> **Correction trail (2026-07-27, `serve-https-on-loopback`, Gitea #5).** That
+> follow-up has landed, and one word above is worth correcting rather than leaving
+> for a reader to inherit: nono treats the failed handshake as a transport error and
+> **blocks** — `Err(SandboxInit)` ⇒ exit 126 — it does not record a `Denied` with
+> our reason, because we are never asked. Both outcomes are closed and they read
+> differently in nono's audit. TLS is opt-in; plaintext remains the default posture
+> and now says so in a startup WARN naming this section's risk. What it buys and
+> what it does not is in
+> [`2026-07-26-https-on-loopback-design.md`](2026-07-26-https-on-loopback-design.md)
+> §3, and the residual — same-uid code that can read the private key — is A04 in
+> `docs/audits/`.
+
 ## 3. Decisions
 
 | # | Decision | Rationale |
@@ -559,7 +571,18 @@ config whose `policy_dir` and `audit_log` sit outside the agent-writable tree (D
 
 ## 10. Follow-ups (explicitly out of v1)
 
-- **https-on-loopback** with locally-trusted cert (PDP impersonation fix, §2).
+- ~~**https-on-loopback** with locally-trusted cert (PDP impersonation fix, §2).~~
+  **Done 2026-07-27** (`serve-https-on-loopback`, Gitea #5). Design and decisions
+  T1–T11: [`2026-07-26-https-on-loopback-design.md`](2026-07-26-https-on-loopback-design.md).
+  Opt-in `[tls]`, a startup self-test through the verifier nono's own client uses —
+  run *before* the bind, so a daemon nobody could believe never accepts anything —
+  and every failure a refusal to serve rather than a downgrade. Two limits belong
+  with the tick rather than under it: it does nothing against same-uid code that can
+  **read the key** (the key's location relative to the profile's read grants is what
+  bounds the sandboxed agent, exactly as for the policy directory — D13), and a
+  squatter it catches produces nono `Err(SandboxInit)` ⇒ exit 126, *not* a recorded
+  denial carrying one of our reasons. Both are closed outcomes; they read differently
+  in nono's audit.
 - **Upstream engagement:** comment on nono #879 (what does "completed" mean; offer
   this repo as the reference adapter); file the lossy-argv `filter_map` issue;
   ask for webhook auth (bearer/UDS).

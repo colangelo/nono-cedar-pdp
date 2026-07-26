@@ -38,4 +38,6 @@ reach, and would hide the fact that a version bump might silently close them.
 
 - [`2026-07-25-v1-implementation-audit.md`](2026-07-25-v1-implementation-audit.md) — the
   32 findings from the three adversarial passes over the v1 implementation, plus the
-  upstream-caused residual that the argv work later added.
+  upstream-caused residual that the argv work later added, and **A04**, the residual
+  https-on-loopback introduced: a control's own preconditions, filed on the day it
+  shipped rather than the day someone rediscovers them.
