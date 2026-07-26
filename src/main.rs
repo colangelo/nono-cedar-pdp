@@ -182,30 +182,6 @@ async fn run_serve(config_path: &std::path::Path) -> Result<(), String> {
     if let Some(tls) = &config.tls {
         nono_cedar_pdp::isolation::refuse_a_readable_private_key(&tls.key)
             .map_err(|e| e.to_string())?;
-        // TRANSITIONAL, and deleted by the change that adds the axum-server arm
-        // (T3): the https listener does not exist yet, so falling through from
-        // here would start the *plaintext* one behind a configuration that says
-        // the transport is authenticated — precisely the silent downgrade T2
-        // forbids, and the worst of the available behaviours. A refusal is the
-        // fail-closed answer until the listener lands.
-        //
-        // Pinned by `a_tls_configured_daemon_refuses_rather_than_downgrade_to_plaintext`
-        // in `tests/cli.rs`. Deleting this block without repointing that test is
-        // how the rule stops being enforced at either end.
-        //
-        // Both paths are named because they are the *resolved* ones (D7), and
-        // that is what makes them worth printing: the operator sees the chain the
-        // listener would have read rather than the one they typed, and
-        // `a_symlinked_tls_pair_is_resolved_before_serving` reads them back to
-        // prove the resolution happened at all.
-        return Err(format!(
-            "[tls] names cert {} and key {} but the https listener is not implemented \
-             yet — refusing to serve, because serving plaintext behind a configuration \
-             that asks for TLS would leave the operator believing the transport is \
-             authenticated when it is not",
-            tls.cert.display(),
-            tls.key.display()
-        ));
     }
 
     let schema = cedar::schema::load().map_err(|e| e.to_string())?;

@@ -371,7 +371,29 @@ fn rfc3339(t: std::time::SystemTime) -> Option<String> {
         .ok()
 }
 
+/// Serve the surface on `bind`, over TLS when the configuration asks for it.
+///
+/// The transport is read off `state.config.tls` rather than passed in, so there
+/// is exactly one answer to "is this daemon serving https" and it is the one the
+/// operator wrote. **The router is identical on both arms** — every case in
+/// `tests/server.rs` therefore covers the https listener too, and a handler that
+/// behaved differently under TLS would be a bug this function could not express.
+///
+/// Neither arm returns before the listener is bound, and the https arm does
+/// everything that can refuse — reading the pair, and proving the certificate
+/// against the verifier nono uses — *before* the bind. See
+/// [`verify_our_own_certificate`] for why after would not be a refusal at all.
 pub async fn serve(state: AppState, bind: SocketAddr) -> std::io::Result<()> {
+    let config = Arc::clone(&state.config);
+    match config.tls.as_ref() {
+        Some(tls) => serve_https(state, bind, tls).await,
+        None => serve_plaintext(state, bind).await,
+    }
+}
+
+/// The default posture, unchanged — plus the one line that keeps it a *chosen*
+/// posture rather than one inferred from the absence of a warning (T2).
+async fn serve_plaintext(state: AppState, bind: SocketAddr) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     // The address the kernel gave us, not the one we asked for. They differ only
     // when `bind` names port 0 — and then the configured value is a placeholder
@@ -380,9 +402,158 @@ pub async fn serve(state: AppState, bind: SocketAddr) -> std::io::Result<()> {
     // address cannot be read is not one to serve on quietly, and nothing has been
     // accepted yet, so the refusal costs no request.
     let bind = listener.local_addr()?;
+    tracing::warn!(
+        "serving plaintext http on {bind}: nono's webhook carries no credential in \
+         either direction, so nono cannot tell this daemon from any other local \
+         process that binds {bind} first. Such a process answers allow to everything, \
+         and nothing — not nono's output, not this daemon's audit log — records that \
+         it was not us. Configure [tls] with a locally-trusted certificate to turn \
+         that impersonation into a handshake failure, which nono treats as a blocked \
+         command."
+    );
     tracing::info!(%bind, "listening");
     axum::serve(listener, router(state)).await
 }
+
+/// The https listener (T3).
+///
+/// `axum-server` rather than a hand-rolled arm because axum 0.8's
+/// `Listener::accept` returns `(Io, Addr)` with no `Result`, so a hand-written
+/// TLS listener has to keep the handshake off the accept path itself — and
+/// awaiting it inline compiles, passes a single-client test, and serialises every
+/// approval behind one slow or hostile client, on a daemon whose whole job is to
+/// answer promptly or be treated as broken. `axum-server` spawns per connection
+/// *before* the handshake, so that property is structural rather than something
+/// this file has to keep remembering.
+///
+/// `from_tcp_rustls` over a listener bound here rather than `bind_rustls`, which
+/// binds internally: the address the kernel actually gave us is what the daemon
+/// reports and what every test reads back, and a `bind` of port 0 has no other
+/// channel to report it through.
+async fn serve_https(
+    state: AppState,
+    bind: SocketAddr,
+    tls: &crate::config::Tls,
+) -> std::io::Result<()> {
+    // One read of the configured pair, on paths the caller has already resolved
+    // (D7). `axum-server` can load the PEM files itself, but then the certificate
+    // the self-test proves and the certificate the listener serves would be two
+    // separate reads of a path that can be repointed in between — the same
+    // two-objects gap D7 closes for the policy directory.
+    let server_config = Arc::new(load_pair(tls)?);
+    // The *resolved* paths, which is what makes the line worth writing: after D7
+    // they are not the ones the operator typed, and "which certificate is this
+    // daemon actually serving" is the question a TLS misconfiguration turns into.
+    tracing::info!(
+        cert = %tls.cert.display(),
+        key = %tls.key.display(),
+        "loaded the TLS certificate and private key"
+    );
+
+    let listener = std::net::TcpListener::bind(bind)?;
+    // `from_tcp` hands the socket to tokio, which requires it non-blocking.
+    listener.set_nonblocking(true)?;
+    let bind = listener.local_addr()?;
+    tracing::info!(%bind, "listening");
+    axum_server::from_tcp_rustls(
+        listener,
+        axum_server::tls_rustls::RustlsConfig::from_config(server_config),
+    )?
+    .serve(router(state).into_make_service())
+    .await
+}
+
+/// The crypto provider, named rather than discovered.
+///
+/// `rustls`'s own `CryptoProvider::get_default_or_install_from_crate_features()`
+/// — which every `ClientConfig::builder()` and `ServerConfig::builder()` calls —
+/// **panics** when more than one provider is compiled in. That is not
+/// hypothetical: this crate's own test binary has both, because the `nono`
+/// dev-dependency drags `aws-lc-rs` in through sigstore's `reqwest`. The shipped
+/// binary has only `ring` today (`cargo tree -e normal -i aws-lc-rs` is empty),
+/// but a security daemon must not carry a startup panic whose trigger is which
+/// crates somebody else's feature unification happens to pull in.
+fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
+}
+
+/// A `[tls]`-shaped refusal. `io::Error` because that is what `serve` returns;
+/// the text is what the operator reads, so every one of them names the `[tls]`
+/// table and the file that failed.
+fn tls_refusal(message: String) -> std::io::Error {
+    std::io::Error::other(message)
+}
+
+/// Read the configured pair into the exact `ServerConfig` the listener will use.
+///
+/// Every failure here is a refusal to serve, never a fall back to plaintext (T2):
+/// an operator whose profile says `https` and whose daemon quietly answered
+/// `http` is worse off than one who never configured TLS, because the belief is
+/// what the deployment was built on.
+fn load_pair(tls: &crate::config::Tls) -> std::io::Result<rustls::ServerConfig> {
+    let cert_pem = std::fs::read(&tls.cert).map_err(|e| {
+        tls_refusal(format!(
+            "[tls] cannot read the certificate {}: {e}",
+            tls.cert.display()
+        ))
+    })?;
+    let chain = rustls_pemfile::certs(&mut cert_pem.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            tls_refusal(format!(
+                "[tls] cannot parse the certificate {}: {e}",
+                tls.cert.display()
+            ))
+        })?;
+    if chain.is_empty() {
+        return Err(tls_refusal(format!(
+            "[tls] the certificate {} holds no CERTIFICATE block",
+            tls.cert.display()
+        )));
+    }
+    let key_pem = std::fs::read(&tls.key).map_err(|e| {
+        tls_refusal(format!(
+            "[tls] cannot read the private key {}: {e}",
+            tls.key.display()
+        ))
+    })?;
+    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+        .map_err(|e| {
+            tls_refusal(format!(
+                "[tls] cannot parse the private key {}: {e}",
+                tls.key.display()
+            ))
+        })?
+        .ok_or_else(|| {
+            tls_refusal(format!(
+                "[tls] the private key {} holds no PRIVATE KEY block",
+                tls.key.display()
+            ))
+        })?;
+    let mut config = rustls::ServerConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| tls_refusal(format!("[tls] unusable TLS protocol versions: {e}")))?
+        .with_no_client_auth()
+        // A key that belongs to a different certificate is the failure worth
+        // naming on its own: it loads far enough to look correct and fails at
+        // handshake time instead — that is, on every approval and never at
+        // startup, unless startup refuses it here.
+        .with_single_cert(chain, key)
+        .map_err(|e| {
+            tls_refusal(format!(
+                "[tls] the private key {} cannot be used with the certificate {} — \
+                 the two do not belong together, or the key is of a kind this build \
+                 does not support: {e}",
+                tls.key.display(),
+                tls.cert.display()
+            ))
+        })?;
+    // What `axum-server`'s own PEM loader sets, kept here because the self-test
+    // has to negotiate exactly what the listener will.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(config)
+}
+
 
 /// The fail-closed matrix is exercised over HTTP in `tests/server.rs`. What lives
 /// here is the one branch that cannot be driven from outside the crate: the

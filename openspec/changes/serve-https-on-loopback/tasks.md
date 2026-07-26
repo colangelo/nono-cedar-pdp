@@ -56,13 +56,13 @@ test today; deleting one instead of repointing it removes a rule from the suite.
   which would put every TLS test back on a guessed port; `from_tcp_rustls` over a listener
   bound here keeps it.
 
-- [ ] 4.1 Failing test (T11): our own rustls client, configured like nono's, completes a handshake against a TLS-configured daemon and gets a real decision back
-- [ ] 4.2 Failing test: a TLS-configured daemon does **not** answer a plaintext request — the no-silent-downgrade rule, asserted from the client side
-- [ ] 4.3 Failing test: an unreadable / unparseable / mismatched cert-key pair exits non-zero without binding (T2)
-- [ ] 4.4 Implement: `axum-server` arm in `server::serve`; the router is untouched so existing `tests/server.rs` coverage carries over
-- [ ] 4.5 Confirm every pre-existing `tests/server.rs` case still passes over plaintext — this change must be invisible to the default posture
-- [ ] 4.6 Plaintext startup logs the impersonation WARN; assert on it rather than trusting it exists
-- [ ] 4.7 The https arm reports the address it bound, like the plaintext one does, and the TLS tests take an ephemeral port through it rather than guessing one
+- [x] 4.1 Failing test (T11): our own rustls client, configured like nono's, completes a handshake against a TLS-configured daemon and gets a real decision back
+- [x] 4.2 Failing test: a TLS-configured daemon does **not** answer a plaintext request — the no-silent-downgrade rule, asserted from the client side
+- [x] 4.3 Failing test: an unreadable / unparseable / mismatched cert-key pair exits non-zero without binding (T2)
+- [x] 4.4 Implement: `axum-server` arm in `server::serve`; the router is untouched so existing `tests/server.rs` coverage carries over
+- [x] 4.5 Confirm every pre-existing `tests/server.rs` case still passes over plaintext — this change must be invisible to the default posture
+- [x] 4.6 Plaintext startup logs the impersonation WARN; assert on it rather than trusting it exists
+- [x] 4.7 The https arm reports the address it bound, like the plaintext one does, and the TLS tests take an ephemeral port through it rather than guessing one
 
 ## 5. The startup self-test
 

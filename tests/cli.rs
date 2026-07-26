@@ -727,63 +727,6 @@ fn a_group_readable_tls_key_refuses_to_start_without_binding() {
     drop(occupied);
 }
 
-/// T2, and the reason `[tls]` is allowed to fail a startup at all: a daemon that
-/// cannot establish the transport its configuration asks for **refuses to serve**.
-/// It never falls back to plaintext, because an operator who configured TLS and
-/// got a listening daemon has no way to tell the two apart — the worst of the
-/// available behaviours, worse than never having had TLS.
-///
-/// The load-bearing half is not the exit code: with the guard gone the daemon
-/// *also* exits non-zero here, because the port it would have bound is held. It
-/// is that the daemon is proved never to have reached the bind, which the held
-/// port turns into a positive assertion — `Address already in use` is what a
-/// fall-through prints, so its absence (with `listening` absent too) is the proof
-/// that no socket existed behind the `[tls]` config. The pair is valid: an
-/// owner-only `0600` key under a `0700` directory, so the key check passes and
-/// the *only* thing left to stop the plaintext listener is the rule under test.
-///
-/// **Stage 4 must repoint this test, not delete it.** The transitional refusal
-/// goes away when the axum-server arm lands and a valid pair starts serving
-/// https — so the message assertion moves to task 4.2's client-side one (a
-/// plaintext request to a TLS daemon is refused). What must survive the swap is
-/// the claim in the name: never plaintext behind `[tls]`. Covered at neither end
-/// is how this rule was left unpinned in the first place.
-#[test]
-fn a_tls_configured_daemon_refuses_rather_than_downgrade_to_plaintext() {
-    let dir = tempfile::tempdir().unwrap();
-    // Held for the whole run, like `a_group_readable_tls_key_refuses_to_start_
-    // without_binding` holds its own: a daemon that fell through to the plaintext
-    // listener would collide with it and say so.
-    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = occupied.local_addr().unwrap();
-    let block = tls_block(dir.path(), 0o600);
-
-    let (ok, output) = serve_from(
-        dir.path(),
-        &format!(
-            "policy_dir = \"{POLICY_DIR}\"\naudit_log = \"{}\"\nbind = \"{addr}\"\n{block}",
-            dir.path().join("decisions.jsonl").display()
-        ),
-        None,
-    );
-    assert!(!ok, "a daemon that cannot serve TLS must not serve: {output}");
-    assert!(
-        !output.to_lowercase().contains("address already in use"),
-        "the daemon fell through to the plaintext listener behind a [tls] config — \
-         it reached the bind, which is the silent downgrade T2 forbids: {output}"
-    );
-    assert!(
-        !output.contains("listening"),
-        "the daemon logs `listening` right after a successful bind, so this run \
-         served plaintext behind a [tls] config: {output}"
-    );
-    assert!(
-        output.contains("[tls]"),
-        "the refusal must send the operator to the configuration that caused it: {output}"
-    );
-    drop(occupied);
-}
-
 /// The pair a config names through a symlinked directory, with the key at
 /// `mode`. Returns the `[tls]` block written in terms of `link`, the resolved
 /// directory the daemon should end up holding, and the symlink path it must not.
@@ -843,19 +786,26 @@ fn a_symlinked_tls_key_is_checked_on_the_chain_it_resolves_to() {
 ///
 /// Asserted on the values `serve` itself carries, not on a refusal message the
 /// check happens to produce: the check re-resolves internally, so a message it
-/// wrote proves nothing about `config.tls`. The key is therefore `0600` and
-/// *passes*, which leaves the transitional `[tls]` refusal — the one thing
-/// downstream of the resolution that prints both paths — as the observable.
+/// wrote proves nothing about `config.tls`. The observable is therefore the
+/// **load** line the listener writes for the pair it actually read — the one
+/// thing downstream of the resolution that names both halves — and the pair is a
+/// real, parseable one at `0600` so that the load is reached at all.
 ///
-/// **Stage 4 must repoint this, not delete it.** When the axum-server arm lands,
-/// the observable becomes whatever the listener logs or loads; the claim being
-/// pinned is unchanged, and it is the claim, not the message, that matters.
+/// The certificate is deliberately the *untrusted* fixture and the port is held,
+/// so this stays true either side of the startup self-test landing: with it, the
+/// daemon refuses on the certificate; without it, on the held port. Both are
+/// after the load, which is what this test reads.
 #[test]
 fn a_symlinked_tls_pair_is_resolved_before_serving() {
     let dir = tempfile::tempdir().unwrap();
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = occupied.local_addr().unwrap();
-    let (linked, actual, link) = symlinked_tls_block(dir.path(), 0o600);
+    let actual = dir.path().join("actual");
+    let link = dir.path().join("link");
+    let (cert, key) = untrusted_pair(&actual);
+    std::os::unix::fs::symlink(&actual, &link).unwrap();
+    let linked = tls_block_for(&cert, &key)
+        .replace(&actual.display().to_string(), &link.display().to_string());
 
     let (ok, output) = serve_from(
         dir.path(),
@@ -1175,4 +1125,505 @@ fn a_policy_directory_inside_the_working_directory_warns_before_serving() {
         output.contains("same user"),
         "the warning must say why file modes do not help: {output}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The https listener (T3), the no-downgrade rule (T2) and the startup self-test
+// (T6), driven through the binary.
+//
+// Everything below spawns the real `serve`. That is the point: the router is
+// untouched by TLS, so an in-process test of the handlers says nothing about
+// which transport carried them, and this repo's recurring failure is green tests
+// that agree with each other and disagree with what actually speaks to nono.
+// ---------------------------------------------------------------------------
+
+/// A `[tls]` block naming an existing pair, for the tests that mint their own
+/// rather than taking [`tls_block`]'s placeholder PEM.
+fn tls_block_for(cert: &Path, key: &Path) -> String {
+    format!(
+        "\n[tls]\ncert = \"{}\"\nkey = \"{}\"\n",
+        cert.display(),
+        key.display()
+    )
+}
+
+/// A message that survives the test harness's output capture.
+///
+/// `eprintln!` goes through `std::io::_eprint`, which libtest redirects into the
+/// per-test buffer and then throws away for a test that passes — so a skip
+/// announced with it is a skip nobody ever sees, which is the failure mode T10
+/// names: a skip that reads like a pass has stopped being a verification. The
+/// raw handle is not redirected.
+fn announce(message: &str) {
+    let _ = writeln!(std::io::stderr(), "{message}");
+}
+
+/// Does the platform trust `cert` for `127.0.0.1`?
+///
+/// Measured through `rustls-platform-verifier` — the crate ureq's
+/// `platform-verifier` feature is, and therefore the one nono's webhook client
+/// uses. Deliberately **not** `security verify-cert`, which reports a
+/// Certificate Transparency failure for an mkcert leaf even with the CA
+/// installed *and* the identical error for a name the certificate does not
+/// carry, so it never reaches name matching and answers uniformly wrong (T7).
+fn platform_trusts(cert: &Path) -> bool {
+    use rustls::client::danger::ServerCertVerifier;
+
+    let pem = std::fs::read(cert).unwrap();
+    let mut chain = rustls_pemfile::certs(&mut pem.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    if chain.is_empty() {
+        return false;
+    }
+    let leaf = chain.remove(0);
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = rustls_platform_verifier::Verifier::new(provider).unwrap();
+    verifier
+        .verify_server_cert(
+            &leaf,
+            &chain,
+            &rustls::pki_types::ServerName::IpAddress(std::net::Ipv4Addr::LOCALHOST.into()),
+            &[],
+            rustls::pki_types::UnixTime::now(),
+        )
+        .is_ok()
+}
+
+/// A certificate and key `mkcert` minted for `localhost 127.0.0.1 ::1`, written
+/// under `dir/tls`, or `None` when this machine cannot produce a
+/// platform-trusted one.
+///
+/// `None` is announced loudly on the real stderr rather than silently returned:
+/// installing a local CA needs a human with an admin password, so a machine
+/// without one is expected — but a verification that quietly stops verifying is
+/// how a suite starts lying (T10).
+///
+/// `TRUST_STORES=system` because mkcert probes the Java keystore on every
+/// invocation and aborts before issuing anything when `keytool` fails, which on a
+/// Mac without a JDK it does.
+fn platform_trusted_pair(dir: &Path) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let (cert, key) = pair_paths(dir);
+    let minted = Command::new("mkcert")
+        .env("TRUST_STORES", "system")
+        .arg("-cert-file")
+        .arg(&cert)
+        .arg("-key-file")
+        .arg(&key)
+        .args(["localhost", "127.0.0.1", "::1"])
+        .output();
+    let issued = matches!(&minted, Ok(out) if out.status.success());
+    if !issued || !platform_trusts(&cert) {
+        announce(
+            "\n  SKIPPED (not run, not passed): this machine has no locally-trusted \
+             certificate.\n  The check needs mkcert's CA in the platform trust store, \
+             which needs an admin password:\n      brew install mkcert && mkcert \
+             -install\n  Until then nothing here proves the https listener works — only \
+             that it refuses.\n",
+        );
+        return None;
+    }
+    harden(dir, &cert, &key);
+    Some((cert, key))
+}
+
+/// A self-signed pair with the right names and the right EKU that chains to
+/// nothing this platform trusts — the certificate T6 exists to refuse. `openssl`
+/// rather than mkcert on purpose: mkcert's whole job is to be trusted.
+fn untrusted_pair(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let (cert, key) = pair_paths(dir);
+    let out = Command::new("openssl")
+        .args(["req", "-x509", "-newkey", "rsa:2048", "-days", "30", "-noenc"])
+        .arg("-keyout")
+        .arg(&key)
+        .arg("-out")
+        .arg(&cert)
+        .args([
+            "-subj",
+            "/CN=nono-cedar-pdp-untrusted",
+            "-addext",
+            "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1",
+            "-addext",
+            "extendedKeyUsage=serverAuth",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "openssl could not mint the untrusted fixture: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !platform_trusts(&cert),
+        "the fixture the untrusted-certificate tests rely on is trusted by this \
+         platform, so those tests would prove nothing"
+    );
+    harden(dir, &cert, &key);
+    (cert, key)
+}
+
+/// `dir/tls/{cert,key}.pem`, with the directory created.
+fn pair_paths(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let tls = dir.join("tls");
+    std::fs::create_dir_all(&tls).unwrap();
+    (tls.join("cert.pem"), tls.join("key.pem"))
+}
+
+/// The modes `just mint-cert` will write, applied here so a minted fixture gets
+/// past the key-protection refusal for the reason an operator's would (T4) —
+/// rather than because the tool that made it happened to choose them.
+fn harden(dir: &Path, cert: &Path, key: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = |path: &Path, mode: u32| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+    perms(&dir.join("tls"), 0o700);
+    perms(cert, 0o644);
+    perms(key, 0o600);
+}
+
+/// One https exchange with a client configured exactly the way nono's webhook
+/// client is: rustls over the **platform** verifier, with the server name taken
+/// from the address being dialled (T5 — the literal address, never a hostname
+/// that resolves to it). Returns the raw response, or the handshake failure.
+fn https(addr: SocketAddr, request: &str) -> Result<String, String> {
+    use rustls_platform_verifier::BuilderVerifierExt;
+
+    // `ring` named rather than discovered, for the reason `server::crypto_provider`
+    // gives: this test binary has two providers compiled in, because the `nono`
+    // dev-dependency drags `aws-lc-rs` in through sigstore's `reqwest`, and
+    // rustls's automatic choice *panics* rather than picking one.
+    let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| e.to_string())?
+    .with_platform_verifier()
+    .map_err(|e| e.to_string())?
+    .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::IpAddress(addr.ip().into());
+    let mut conn = rustls::ClientConnection::new(std::sync::Arc::new(config), name)
+        .map_err(|e| e.to_string())?;
+    let mut socket =
+        TcpStream::connect_timeout(&addr, Duration::from_secs(5)).map_err(|e| e.to_string())?;
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| e.to_string())?;
+    let mut stream = rustls::Stream::new(&mut conn, &mut socket);
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| e.to_string())?;
+    stream.flush().map_err(|e| e.to_string())?;
+    let mut response = Vec::new();
+    // `Connection: close` means the peer closes once the response is written, so
+    // a clean end-of-stream here is the response ending — not an error.
+    match stream.read_to_end(&mut response) {
+        Ok(_) => {}
+        Err(e) if !response.is_empty() => {
+            let _ = e;
+        }
+        Err(e) => return Err(e.to_string()),
+    }
+    Ok(String::from_utf8_lossy(&response).to_string())
+}
+
+/// Whatever a plaintext HTTP request gets back, tolerating a peer that answers a
+/// malformed handshake by resetting the connection. [`http`] cannot be used: it
+/// unwraps the read, and a reset would abort the test instead of being the
+/// evidence it is looking for.
+fn plaintext_probe(addr: SocketAddr, request: &str) -> String {
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(5)) else {
+        return String::new();
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    if stream.write_all(request.as_bytes()).is_err() {
+        return String::new();
+    }
+    let _ = stream.flush();
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    String::from_utf8_lossy(&response).to_string()
+}
+
+/// A config naming the shipped policy pack, an ephemeral port and `cert`/`key`.
+fn tls_config(dir: &Path, cert: &Path, key: &Path) -> String {
+    format!(
+        "policy_dir = \"{POLICY_DIR}\"\naudit_log = \"{}\"\nbind = \"127.0.0.1:0\"\n{}\n\
+         [agents]\ncedar = \"claude-code\"\n",
+        dir.join("decisions.jsonl").display(),
+        tls_block_for(cert, key)
+    )
+}
+
+/// T11: a client built the way nono's webhook client is built — rustls with the
+/// **platform** verifier — completes a handshake with this daemon and gets a real
+/// decision back.
+///
+/// The whole control rests on nono being able to tell this daemon from a
+/// squatter, and nono decides that with the platform trust store. So the useful
+/// test is not "some TLS client connected"; it is "a client that checks the same
+/// thing nono checks accepts us", which is why this configures no root of its own.
+///
+/// It is explicitly **not** the proof that nono denies a squatter — `just
+/// smoke-tls` is, with real `nono run`. Two tests because they answer different
+/// questions, and the cheap one must never be mistaken for the expensive one.
+#[test]
+fn a_tls_daemon_answers_a_client_configured_the_way_nonos_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some((cert, key)) = platform_trusted_pair(dir.path()) else {
+        return;
+    };
+    let mut daemon = start_daemon(dir.path(), &tls_config(dir.path(), &cert, &key));
+    let addr = daemon.addr;
+    let health = https(
+        addr,
+        &format!("GET /healthz HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"),
+    );
+    let body = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/git-status.json"
+    ))
+    .unwrap();
+    let approve = https(
+        addr,
+        &format!(
+            "POST /v1/approve HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    );
+    let logs = daemon.stop();
+
+    let health = health.unwrap_or_else(|e| {
+        panic!("the platform verifier refused this daemon's certificate: {e} (log: {logs})")
+    });
+    assert!(
+        health.starts_with("HTTP/1.1 200 OK"),
+        "GET /healthz over https: {health:?} (log: {logs})"
+    );
+    let approve =
+        approve.unwrap_or_else(|e| panic!("POST /v1/approve over https: {e} (log: {logs})"));
+    assert!(
+        approve.starts_with("HTTP/1.1 200 OK"),
+        "POST /v1/approve over https: {approve:?} (log: {logs})"
+    );
+    assert!(
+        approve.ends_with("{\"decision\":\"allow\"}"),
+        "the decision must survive the new transport unchanged — the router is the \
+         same one the plaintext tests exercise: {approve:?} (log: {logs})"
+    );
+}
+
+/// T2, and the reason `[tls]` is allowed to fail a startup at all: a daemon that
+/// cannot establish the transport its configuration asks for **refuses to serve**,
+/// and one that can **refuses to speak plaintext**. It never falls back, because
+/// an operator who configured TLS and got a listening daemon has no way to tell
+/// the two apart — the worst of the available behaviours, worse than never having
+/// had TLS.
+///
+/// Asserted from the client side, which is the only place the claim is real: the
+/// daemon's own log saying "https" proves nothing about what it would answer. The
+/// https half runs in the same test on purpose — without it, a daemon that had
+/// crashed, or bound nothing at all, would satisfy the plaintext half perfectly.
+///
+/// The refusal-to-*start* half of T2 — a `[tls]` block the daemon cannot use —
+/// lives in `an_unparseable_tls_certificate_refuses_to_serve_without_binding` and
+/// its two siblings, which need no trusted CA and so run everywhere.
+#[test]
+fn a_tls_configured_daemon_refuses_rather_than_downgrade_to_plaintext() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some((cert, key)) = platform_trusted_pair(dir.path()) else {
+        return;
+    };
+    let mut daemon = start_daemon(dir.path(), &tls_config(dir.path(), &cert, &key));
+    let addr = daemon.addr;
+    let plaintext = plaintext_probe(
+        addr,
+        &format!("GET /healthz HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"),
+    );
+    let secure = https(
+        addr,
+        &format!("GET /healthz HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"),
+    );
+    let logs = daemon.stop();
+
+    assert!(
+        !plaintext.contains("HTTP/1.1"),
+        "a daemon configured for TLS answered a plaintext request — that is the \
+         silent downgrade T2 forbids, and nothing downstream could detect it: \
+         {plaintext:?} (log: {logs})"
+    );
+    assert!(
+        !plaintext.contains("\"decision\""),
+        "a plaintext caller got a decision out of a TLS-configured daemon: \
+         {plaintext:?} (log: {logs})"
+    );
+    let secure = secure.unwrap_or_else(|e| {
+        panic!(
+            "the daemon refused plaintext but does not serve https either, so the \
+             assertion above proved only that it was broken: {e} (log: {logs})"
+        )
+    });
+    assert!(
+        secure.starts_with("HTTP/1.1 200 OK"),
+        "the same daemon must answer over https: {secure:?} (log: {logs})"
+    );
+}
+
+/// The posture is always in the log, never inferred from the absence of a line
+/// (T2). An operator reading a daemon's own output has to be able to see that
+/// anything else on this machine could have answered in its place — the
+/// plaintext listener is a documented posture, not a defect, and the only thing
+/// that makes it a *chosen* one is saying so.
+#[test]
+fn a_plaintext_daemon_warns_that_anything_could_impersonate_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let policies = copy_shipped_policies(dir.path());
+    let mut daemon = start_daemon(
+        dir.path(),
+        &format!(
+            "policy_dir = \"{}\"\naudit_log = \"{}\"\nbind = \"127.0.0.1:0\"\n",
+            policies.display(),
+            dir.path().join("decisions.jsonl").display()
+        ),
+    );
+    let logs = strip_ansi(&daemon.stop());
+
+    assert!(
+        logs.contains("WARN"),
+        "the posture must be a warning, not an info line an operator scrolls past: \
+         {logs}"
+    );
+    assert!(
+        logs.contains("impersonat"),
+        "the warning must name what is open — impersonation of this daemon — rather \
+         than merely observing that TLS is off: {logs}"
+    );
+    assert!(
+        logs.contains("[tls]"),
+        "and the remedy, or the operator has a risk with nowhere to go: {logs}"
+    );
+}
+
+/// A `[tls]` block the daemon cannot turn into a listener is a refusal to serve
+/// (T2). Not a warning, and above all not a fall-through to the plaintext
+/// listener: the operator believes the transport is authenticated, the nono
+/// profile's URL still says `https`, and nothing in either process reports the
+/// gap.
+///
+/// The three cases are the three ways a pair fails before it is ever offered to
+/// anyone: unreadable, unparseable, and a key that belongs to a different
+/// certificate. The last is the one worth having its own case — a mismatched pair
+/// loads far enough to look fine and fails at handshake time, i.e. on every real
+/// approval and never at startup, unless the daemon checks.
+///
+/// Ordering is proved the way `a_policy_load_failure_is_reported_before_the_port_
+/// is_touched` proves it: hold the port the daemon is told to bind, and require
+/// the failure it reports to be the certificate's rather than
+/// `Address already in use`. A daemon that bound first would print the latter.
+#[test]
+fn an_unparseable_tls_certificate_refuses_to_serve_without_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = occupied.local_addr().unwrap();
+    // `tls_block`'s placeholder: a PEM header and nothing else, at a mode the key
+    // check accepts, so the load is the only thing left to refuse it.
+    let block = tls_block(dir.path(), 0o600);
+
+    let (ok, output) = serve_from(
+        dir.path(),
+        &format!(
+            "policy_dir = \"{POLICY_DIR}\"\naudit_log = \"{}\"\nbind = \"{addr}\"\n{block}",
+            dir.path().join("decisions.jsonl").display()
+        ),
+        None,
+    );
+    assert!(!ok, "a daemon that cannot serve TLS must not serve: {output}");
+    assert!(
+        output.contains("[tls]"),
+        "the refusal must send the operator to the configuration that caused it: {output}"
+    );
+    assert!(
+        output.contains(&dir.path().join("tls/cert.pem").display().to_string()),
+        "and name the file it could not use: {output}"
+    );
+    assert!(
+        !output.to_lowercase().contains("address already in use"),
+        "the daemon fell through to a listener behind an unusable [tls] config — it \
+         reached the bind, which is the silent downgrade T2 forbids: {output}"
+    );
+    assert!(
+        !output.contains("listening"),
+        "the daemon logs `listening` right after a successful bind, so this run bound \
+         a port behind an unusable [tls] config: {output}"
+    );
+    drop(occupied);
+}
+
+#[test]
+fn an_unreadable_tls_certificate_refuses_to_serve_without_binding() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = occupied.local_addr().unwrap();
+    let (cert, key) = untrusted_pair(dir.path());
+    std::fs::set_permissions(&cert, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let (ok, output) = serve_from(
+        dir.path(),
+        &format!(
+            "policy_dir = \"{POLICY_DIR}\"\naudit_log = \"{}\"\nbind = \"{addr}\"\n{}",
+            dir.path().join("decisions.jsonl").display(),
+            tls_block_for(&cert, &key)
+        ),
+        None,
+    );
+    assert!(!ok, "a daemon that cannot read its certificate must not serve: {output}");
+    assert!(
+        output.contains("[tls]") && output.contains(&cert.display().to_string()),
+        "the refusal must name the configuration and the file: {output}"
+    );
+    assert!(
+        !output.to_lowercase().contains("address already in use"),
+        "the daemon reached the bind behind an unreadable certificate: {output}"
+    );
+    assert!(!output.contains("listening"), "{output}");
+    drop(occupied);
+}
+
+#[test]
+fn a_mismatched_tls_pair_refuses_to_serve_without_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = occupied.local_addr().unwrap();
+    let (cert, _key) = untrusted_pair(dir.path());
+    let (_other_cert, other_key) = untrusted_pair(other.path());
+
+    let (ok, output) = serve_from(
+        dir.path(),
+        &format!(
+            "policy_dir = \"{POLICY_DIR}\"\naudit_log = \"{}\"\nbind = \"{addr}\"\n{}",
+            dir.path().join("decisions.jsonl").display(),
+            tls_block_for(&cert, &other_key)
+        ),
+        None,
+    );
+    assert!(
+        !ok,
+        "a key that does not belong to the certificate fails at handshake time — on \
+         every approval and never at startup — unless startup refuses it: {output}"
+    );
+    assert!(
+        output.contains("[tls]"),
+        "the refusal must send the operator to the configuration: {output}"
+    );
+    assert!(
+        !output.to_lowercase().contains("address already in use"),
+        "the daemon reached the bind behind a mismatched pair: {output}"
+    );
+    assert!(!output.contains("listening"), "{output}");
+    drop(occupied);
 }

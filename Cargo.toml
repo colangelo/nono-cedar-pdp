@@ -40,6 +40,39 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # dev-dependency, which never ships, so this is a genuinely new runtime dependency
 # and is justified on its own terms rather than as already-paid-for.
 sha2 = "0.11"
+# The https listener (T3) and the startup self-test that decides whether it is
+# allowed to bind (T6). ADR-001's weight argument is about refusing to pull
+# sigstore, x509 and Keychain code into a security daemon for four serde structs
+# — machinery incidental to a feature we already had. This is the opposite case:
+# serving a transport nono can authenticate *is* the feature, and there is no
+# lighter way to have it. Recorded here so the next reader can see the rule was
+# applied rather than skipped.
+#
+# `axum-server` rather than a hand-rolled listener because axum 0.8's
+# `Listener::accept` returns `(Io, Addr)` with no `Result`, so a hand-written TLS
+# arm must keep the handshake off the accept path itself; awaiting it inline
+# compiles, passes a one-client test, and serialises every approval behind one
+# slow or hostile client. `axum-server` spawns per connection before the
+# handshake (`server.rs:308-309`), so that is correct by construction.
+#
+# `tls-rustls-no-provider` + `rustls/ring`, never the default `tls-rustls`, which
+# pulls `aws-lc-rs` and its C/assembly build. `ring` is also nono's own explicit
+# choice (`crates/nono-proxy/Cargo.toml`). `cargo tree -e normal -i aws-lc-rs`
+# must stay empty; it appears under `-e all` only through the `nono`
+# dev-dependency's sigstore chain, which never ships.
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# The same crate ureq's `platform-verifier` feature uses, which is what nono's
+# webhook client is built with (`crates/nono-cli/src/approval_runtime.rs:136-138`).
+# So the startup self-test is not a model of nono's verifier — it is nono's
+# verifier, which is the whole reason T6 answers the operator's real question.
+rustls-platform-verifier = "0.7.0"
+# Reading the configured PEM pair once, so the certificate the self-test proves is
+# byte-identical to the one the listener serves. `axum-server` can load PEM files
+# itself, but then the pair would be read twice from paths a squatter could
+# repoint between the two reads — the same two-objects gap D7 closes for the
+# policy directory.
+rustls-pemfile = "2.2.0"
 
 [dev-dependencies]
 nono = { version = "0.69.0", default-features = false }
