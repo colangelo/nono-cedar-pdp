@@ -38,12 +38,31 @@ docs around an unmeasured assumption is how a spec hardens around a wrong fact.
 
 ## 4. The listener
 
+Three things stage 3 left for this stage to carry rather than drop. Each is a live
+test today; deleting one instead of repointing it removes a rule from the suite.
+
+- **`a_tls_configured_daemon_refuses_rather_than_downgrade_to_plaintext`** (`tests/cli.rs`)
+  is the *only* cover on T2's no-downgrade rule. It reads the transitional refusal that
+  4.4 deletes. Repoint it at 4.2 — the claim in its name has to hold at both ends, and
+  covered at neither is exactly how it was missed the first time.
+- **`a_symlinked_tls_pair_is_resolved_before_serving`** (`tests/cli.rs`) pins D7 on the
+  values `serve` holds, and reads them out of the same transitional message. Repoint it at
+  whatever the listener logs or loads. Its sibling
+  `a_symlinked_tls_key_is_checked_on_the_chain_it_resolves_to` is *not* a substitute and
+  says so in its own docstring: it is satisfied by `isolation`'s internal `absolutize`.
+- **`serve` logs the address it actually bound**, not the configured one, and
+  `tests/cli.rs` reads the port back out of that line instead of guessing a free one. A
+  TLS arm built on `axum_server::bind_rustls(addr, …)` binds internally and loses that,
+  which would put every TLS test back on a guessed port; `from_tcp_rustls` over a listener
+  bound here keeps it.
+
 - [ ] 4.1 Failing test (T11): our own rustls client, configured like nono's, completes a handshake against a TLS-configured daemon and gets a real decision back
 - [ ] 4.2 Failing test: a TLS-configured daemon does **not** answer a plaintext request — the no-silent-downgrade rule, asserted from the client side
 - [ ] 4.3 Failing test: an unreadable / unparseable / mismatched cert-key pair exits non-zero without binding (T2)
 - [ ] 4.4 Implement: `axum-server` arm in `server::serve`; the router is untouched so existing `tests/server.rs` coverage carries over
 - [ ] 4.5 Confirm every pre-existing `tests/server.rs` case still passes over plaintext — this change must be invisible to the default posture
 - [ ] 4.6 Plaintext startup logs the impersonation WARN; assert on it rather than trusting it exists
+- [ ] 4.7 The https arm reports the address it bound, like the plaintext one does, and the TLS tests take an ephemeral port through it rather than guessing one
 
 ## 5. The startup self-test
 
