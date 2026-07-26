@@ -644,6 +644,61 @@ mod tests {
         assert_eq!(line["backend"], "cedar\\u{009b}0m\\u{007f}", "{line:#}");
     }
 
+    /// The rejected path's escaping lives in `scrape_context`, one module away
+    /// from the sink it protects — exactly the distance a refactor forgets. So
+    /// this pin is end to end: hostile bytes enter as a wire body and are
+    /// asserted absent from the file's raw bytes. DEL and C1 specifically,
+    /// because serde escapes C0 on its own — a C0-only assertion here would stay
+    /// green with no escaping at all, which is how the decided-path gap survived
+    /// a whole remediation round.
+    #[test]
+    fn del_and_c1_controls_on_a_rejected_line_never_reach_the_file_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decisions.jsonl");
+        let log = AuditLog::open(&path).unwrap();
+        let config = crate::config::Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            policy_dir: dir.path().to_path_buf(),
+            audit_log: path.clone(),
+            agents: std::collections::BTreeMap::new(),
+        };
+
+        let body = serde_json::json!({
+            "backend": "ced\u{9b}31mar",
+            "request": {
+                "capability_type": "netw\u{7f}ork",
+                "request_id": "n1\u{9b}0m",
+                "session_id": "s\u{7f}1",
+            }
+        })
+        .to_string();
+        let context = crate::adapter::nono_webhook::scrape_context(body.as_bytes(), &config);
+        log.record_rejected(&context, &crate::decision::Decision::deny("unsupported"));
+
+        let raw = std::fs::read(&path).unwrap();
+        let csi = "\u{9b}".as_bytes(); // 0xC2 0x9B in UTF-8
+        assert!(
+            !raw.windows(csi.len()).any(|window| window == csi),
+            "a raw CSI byte reached the audit file: {:?}",
+            String::from_utf8_lossy(&raw)
+        );
+        assert!(
+            !raw.contains(&0x7f),
+            "a raw DEL byte reached the audit file: {:?}",
+            String::from_utf8_lossy(&raw)
+        );
+
+        // Escaped, not truncated or dropped.
+        let line = &lines(&path)[0];
+        assert_eq!(line["backend"], "ced\\u{009b}31mar", "{line:#}");
+        assert_eq!(line["request_id"], "n1\\u{009b}0m", "{line:#}");
+        assert_eq!(line["session_id"], "s\\u{007f}1", "{line:#}");
+        assert_eq!(
+            line["resource"], "capability_type=netw\\u{007f}ork",
+            "{line:#}"
+        );
+    }
+
     /// A rejected request never became a `PolicyQuery`, so none of the three
     /// routing fields is known — and each must still be an explicit null, because
     /// the fixed key set is the invariant a consumer leans on. All three line
