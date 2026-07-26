@@ -47,7 +47,13 @@ Each of these was a real defect found by audit, not a hypothetical.
   are a hard error (a typo must not be silently ignored).
 - **Positional argument matching is unexpressible by construction** — `args` is a Cedar
   `Set`. Do not add an indexable form; upstream drops non-UTF-8 argv entries, so positions
-  are untrustworthy.
+  are untrustworthy. The entry is **dropped, not converted** — absent from `args` and
+  `argv_tail` alike — so a rule naming an argument cannot match one it cannot see, which is
+  **fail-open in a `forbid`**. Membership on a flag occupying its own argv entry survives;
+  a glob over a `--flag=<value>` entry does not, which is why
+  `git --exec-path=<non-UTF-8 dir> status` is approved by the shipped pack. Not closable
+  here — the post-drop request is byte-identical to a legitimate one — so do not "harden"
+  a policy against it. `docs/audits/` U01; upstream GHSA-p385-fvxh-xvgf.
 - **Deny and broken are different signals.** Decision-shaped failures return `200` with an
   explicit deny reason (nono records our reason); a broken daemon returns `503`.
 
@@ -87,5 +93,8 @@ disposable half.
 - `docs/adr/ADR-001-rust-and-cedar-crate.md` — Rust + embedded `cedar-policy`, and why
   `nono` is dev-only.
 - `docs/research/` — groundwork and the ecosystem survey that establishes the gap.
+- `docs/audits/` — accepted-risk register: what was fixed, what was accepted and why, and
+  what is **not ours to fix**. Read it before concluding the policy pack denies everything
+  it names; every accepted entry states what would close it.
 - `openspec/changes/add-cedar-pdp-v1/` — proposal, design, four capability specs, tasks.
 - `README.md` — operator-facing: quick start, nono profile wiring, rollout postures.
