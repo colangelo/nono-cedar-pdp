@@ -119,6 +119,105 @@ fn filesystem_capability_requests_are_unsupported() {
     );
 }
 
+/// The *header* half of the upstream contract, pinned as far as it can be from here.
+///
+/// The decide endpoint now requires `Content-Type: application/json`, which makes a
+/// header nono sends load-bearing: if a future nono stopped sending it, every
+/// decision would be refused — fail-closed, but a total outage. The two header values
+/// were read from nono 0.69.0's webhook client,
+/// `crates/nono-cli/src/approval_runtime.rs`, which builds the POST as
+///
+/// ```text
+/// .post(&self.url)
+/// .header("Content-Type", "application/json")
+/// .header("User-Agent", &format!("nono-cli/{}", env!("CARGO_PKG_VERSION")))
+/// .send(body)
+/// ```
+///
+/// **That client is not reachable from the dev-dependency, so the header values
+/// themselves cannot be asserted.** `nono` is the sandboxing *library* (dev-only, per
+/// ADR-001); the webhook POST lives in the `nono-cli` binary crate, which publishes no
+/// library target. `nono 0.69.0` exposes the approval *types* the tests above
+/// round-trip and no HTTP client, no `reqwest` builder and no header constant of any
+/// kind — verified by grepping the vendored crate source for `Content-Type` and
+/// `User-Agent`, which match nothing. Rather than skip silently, this pins the three
+/// things that *are* reachable, so a version bump breaks something visible:
+///
+/// 1. the dev-dependency version the headers were read from — bumping `nono` fails
+///    here and sends the bumper back to `approval_runtime.rs`;
+/// 2. that nono's own request type serializes to a JSON *object*, so
+///    `application/json` is a truthful description of the body the client posts —
+///    the gate demands what the payload actually is, not a convention;
+/// 3. that the gate accepts the upstream literal and refuses the three content types
+///    a CORS-simple cross-origin POST may carry, which is the mechanism that closes
+///    the browser vector (design D1).
+///
+/// The `User-Agent` is recorded as evidence only (design D5) and nothing depends on
+/// its value, so there is nothing to fail closed if it changes — which is why the
+/// version pin is the guard for that half.
+#[test]
+fn the_webhook_header_contract_is_pinned_to_the_nono_version_it_was_read_from() {
+    const MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+    assert!(
+        MANIFEST.contains(r#"nono = { version = "0.69.0""#),
+        "the nono dev-dependency moved off 0.69.0. The decide endpoint's header gate \
+         requires the `Content-Type: application/json` that nono 0.69.0's webhook \
+         client sends from crates/nono-cli/src/approval_runtime.rs — re-read that \
+         file's `.header(...)` calls before bumping, because a client that stopped \
+         sending the header would have every decision refused with 415"
+    );
+
+    // (2) The body really is a JSON object, so the content type the gate demands
+    // describes the payload rather than a convention we hope holds.
+    let upstream = nono::ApprovalRequest::Command {
+        request_id: "r1".into(),
+        command: "git".into(),
+        args: vec![EXAMPLE_SHIM_ARGV0.into(), "status".into()],
+        caller: "session".into(),
+        intercept_rule: "status".into(),
+        reason: None,
+        child_pid: 42,
+        session_id: "s1".into(),
+    };
+    let body = serde_json::json!({ "backend": "cedar", "request": serde_json::to_value(&upstream).unwrap() });
+    assert!(
+        body.is_object(),
+        "nono's own approval request no longer serializes to a JSON object, so \
+         `application/json` no longer describes the body: {body}"
+    );
+
+    // (3) The gate itself, against the upstream literal and against the three types a
+    // CORS-simple cross-origin POST may use — the ones a drive-by page is limited to.
+    assert!(
+        nono_cedar_pdp::server::is_json_content_type(Some("application/json")),
+        "the gate must accept the exact literal nono's client sends, or every real \
+         decision is refused"
+    );
+    for cors_simple in [
+        "text/plain",
+        "application/x-www-form-urlencoded",
+        "multipart/form-data",
+    ] {
+        assert!(
+            !nono_cedar_pdp::server::is_json_content_type(Some(cors_simple)),
+            "{cors_simple:?} is a content type a CORS-simple cross-origin POST may \
+             send without a preflight; accepting it reopens the drive-by vector"
+        );
+    }
+    assert!(
+        !nono_cedar_pdp::server::is_json_content_type(None),
+        "a request with no content-type cannot have come from nono's client"
+    );
+    // A future client may add parameters, and RFC 9110 makes the type
+    // case-insensitive; neither may turn a real request into a refusal.
+    assert!(nono_cedar_pdp::server::is_json_content_type(Some(
+        "application/json; charset=utf-8"
+    )));
+    assert!(nono_cedar_pdp::server::is_json_content_type(Some(
+        "APPLICATION/JSON"
+    )));
+}
+
 #[test]
 fn our_response_shape_is_not_upstreams_decision_shape() {
     // Upstream tries `ApprovalDecision` first, then the friendly shape. Prove

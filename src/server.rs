@@ -24,6 +24,29 @@ use tower_http::catch_panic::CatchPanicLayer;
 /// null, and an empty value reads as "we forgot to log it".
 const UNKNOWN: &str = "-";
 
+/// The `Content-Type` nono's webhook client sends, verified against nono 0.69.0
+/// (`crates/nono-cli/src/approval_runtime.rs`).
+const NONO_CONTENT_TYPE: &str = "application/json";
+
+/// Whether a `Content-Type` value describes the JSON body nono's webhook client
+/// posts. `None` is an absent header, which is a refusal: nono always sends one.
+///
+/// Media-type parameters are tolerated (`application/json; charset=utf-8`) because
+/// the essence is the type and a future client may add a charset, and the type is
+/// compared case-insensitively per RFC 9110 §8.3.1. Public so
+/// `tests/conformance.rs` can pin the gate against the upstream literal and against
+/// the three types a CORS-simple cross-origin POST may carry, without standing up a
+/// router.
+pub fn is_json_content_type(value: Option<&str>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    // `split(';')` always yields at least one item, so the default is unreachable;
+    // it exists because `unwrap` is denied outside tests.
+    let media_type = value.split(';').next().unwrap_or("").trim();
+    media_type.eq_ignore_ascii_case(NONO_CONTENT_TYPE)
+}
+
 /// Largest approval body the daemon will buffer.
 ///
 /// Explicit, not inherited from axum's default extractor limit: the threshold

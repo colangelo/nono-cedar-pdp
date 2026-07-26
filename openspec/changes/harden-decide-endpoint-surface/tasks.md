@@ -7,7 +7,7 @@ tracing max-level trap that once made filtered runs lie.
 
 ## 1. Pin the upstream header contract before relying on it (#8)
 
-- [ ] 1.1 Test in `tests/conformance.rs` (or beside it) asserting the header contract this change depends on: nono's webhook client sends `Content-Type: application/json` and `User-Agent: nono-cli/<version>`. Since the `nono` crate exposes the backend but not an interceptable client, assert against the documented constant/shape available from the dev-dependency, and if the crate genuinely cannot express it, record the verified upstream source location in the test's doc comment and assert what *is* reachable — do not silently skip. A future version bump must break something visible.
+- [x] 1.1 Test in `tests/conformance.rs` (or beside it) asserting the header contract this change depends on: nono's webhook client sends `Content-Type: application/json` and `User-Agent: nono-cli/<version>`. Since the `nono` crate exposes the backend but not an interceptable client, assert against the documented constant/shape available from the dev-dependency, and if the crate genuinely cannot express it, record the verified upstream source location in the test's doc comment and assert what *is* reachable — do not silently skip. A future version bump must break something visible.
 
 ## 2. Refuse requests that cannot have come from nono (#8)
 
