@@ -1312,6 +1312,148 @@ async fn the_audit_line_keeps_the_full_resource_summary_at_the_default_level() {
     );
 }
 
+/// The command variant above is only half the surface: nono's credential proxy
+/// forwards the request target verbatim, query string included, and for an API proxy
+/// the query string is where a token lands. So an `endpoint` decision has to hold the
+/// same line at the default level — identifiers and outcome, no request target.
+#[tokio::test]
+async fn the_default_decision_line_carries_identifiers_but_not_the_endpoint_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = "/repos/foo/bar?token=endpoint-leaked-into-an-unprotected-stream";
+    let body = endpoint_body("telemetry-4", path);
+
+    let logs = {
+        let capture = capture();
+        let (status, response) = post(&dir, &body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(
+            response,
+            serde_json::json!({"decision": "allow"}),
+            "{response}"
+        );
+        capture.text()
+    };
+
+    for field in [
+        "request_id=telemetry-4",
+        "session_id=proxy",
+        "backend=cedar",
+        "action=\"httpRequest\"",
+        "allow=true",
+        "matched=",
+        "eval_us=",
+    ] {
+        assert!(
+            logs.contains(field),
+            "the INFO decision line must carry {field:?}: {logs:?}"
+        );
+    }
+
+    assert!(
+        !logs.contains("endpoint-leaked-into-an-unprotected-stream"),
+        "the requested API path must not reach stdout at the default level — \
+         stdout has none of the audit log's permissions: {logs:?}"
+    );
+    assert!(!logs.contains(path), "nor the target as a whole: {logs:?}");
+
+    // Relocated, not lost.
+    let lines = audit_lines(&dir);
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert!(
+        lines[0]["resource"].as_str().unwrap().contains(path),
+        "the audit line must still carry the whole target: {:#?}",
+        lines[0]
+    );
+}
+
+/// The refusal path is the one that reads like an exception and is not: an ambiguous
+/// endpoint path is refused before any policy is consulted, and that refusal is
+/// logged at WARN because an operator should see it without opting in — but the WARN
+/// must name the *cause*, not the path. Naming the path there would put the whole
+/// request target, query string and all, into an unprotected stream by default, which
+/// is exactly what moving the decision detail to DEBUG was for.
+#[tokio::test]
+async fn an_ambiguous_endpoint_refusal_keeps_the_path_out_of_the_default_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = "/repos/../user/keys?token=refusal-leaked-at-default-level";
+    let body = endpoint_body("telemetry-5", path);
+
+    let (response, logs) = {
+        let capture = capture();
+        let (status, response) = post(&dir, &body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        (response, capture.text())
+    };
+
+    // The operator is still told, and can still join it to the audit line.
+    assert!(
+        logs.contains("WARN") && logs.contains("request_id=telemetry-5"),
+        "the refusal must be visible at the default level: {logs:?}"
+    );
+    assert!(
+        logs.contains(".."),
+        "and it must name the cause it refused on: {logs:?}"
+    );
+
+    assert!(
+        !logs.contains("refusal-leaked-at-default-level"),
+        "the request target must not reach stdout at the default level: {logs:?}"
+    );
+    assert!(
+        !logs.contains("/repos/"),
+        "no part of the path may reach stdout at the default level: {logs:?}"
+    );
+
+    // Nothing is lost: nono is told the whole target in the reason it records, and
+    // the audit log — the file with permissions — keeps both.
+    assert_eq!(response["decision"], "deny", "{response}");
+    assert!(
+        response["reason"].as_str().unwrap().contains(path),
+        "{response}"
+    );
+    let lines = audit_lines(&dir);
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert!(
+        lines[0]["resource"].as_str().unwrap().contains(path)
+            && lines[0]["reason"].as_str().unwrap().contains(path),
+        "{:#?}",
+        lines[0]
+    );
+}
+
+/// …and the path an operator lost from the WARN is one env var away, on an event
+/// carrying `request_id` so it joins the refusal it belongs to. Without this the
+/// previous test would be satisfied by deleting the detail outright, which is the
+/// opposite of design D6.
+#[tokio::test]
+async fn at_debug_the_refused_endpoint_path_is_recoverable() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = "/repos/../user/keys?token=only-at-debug";
+    let body = endpoint_body("telemetry-6", path);
+
+    let logs = {
+        let capture = capture_at(tracing::Level::DEBUG);
+        let (status, response) = post(&dir, &body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        capture.text()
+    };
+
+    assert!(
+        logs.contains("DEBUG"),
+        "the detail must be emitted when the operator opts in: {logs:?}"
+    );
+    assert!(
+        logs.contains(path),
+        "the refused target is the first thing wanted when diagnosing this deny: \
+         {logs:?}"
+    );
+    assert!(
+        logs.matches("request_id=telemetry-6").count() >= 2,
+        "the DEBUG event must repeat request_id or it cannot be joined to the \
+         refusal: {logs:?}"
+    );
+}
+
 /// Upstream builds `request_id` as `…-approve-{command}-{nanos}`, so the agent
 /// picks part of it. Raw `ESC`/`CR` in an operator-facing log line lets a crafted
 /// name erase and rewrite the decision an operator is reading.

@@ -517,15 +517,27 @@ impl Engine {
         // permit can be credited for it. See `crate::endpoint_path`.
         if let crate::query::Target::Endpoint { path, .. } = &q.target {
             if let Some(ambiguity) = crate::endpoint_path::ambiguity(path) {
-                let reason = format!(
-                    "ambiguous endpoint path {path:?}: {} — refusing to guess what the \
-                     upstream resolves it to",
-                    ambiguity.describe()
-                );
-                let decision = Decision::deny(reason);
+                let cause = ambiguity.describe();
+                let decision = Decision::deny(format!(
+                    "ambiguous endpoint path {path:?}: {cause} — refusing to guess what \
+                     the upstream resolves it to"
+                ));
+                // Telemetry, not the record. This WARN is default-level on purpose —
+                // an operator should see a refused path without opting in — so it
+                // carries the *cause* and the request id and not the path: nono's
+                // proxy forwards the request target verbatim, query string included,
+                // and for an API proxy that is where a token lands, while stdout
+                // inherits none of the audit log's 0600. Nothing is lost — the whole
+                // target stays in the deny reason nono records and the audit log
+                // keeps, and the caller's DEBUG "decision detail" event carries it
+                // for whoever opts in (`server::approve`, pinned by
+                // `at_debug_the_refused_endpoint_path_is_recoverable`).
                 tracing::warn!(
                     request_id = %crate::sanitize::control_escape(&q.request_id),
-                    reason = %decision.reason,
+                    // `describe` embeds only the offending segment (`.` or `..`), but
+                    // it is the one field here derived from the path at all, so it is
+                    // escaped like every other request-derived value.
+                    ambiguity = %crate::sanitize::control_escape(&cause),
                     "denying an endpoint request whose path is ambiguous"
                 );
                 return decision;
@@ -1270,6 +1282,53 @@ permit (
                 ))
                 .allow,
             "a command argument containing .. must not be caught by the path guard"
+        );
+    }
+
+    /// The refusal above is telemetry like every other operator-facing line, so it
+    /// obeys the same rule: the resource summary — here the request target nono's
+    /// proxy forwarded verbatim, query string included — is DEBUG-only, because
+    /// stdout has none of the audit log's `0600`. The *cause* stays at WARN, since
+    /// "an endpoint path was refused as ambiguous" is what an operator needs to see
+    /// without opting in.
+    ///
+    /// The query string is the load-bearing half of the assertion: for an API proxy
+    /// that is where a token lands, and it is not part of the routing decision at
+    /// all (`endpoint_path::ambiguity` truncates at `?`), so leaking it buys
+    /// nothing.
+    #[test]
+    fn the_ambiguity_refusal_keeps_the_path_out_of_the_default_log() {
+        let (engine, _d) = matrix_engine();
+        let path = "/repos/../user/keys?token=leaked-at-default-level";
+
+        let (decision, log_text) =
+            crate::test_log::with_captured_log(|| engine.evaluate(&endpoint_query("GET", path)));
+
+        assert!(!decision.allow, "{decision:?}");
+        assert!(
+            log_text.contains("request_id=p1"),
+            "the refusal must still be visible and correlatable: {log_text:?}"
+        );
+        assert!(
+            log_text.contains(".."),
+            "the cause belongs at the default level: {log_text:?}"
+        );
+        assert!(
+            !log_text.contains("leaked-at-default-level"),
+            "the request target must not reach stdout at the default level — \
+             stdout has none of the audit log's permissions: {log_text:?}"
+        );
+        assert!(
+            !log_text.contains("/repos/"),
+            "no part of the path may reach stdout at the default level: {log_text:?}"
+        );
+
+        // Relocated, not lost: nono still receives the whole target in the reason,
+        // and that reason is what the audit log records.
+        assert!(
+            decision.reason.contains(path),
+            "the deny reason must still name the path: {}",
+            decision.reason
         );
     }
 
