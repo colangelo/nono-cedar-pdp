@@ -18,6 +18,11 @@ use std::sync::Mutex;
 /// explicit `null`, so a consumer can tell "not known" from "not recorded".
 #[derive(Debug, Serialize)]
 pub struct AuditRecord<'a> {
+    /// Always `"decision"`. The log carries more than one record shape, and a
+    /// consumer must select on an explicit value rather than infer the shape from
+    /// which keys happen to be present — the same reason the key set within a shape
+    /// is fixed. See [`PolicySetRecord`] for the other shape.
+    pub kind: &'static str,
     pub ts: String,
     pub request_id: Option<&'a str>,
     pub session_id: Option<&'a str>,
@@ -62,6 +67,66 @@ pub struct AuditRecord<'a> {
     pub matched: &'a [String],
     pub reason: &'a str,
     pub eval_us: u128,
+}
+
+/// One `policy-set` line: which policy set became — or failed to become — the one
+/// deciding.
+///
+/// The trail could already say which policy *id* decided a request and not which
+/// content that id had, so after a hot reload nothing answered "which policies were
+/// live when this decision was made". This line answers it, and it survives the
+/// tampering it evidences because the audit log sits outside every write grant the
+/// sandboxed agent holds (D13) — an agent that rewrites the policy directory cannot
+/// erase the record of having done so.
+///
+/// **Evidence, not an integrity control.** The hash is written by the same process
+/// that read the files, so it supports later comparison and says nothing about
+/// authorship. Policy signing is the control and is unbuilt. This must never be
+/// described as verifying anything, for the reason [`AuditRecord::user_agent`]
+/// already gives: a field that looks like authentication is worse than no field.
+#[derive(Debug, Serialize)]
+pub struct PolicySetRecord<'a> {
+    /// Always `"policy-set"`. See [`AuditRecord::kind`].
+    pub kind: &'static str,
+    pub ts: String,
+    /// `"loaded"`, `"refused"` or `"failed"` — see [`PolicySetOutcome`].
+    pub outcome: &'static str,
+    /// On `loaded`, the generation that just became active. On the two outcomes that
+    /// adopt nothing, the generation still deciding.
+    pub generation: u64,
+    /// `sha256:<hex>` of the adopted set, or `null` when nothing was adopted:
+    /// there is no set to name, and inventing one would be a false alibi.
+    pub content_hash: Option<&'a str>,
+    /// The loaded policy files, or `null` when nothing was adopted. Control-escaped:
+    /// a file name in the policy directory is attacker-influenced in exactly the way
+    /// the recording-boundary rule anticipates.
+    pub files: Option<Vec<String>>,
+    /// Whether the startup isolation check produced advisory warnings — the policy
+    /// directory sitting somewhere an agent may write. A property of the process, so
+    /// it is carried on every line rather than only the first: an audit line is
+    /// supposed to be self-sufficient.
+    pub at_risk: bool,
+    /// Why a reload adopted nothing, control-escaped. `null` on `loaded`.
+    pub reason: Option<String>,
+}
+
+/// What a load attempt did, and the evidence that goes with it.
+///
+/// Attempts that adopt nothing are recorded too, and that is deliberate rather than
+/// incidental: a reload refused by the trust re-check *is* the detection event for a
+/// policy-directory compromise. Recording only successes would leave it exactly as
+/// silent in the durable record as it was before this existed — visible only on
+/// stdout, which `pdp-operations` classifies as telemetry rather than the record.
+pub enum PolicySetOutcome<'a> {
+    /// A set was read, validated and adopted.
+    Loaded {
+        content_hash: &'a str,
+        files: &'a [PathBuf],
+    },
+    /// The pre-reload trust re-check refused before anything was read.
+    Refused { reason: String },
+    /// A reload was attempted and failed — invalid Cedar, an unreadable directory.
+    Failed { reason: String },
 }
 
 /// Where audit lines go. A trait so the partial-write recovery path can be
@@ -301,6 +366,7 @@ impl AuditLog {
             ),
         };
         self.append(&AuditRecord {
+            kind: "decision",
             ts: now_rfc3339(),
             request_id: Some(&request_id),
             session_id: Some(&session_id),
@@ -336,6 +402,7 @@ impl AuditLog {
         // it — it comes from a header, not the body.
         let user_agent = user_agent.map(crate::sanitize::control_escape);
         self.append(&AuditRecord {
+            kind: "decision",
             ts: now_rfc3339(),
             request_id: context.request_id.as_deref(),
             session_id: context.session_id.as_deref(),
@@ -360,7 +427,67 @@ impl AuditLog {
         });
     }
 
-    fn append(&self, record: &AuditRecord<'_>) {
+    /// Record which policy set is deciding, or that an attempt to change it adopted
+    /// nothing. Called for the bootstrap load and every reload attempt.
+    ///
+    /// Like [`Self::record`], a logging failure never changes anything: a reload
+    /// that cannot be recorded still took effect, because refusing to serve on a
+    /// logging error would convert an observability failure into an outage.
+    pub fn record_policy_set(
+        &self,
+        generation: u64,
+        at_risk: bool,
+        outcome: &PolicySetOutcome<'_>,
+    ) {
+        // Escaped at the recording boundary like every other value derived from
+        // outside our own config: policy file names are chosen by whoever can write
+        // the policy directory, and a reload error string quotes the path it failed
+        // on. JSON encoding escapes only C0, so DEL and C1 (CSI among them) would
+        // otherwise replay in the terminal of whoever reads the trail.
+        let (outcome_name, content_hash, files, reason) = match outcome {
+            PolicySetOutcome::Loaded {
+                content_hash,
+                files,
+            } => (
+                "loaded",
+                Some(*content_hash),
+                Some(
+                    files
+                        .iter()
+                        .map(|p| crate::sanitize::control_escape(&p.display().to_string()))
+                        .collect(),
+                ),
+                None,
+            ),
+            PolicySetOutcome::Refused { reason } => (
+                "refused",
+                None,
+                None,
+                Some(crate::sanitize::control_escape(reason)),
+            ),
+            PolicySetOutcome::Failed { reason } => (
+                "failed",
+                None,
+                None,
+                Some(crate::sanitize::control_escape(reason)),
+            ),
+        };
+        self.append(&PolicySetRecord {
+            kind: "policy-set",
+            ts: now_rfc3339(),
+            outcome: outcome_name,
+            generation,
+            content_hash,
+            files,
+            at_risk,
+            reason,
+        });
+    }
+
+    /// Generic over the record shape so both kinds go through the same reattach,
+    /// shrink-detection and short-write rollback path. A second writer would be a
+    /// second place for those to drift.
+    fn append<R: Serialize>(&self, record: &R) {
         let line = match serde_json::to_string(record) {
             Ok(line) => line,
             Err(e) => {
@@ -1313,5 +1440,144 @@ mod tests {
             log_text.contains("shrank"),
             "the operator must see that lines were removed: {log_text:?}"
         );
+    }
+
+    #[test]
+    fn every_decision_line_names_its_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decisions.jsonl");
+        let log = AuditLog::open(&path).unwrap();
+        log.record(&query(), &crate::decision::Decision::deny("nope"), None);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let line: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            line["kind"], "decision",
+            "a consumer must select records by an explicit value, not by guessing \
+             from which keys are present"
+        );
+    }
+
+    #[test]
+    fn a_loaded_policy_set_records_its_hash_files_and_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decisions.jsonl");
+        let log = AuditLog::open(&path).unwrap();
+        log.record_policy_set(
+            7,
+            true,
+            &PolicySetOutcome::Loaded {
+                content_hash: "sha256:abc",
+                files: &[PathBuf::from("/policies/10-git.cedar")],
+            },
+        );
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let line: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(line["kind"], "policy-set");
+        assert_eq!(line["outcome"], "loaded");
+        assert_eq!(line["generation"], 7);
+        assert_eq!(line["content_hash"], "sha256:abc");
+        assert_eq!(line["files"][0], "/policies/10-git.cedar");
+        assert_eq!(line["at_risk"], true);
+        assert!(line["reason"].is_null(), "nothing failed, so no reason");
+    }
+
+    /// The outcome that matters most: a refused reload is the detection event for a
+    /// policy-directory compromise, and before this line existed it lived only on
+    /// stdout — which `pdp-operations` classifies as telemetry, not the record.
+    #[test]
+    fn a_refused_reload_records_a_null_hash_and_the_generation_still_deciding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decisions.jsonl");
+        let log = AuditLog::open(&path).unwrap();
+        log.record_policy_set(
+            3,
+            false,
+            &PolicySetOutcome::Refused {
+                reason: "mode 0770 on /policies".to_string(),
+            },
+        );
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let line: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(line["outcome"], "refused");
+        assert_eq!(
+            line["generation"], 3,
+            "the generation recorded is the one still deciding"
+        );
+        assert!(
+            line["content_hash"].is_null(),
+            "nothing was adopted, so there is no set to name — inventing one would \
+             be a false alibi"
+        );
+        assert!(line["files"].is_null(), "nothing was adopted");
+        assert!(line["reason"].as_str().unwrap().contains("0770"));
+    }
+
+    #[test]
+    fn a_failed_reload_records_a_null_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decisions.jsonl");
+        let log = AuditLog::open(&path).unwrap();
+        log.record_policy_set(
+            2,
+            false,
+            &PolicySetOutcome::Failed {
+                reason: "unexpected token".to_string(),
+            },
+        );
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let line: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(line["outcome"], "failed");
+        assert_eq!(line["generation"], 2);
+        assert!(line["content_hash"].is_null());
+    }
+
+    /// Asserted on the **raw file bytes**, with DEL and a C1 control rather than
+    /// `\u{1b}`. The trap AGENTS.md names: a C0-only assertion stays green with the
+    /// escaping removed, because JSON encoding escapes C0 anyway. A policy file name
+    /// and a reload error's quoted path are both chosen by whoever can write the
+    /// policy directory, which is exactly the attacker this escaping is for.
+    #[test]
+    fn control_bytes_in_a_provenance_line_cannot_reach_a_terminal_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decisions.jsonl");
+        let log = AuditLog::open(&path).unwrap();
+        log.record_policy_set(
+            1,
+            false,
+            &PolicySetOutcome::Refused {
+                // DEL (U+007F) and CSI (U+009B): neither is escaped by JSON string
+                // encoding, so both would land in the file raw without the boundary.
+                reason: "bad \u{7f} path \u{9b}31m".to_string(),
+            },
+        );
+        log.record_policy_set(
+            1,
+            false,
+            &PolicySetOutcome::Loaded {
+                content_hash: "sha256:abc",
+                files: &[PathBuf::from("/p/evil\u{7f}\u{9b}31m.cedar")],
+            },
+        );
+
+        let raw = std::fs::read(&path).unwrap();
+        assert!(
+            !raw.contains(&0x7f),
+            "a raw DEL reached the audit file: reading the trail in a terminal \
+             would replay it"
+        );
+        // C1 CSI is U+009B, which is 0xc2 0x9b in UTF-8.
+        assert!(
+            !raw.windows(2).any(|w| w == [0xc2, 0x9b]),
+            "a raw C1 CSI reached the audit file"
+        );
+        // And the line is still parseable, i.e. escaping did not corrupt it.
+        let text = String::from_utf8(raw).unwrap();
+        for line in text.lines() {
+            serde_json::from_str::<serde_json::Value>(line).unwrap();
+        }
     }
 }
