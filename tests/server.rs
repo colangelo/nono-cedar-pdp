@@ -144,7 +144,7 @@ fn capability_body(request_id: &str) -> String {
         "request": {
             "capability_type": "capability",
             "request_id": request_id,
-            "path": "/Users/ac/.ssh/id_ed25519",
+            "path": "/Users/agent/.ssh/id_ed25519",
             "access": "read",
             "reason": null,
             "child_pid": 7,

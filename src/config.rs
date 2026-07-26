@@ -177,7 +177,9 @@ cedar = "claude-code"
     /// config that removes it must not load.
     #[test]
     fn rejects_a_non_loopback_bind() {
-        for bind in ["0.0.0.0:18182", "192.168.4.200:8181", "[::]:8181"] {
+        // 192.0.2.0/24 is TEST-NET-1 (RFC 5737), i.e. a documentation address:
+        // an example that cannot accidentally name someone's real host.
+        for bind in ["0.0.0.0:18182", "192.0.2.1:8181", "[::]:8181"] {
             let f = write_config(&format!("policy_dir = \"/tmp/p\"\nbind = \"{bind}\"\n"));
             let err = Config::load(f.path()).unwrap_err();
             assert!(

@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn scrapes_the_context_of_a_refused_request() {
         let body = r#"{"backend":"cedar","request":{"capability_type":"capability",
-            "request_id":"cap-1","path":"/Users/ac/.ssh/id_ed25519","access":"read",
+            "request_id":"cap-1","path":"/Users/agent/.ssh/id_ed25519","access":"read",
             "reason":null,"child_pid":7,"session_id":"s1"}}"#;
         let ctx = scrape_context(body.as_bytes(), &config());
         assert_eq!(ctx.backend.as_deref(), Some("cedar"));

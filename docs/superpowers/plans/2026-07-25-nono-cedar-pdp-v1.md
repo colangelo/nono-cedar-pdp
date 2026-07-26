@@ -171,7 +171,7 @@ and keeps the unguarded constructor `#[cfg(test)]`. `src/server.rs` and
 - [ ] **Step 1: Create the cargo project skeleton**
 
 ```bash
-cd /Users/ac/_sync/dev/nono-cedar-pdp
+cd /path/to/nono-cedar-pdp
 cargo init --name nono-cedar-pdp --vcs none
 ```
 

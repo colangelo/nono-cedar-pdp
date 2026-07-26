@@ -6,13 +6,6 @@ enforcement (Seatbelt/Landlock) and escalates blocked actions over an HTTP webho
 daemon decides, nono enforces. Integration uses nono's stock webhook backend, so **no fork
 and no upstream change** are required.
 
-**Relay:** this repo is a participant in the house agent relay — role `app`, channel
-`nats`. Run **`/check-relay`** to read it; the global skill self-locates via the registry
-in `home-network/agent-relay/AGENTS.md`, so there is no per-repo command and, by design,
-no committed `agent-relay/` directory (zero committed surface — this tree is intended for
-publication). Send with
-`~/_sync/ac-devops/_projects/Infra/home-network/tools/relay-send --to <repo>`.
-
 ## Three things that are easy to get wrong here
 
 Each of these was a real defect found by audit, not a hypothetical.
