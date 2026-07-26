@@ -69,7 +69,7 @@ test today; deleting one instead of repointing it removes a rule from the suite.
 - [x] 5.1 Failing test: a daemon whose certificate is untrusted exits non-zero (T6)
 - [x] 5.2 Failing test: **nothing is ever accepted on the bind address** in that case — the window is the whole point, so assert the port is not listening, not merely that the process exited
 - [x] 5.3 Implement: throwaway listener on `127.0.0.1:0`, `rustls-platform-verifier` client, `ServerName` derived from `bind`, all **before** the real bind
-- [x] 5.4 Mutation: **run 2026-07-27.** With the call moved below the bind, 5.2 goes red on the daemon's own `listening bind=127.0.0.1:62571` line and 5.1 goes red on `Address already in use` — while the exit code stays non-zero in both, which is exactly why neither test settles for asserting that. Reverted; suite green
+- [x] 5.4 Mutation: **run twice, 2026-07-27.** (a) Ordering — With the call moved below the bind, 5.2 goes red on the daemon's own `listening bind=127.0.0.1:62571` line and 5.1 goes red on `Address already in use` — while the exit code stays non-zero in both, which is exactly why neither test settles for asserting that. Reverted; suite green. (b) `ServerName` — hardcoding `127.0.0.1` in place of the value derived from `bind` reddens `a_daemon_on_the_ipv6_loopback_serves_a_certificate_minted_for_only_that_address` with `NotValidForName`, and **nothing else**: the "does not cover the bind address" case has both addresses wrong for each other, so it stays green under it. That asymmetry was measured, not assumed, and is why the two tests are separate
 
 ## 6. Minting and the operator path
 

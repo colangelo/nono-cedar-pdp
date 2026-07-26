@@ -1158,7 +1158,7 @@ fn announce(message: &str) {
     let _ = writeln!(std::io::stderr(), "{message}");
 }
 
-/// Does the platform trust `cert` for `127.0.0.1`?
+/// Does the platform trust `cert` for `name`?
 ///
 /// Measured through `rustls-platform-verifier` — the crate ureq's
 /// `platform-verifier` feature is, and therefore the one nono's webhook client
@@ -1166,7 +1166,7 @@ fn announce(message: &str) {
 /// Certificate Transparency failure for an mkcert leaf even with the CA
 /// installed *and* the identical error for a name the certificate does not
 /// carry, so it never reaches name matching and answers uniformly wrong (T7).
-fn platform_trusts(cert: &Path) -> bool {
+fn platform_trusts(cert: &Path, name: std::net::IpAddr) -> bool {
     use rustls::client::danger::ServerCertVerifier;
 
     let pem = std::fs::read(cert).unwrap();
@@ -1183,16 +1183,21 @@ fn platform_trusts(cert: &Path) -> bool {
         .verify_server_cert(
             &leaf,
             &chain,
-            &rustls::pki_types::ServerName::IpAddress(std::net::Ipv4Addr::LOCALHOST.into()),
+            &rustls::pki_types::ServerName::IpAddress(name.into()),
             &[],
             rustls::pki_types::UnixTime::now(),
         )
         .is_ok()
 }
 
-/// A certificate and key `mkcert` minted for `localhost 127.0.0.1 ::1`, written
-/// under `dir/tls`, or `None` when this machine cannot produce a
-/// platform-trusted one.
+/// A certificate and key `mkcert` minted for `names`, written under `dir/tls`, or
+/// `None` when this machine cannot produce a platform-trusted certificate at all.
+///
+/// `trusted_for` is the address the precondition is measured against, and it must
+/// be one the certificate carries: the question this gate asks is *"is the mkcert
+/// CA installed"*, never *"does this certificate cover the bind address"* — the
+/// second is the daemon's job and a test that pre-answered it would be asserting
+/// its own fixture.
 ///
 /// `None` is announced loudly on the real stderr rather than silently returned:
 /// installing a local CA needs a human with an admin password, so a machine
@@ -1202,7 +1207,11 @@ fn platform_trusts(cert: &Path) -> bool {
 /// `TRUST_STORES=system` because mkcert probes the Java keystore on every
 /// invocation and aborts before issuing anything when `keytool` fails, which on a
 /// Mac without a JDK it does.
-fn platform_trusted_pair(dir: &Path) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+fn mkcert_pair(
+    dir: &Path,
+    names: &[&str],
+    trusted_for: std::net::IpAddr,
+) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     let (cert, key) = pair_paths(dir);
     let minted = Command::new("mkcert")
         .env("TRUST_STORES", "system")
@@ -1210,10 +1219,10 @@ fn platform_trusted_pair(dir: &Path) -> Option<(std::path::PathBuf, std::path::P
         .arg(&cert)
         .arg("-key-file")
         .arg(&key)
-        .args(["localhost", "127.0.0.1", "::1"])
+        .args(names)
         .output();
     let issued = matches!(&minted, Ok(out) if out.status.success());
-    if !issued || !platform_trusts(&cert) {
+    if !issued || !platform_trusts(&cert, trusted_for) {
         announce(
             "\n  SKIPPED (not run, not passed): this machine has no locally-trusted \
              certificate.\n  The check needs mkcert's CA in the platform trust store, \
@@ -1225,6 +1234,16 @@ fn platform_trusted_pair(dir: &Path) -> Option<(std::path::PathBuf, std::path::P
     }
     harden(dir, &cert, &key);
     Some((cert, key))
+}
+
+/// The pair a correctly-provisioned operator has: `localhost`, `127.0.0.1` and
+/// `::1` together, so the documented default bind is covered.
+fn platform_trusted_pair(dir: &Path) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    mkcert_pair(
+        dir,
+        &["localhost", "127.0.0.1", "::1"],
+        std::net::Ipv4Addr::LOCALHOST.into(),
+    )
 }
 
 /// A self-signed pair with the right names and the right EKU that chains to
@@ -1256,7 +1275,7 @@ fn untrusted_pair(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        !platform_trusts(&cert),
+        !platform_trusts(&cert, std::net::Ipv4Addr::LOCALHOST.into()),
         "the fixture the untrusted-certificate tests rely on is trusted by this \
          platform, so those tests would prove nothing"
     );
@@ -1773,5 +1792,118 @@ fn an_untrusted_tls_certificate_never_lets_anything_connect_to_the_bind_address(
         answered.is_none(),
         "something accepted a connection on {answered:?}, the address this daemon \
          reported binding: {output}"
+    );
+}
+
+/// The self-test's server name comes from **`bind`**, and a certificate that
+/// chains perfectly but does not carry that address is still a refusal.
+///
+/// mkcert rather than openssl for the fixture, deliberately: the CA is the same
+/// one the trusted pair uses, so the chain verifies and **name matching is the
+/// only thing left that can refuse it**. That is the same shape as the
+/// `127.0.0.2` row of the measurement T5 rests on — without it, "the platform
+/// trusts this certificate" degenerates into "the platform trusts this CA".
+///
+/// **This does not prove the name came from `bind`.** Both the address the
+/// certificate carries and the address the daemon was told to bind are wrong for
+/// each other here, so a self-test that hardcoded `127.0.0.1` would refuse this
+/// too and stay green — measured, not assumed. The claim that the name is
+/// *derived* is
+/// `a_daemon_on_the_ipv6_loopback_serves_a_certificate_minted_for_only_that_address`,
+/// which fails under exactly that mutation. Keep them apart.
+#[test]
+fn a_certificate_that_does_not_cover_the_bind_address_refuses_to_serve() {
+    let dir = tempfile::tempdir().unwrap();
+    let elsewhere: std::net::IpAddr = std::net::Ipv4Addr::new(127, 0, 0, 2).into();
+    let Some((cert, key)) = mkcert_pair(dir.path(), &["127.0.0.2"], elsewhere) else {
+        return;
+    };
+    // Held for the whole run, so `Address already in use` is what a daemon that
+    // bound before checking would print.
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = occupied.local_addr().unwrap();
+
+    let (ok, output) = serve_from(
+        dir.path(),
+        &format!(
+            "policy_dir = \"{POLICY_DIR}\"\naudit_log = \"{}\"\nbind = \"{addr}\"\n{}",
+            dir.path().join("decisions.jsonl").display(),
+            tls_block_for(&cert, &key)
+        ),
+        None,
+    );
+    assert!(
+        !ok,
+        "the certificate covers 127.0.0.2 and the daemon was told to bind \
+         {addr} — nono would reject the handshake, so the daemon must not \
+         start: {output}"
+    );
+    assert!(
+        output.contains("[tls]") && output.contains(&addr.ip().to_string()),
+        "the refusal must name the address the certificate failed to cover, or the \
+         operator reads it as a broken CA: {output}"
+    );
+    assert!(
+        !output.to_lowercase().contains("address already in use"),
+        "the daemon reached the bind before checking its certificate against the \
+         address it was about to serve on: {output}"
+    );
+    assert!(!output.contains("listening"), "{output}");
+    drop(occupied);
+}
+
+/// The self-test's server name is **derived from `bind`**, not assumed to be the
+/// default loopback — and the https listener works on the other loopback address
+/// the configuration accepts.
+///
+/// This is the one test with teeth against a hardcoded server name. Every other
+/// TLS test here binds `127.0.0.1`, and its certificate covers `127.0.0.1`, so a
+/// self-test that checked `127.0.0.1` regardless of `bind` satisfies all of them
+/// — including the "does not cover the bind address" case above, where both
+/// addresses are wrong for each other. Here the certificate covers `::1` and
+/// **nothing else**, so a hardcoded `127.0.0.1` turns a daemon that must start
+/// into one that refuses, and this goes red on its own.
+///
+/// It is also the only place the daemon is exercised on `[::1]`, which the
+/// configuration accepts and T5 warns about for a different reason: `localhost`
+/// resolves to `::1` before `127.0.0.1` on macOS, so an operator who thinks in
+/// hostnames can easily end up here without meaning to.
+#[test]
+fn a_daemon_on_the_ipv6_loopback_serves_a_certificate_minted_for_only_that_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let v6: std::net::IpAddr = std::net::Ipv6Addr::LOCALHOST.into();
+    let Some((cert, key)) = mkcert_pair(dir.path(), &["::1"], v6) else {
+        return;
+    };
+    let mut daemon = start_daemon(
+        dir.path(),
+        &format!(
+            "policy_dir = \"{POLICY_DIR}\"\naudit_log = \"{}\"\nbind = \"[::1]:0\"\n{}\n\
+             [agents]\ncedar = \"claude-code\"\n",
+            dir.path().join("decisions.jsonl").display(),
+            tls_block_for(&cert, &key)
+        ),
+    );
+    let addr = daemon.addr;
+    let health = https(
+        addr,
+        &format!("GET /healthz HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"),
+    );
+    let logs = daemon.stop();
+
+    assert!(
+        addr.is_ipv6(),
+        "the daemon was told to bind the IPv6 loopback: {addr} (log: {logs})"
+    );
+    let health = health.unwrap_or_else(|e| {
+        panic!(
+            "a certificate minted for exactly this daemon's bind address was not \
+             accepted for it, so the self-test is not asking about `bind`: {e} \
+             (log: {logs})"
+        )
+    });
+    assert!(
+        health.starts_with("HTTP/1.1 200 OK"),
+        "GET /healthz over https on the IPv6 loopback: {health:?} (log: {logs})"
     );
 }
