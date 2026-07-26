@@ -29,12 +29,12 @@ docs around an unmeasured assumption is how a spec hardens around a wrong fact.
 
 ## 3. Key protection
 
-- [ ] 3.1 Failing test: a group-readable key refuses to serve (T4)
-- [ ] 3.2 Failing test: a world-readable key refuses to serve
-- [ ] 3.3 Failing test: a key under an ancestor the existing walk rejects refuses to serve — reuse `isolation.rs`, do not reimplement the walk
-- [ ] 3.4 Failing test: a `0600` key owned by us passes
-- [ ] 3.5 Implement, resolving the pair at startup alongside the other state paths (D7) so the checked chain is the read chain
-- [ ] 3.6 Module docs state the scope honestly: **other local users only**, never the sandboxed agent (the house rule `tests/docs.rs` pins)
+- [x] 3.1 Failing test: a group-readable key refuses to serve (T4)
+- [x] 3.2 Failing test: a world-readable key refuses to serve
+- [x] 3.3 Failing test: a key under an ancestor the existing walk rejects refuses to serve — reuse `isolation.rs`, do not reimplement the walk
+- [x] 3.4 Failing test: a `0600` key owned by us passes
+- [x] 3.5 Implement, resolving the pair at startup alongside the other state paths (D7) so the checked chain is the read chain
+- [x] 3.6 Module docs state the scope honestly: **other local users only**, never the sandboxed agent (the house rule `tests/docs.rs` pins)
 
 ## 4. The listener
 

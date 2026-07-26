@@ -896,7 +896,7 @@ mod tests {
             policy_dir: dir.path().to_path_buf(),
             audit_log: path.clone(),
             agents: std::collections::BTreeMap::new(),
-        tls: None,
+            tls: None,
         };
 
         let body = serde_json::json!({

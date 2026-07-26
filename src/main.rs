@@ -134,6 +134,24 @@ async fn run_serve(config_path: &std::path::Path) -> Result<(), String> {
         )
     })?;
     config.audit_log = nono_cedar_pdp::isolation::resolve_existing_prefix(&config.audit_log);
+    // The TLS pair rides the same rule (D7). Both must exist to serve, so plain
+    // `canonicalize` like `policy_dir` rather than the audit log's
+    // existing-prefix form — and resolving here, before the key check below,
+    // is what makes the chain that check walks the chain the listener reads. A
+    // symlinked `key` resolved twice would be two different objects, and the
+    // gap between them is where a repoint lands.
+    if let Some(tls) = config.tls.as_mut() {
+        for (what, path) in [("cert", &mut tls.cert), ("key", &mut tls.key)] {
+            *path = std::fs::canonicalize(&path).map_err(|e| {
+                format!(
+                    "resolving tls {what} {}: {e} — [tls] is configured, and a transport \
+                     that cannot be established is a refusal to serve, never a silent \
+                     fallback to plaintext",
+                    path.display()
+                )
+            })?;
+        }
+    }
     // Before anything is loaded, opened or bound: who can write the policies
     // decides every approval this daemon will ever make. An `Err` here is a
     // refusal to serve; the warnings are advisory and deliberately loud. Both
@@ -155,6 +173,28 @@ async fn run_serve(config_path: &std::path::Path) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     for warning in &warnings {
         tracing::warn!("{warning}");
+    }
+    // And the private key, on the same terms and in the same place: read access
+    // to it is the ability to *be* this daemon, since nono verifies the
+    // certificate and has no other way to tell who answered (T4). Narrower than
+    // it looks — other local users only; see `isolation`'s module docs for why
+    // the sandboxed agent is bounded by its profile's read grants instead.
+    if let Some(tls) = &config.tls {
+        nono_cedar_pdp::isolation::refuse_a_readable_private_key(&tls.key)
+            .map_err(|e| e.to_string())?;
+        // TRANSITIONAL, and deleted by the change that adds the axum-server arm
+        // (T3): the https listener does not exist yet, so falling through from
+        // here would start the *plaintext* one behind a configuration that says
+        // the transport is authenticated — precisely the silent downgrade T2
+        // forbids, and the worst of the available behaviours. A refusal is the
+        // fail-closed answer until the listener lands.
+        return Err(format!(
+            "[tls] names {} but the https listener is not implemented yet — refusing to \
+             serve, because serving plaintext behind a configuration that asks for TLS \
+             would leave the operator believing the transport is authenticated when it \
+             is not",
+            tls.cert.display()
+        ));
     }
 
     let schema = cedar::schema::load().map_err(|e| e.to_string())?;

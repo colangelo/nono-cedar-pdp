@@ -292,6 +292,66 @@ fn free_loopback_addr() -> SocketAddr {
     addr
 }
 
+/// Start a daemon listening on an ephemeral loopback port, returning the address
+/// it bound and the running child. Panics — with the daemon's own output — if it
+/// exits during startup or never listens.
+///
+/// The retry is the point. [`free_loopback_addr`] cannot hand out a *reserved*
+/// port: releasing the probe socket is precisely what makes the port available
+/// to the daemon, and to everything else asking the kernel for an ephemeral port
+/// at the same moment. Several tests in this file allocate one in parallel, so
+/// the window is small but real — measured at roughly one run in ten once two
+/// more allocators joined the file. Retrying on `Address already in use`
+/// specifically keeps every guarantee the caller asserts (the daemon still has
+/// to bind exactly the address its configuration named) while removing a flake
+/// that says nothing about the daemon.
+fn start_daemon_on_a_free_port(
+    config_dir: &Path,
+    config_body: impl Fn(SocketAddr) -> String,
+) -> (SocketAddr, std::process::Child) {
+    const ATTEMPTS: u32 = 5;
+    for attempt in 1..=ATTEMPTS {
+        let addr = free_loopback_addr();
+        let config = config_dir.join("config.toml");
+        std::fs::write(&config, config_body(addr)).unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_nono-cedar-pdp"))
+            .arg("serve")
+            .arg("--config")
+            .arg(&config)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        // Wait for the listener rather than sleeping: a fixed sleep is either
+        // flaky or slow, and an exit here is a startup failure to report as one.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                let output = child.wait_with_output().unwrap();
+                let text = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if text.to_lowercase().contains("address already in use") && attempt < ATTEMPTS {
+                    break;
+                }
+                panic!("the daemon exited during startup ({status}): {text}");
+            }
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+                return (addr, child);
+            }
+            if Instant::now() >= deadline {
+                child.kill().ok();
+                panic!("the daemon never listened on {addr}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    panic!("no ephemeral port survived {ATTEMPTS} attempts between the probe and the bind");
+}
+
 /// Startup must fail *before* the socket exists: a daemon that binds first and
 /// validates second answers requests for the window in between, and nono treats a
 /// connection refusal (fail closed) very differently from a 503 or a hang.
@@ -407,6 +467,123 @@ fn a_non_loopback_bind_refuses_to_start() {
     assert!(stderr.contains("0.0.0.0:18182"), "{stderr}");
 }
 
+/// A certificate and key pair under `dir/tls`, with the key at `mode`. Returns
+/// the `[tls]` block naming them.
+fn tls_block(dir: &Path, mode: u32) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let tls = dir.join("tls");
+    std::fs::create_dir_all(&tls).unwrap();
+    let cert = tls.join("cert.pem");
+    let key = tls.join("key.pem");
+    std::fs::write(&cert, "-----BEGIN CERTIFICATE-----\n").unwrap();
+    std::fs::write(&key, "-----BEGIN PRIVATE KEY-----\n").unwrap();
+    std::fs::set_permissions(&tls, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&cert, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(mode)).unwrap();
+    format!(
+        "\n[tls]\ncert = \"{}\"\nkey = \"{}\"\n",
+        cert.display(),
+        key.display()
+    )
+}
+
+/// T4 through the binary: a private key another local user can read is a key
+/// they can answer nono's approvals with, so the daemon must stop — and stop
+/// *before* the socket exists, for the same reason the policy checks do. A
+/// refusal that arrives after the bind has already served.
+///
+/// The ordering is proved the way
+/// `a_policy_load_failure_is_reported_before_the_port_is_touched` proves it:
+/// hold the port the daemon is told to bind, and require the failure it reports
+/// to be the key's rather than `Address already in use`. That is a stronger
+/// assertion than "the port is free afterwards", and — the reason it is written
+/// this way rather than with `free_loopback_addr` — it needs no *free* ephemeral
+/// port, so it does not race the tests that do ask for one. Two more consumers
+/// of that helper measurably flaked
+/// `a_started_daemon_answers_healthz_and_approve_over_a_real_socket`, whose port
+/// the kernel can hand out again between the probe and the daemon's bind.
+#[test]
+fn a_group_readable_tls_key_refuses_to_start_without_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = occupied.local_addr().unwrap();
+    let block = tls_block(dir.path(), 0o640);
+
+    let (ok, output) = serve_from(
+        dir.path(),
+        &format!(
+            "policy_dir = \"{POLICY_DIR}\"\naudit_log = \"{}\"\nbind = \"{addr}\"\n{block}",
+            dir.path().join("decisions.jsonl").display()
+        ),
+        None,
+    );
+    assert!(!ok, "startup must fail: {output}");
+    assert!(
+        output.contains("private key"),
+        "the message must name the subsystem: {output}"
+    );
+    assert!(
+        output.contains(&dir.path().join("tls/key.pem").display().to_string()),
+        "the message must name the path: {output}"
+    );
+    assert!(output.contains("0640"), "the mode must be named: {output}");
+    assert!(
+        output.contains("chmod 600"),
+        "the operator needs the remedy: {output}"
+    );
+    assert!(
+        !output.to_lowercase().contains("address already in use"),
+        "the daemon reached the listener before checking who can read its key: {output}"
+    );
+    assert!(
+        !output.contains("listening"),
+        "the daemon logs `listening` right after a successful bind, so this run bound \
+         a port before failing: {output}"
+    );
+    drop(occupied);
+}
+
+/// The key check has to run over the chain the listener will read, not the one
+/// the operator typed (D7). A `~/`-relative or symlinked path resolved twice —
+/// once for the check, once for the read — is two different objects, and the
+/// gap between them is where a repoint lands. Driven through a symlinked
+/// directory, which is the shape that made this a real defect for `policy_dir`.
+#[test]
+fn a_symlinked_tls_key_is_checked_on_the_chain_it_resolves_to() {
+    let dir = tempfile::tempdir().unwrap();
+    // Held rather than probed-and-released, for the reason the test above gives.
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = occupied.local_addr().unwrap();
+    // The real pair lives under `actual/`; the config names it through `link`.
+    let actual = dir.path().join("actual");
+    let block = tls_block(&actual, 0o644);
+    std::os::unix::fs::symlink(&actual, dir.path().join("link")).unwrap();
+    let linked = block.replace(
+        &actual.display().to_string(),
+        &dir.path().join("link").display().to_string(),
+    );
+
+    let (ok, output) = serve_from(
+        dir.path(),
+        &format!(
+            "policy_dir = \"{POLICY_DIR}\"\naudit_log = \"{}\"\nbind = \"{addr}\"\n{linked}",
+            dir.path().join("decisions.jsonl").display()
+        ),
+        None,
+    );
+    assert!(!ok, "startup must fail: {output}");
+    assert!(
+        output.contains("0644"),
+        "the refusal must be the key's mode, read through the link: {output}"
+    );
+    assert!(
+        output.contains(&actual.join("tls/key.pem").display().to_string()),
+        "the message must name the resolved path, since that is the one the \
+         listener will read: {output}"
+    );
+    drop(occupied);
+}
+
 /// Send one HTTP/1.1 request over a real socket and return the raw response.
 /// `Connection: close` so the read ends at the response rather than on a timeout.
 fn http(addr: SocketAddr, request: &str) -> String {
@@ -455,46 +632,14 @@ fn a_started_daemon_answers_healthz_and_approve_over_a_real_socket() {
     let dir = tempfile::tempdir().unwrap();
     let policies = copy_shipped_policies(dir.path());
     let audit_log = dir.path().join("state/decisions.jsonl");
-    let addr = free_loopback_addr();
-    let config = dir.path().join("config.toml");
-    std::fs::write(
-        &config,
+    let (addr, mut child) = start_daemon_on_a_free_port(dir.path(), |addr| {
         format!(
             "policy_dir = \"{}\"\naudit_log = \"{}\"\nbind = \"{addr}\"\n\n[agents]\ncedar = \"claude-code\"\n",
             policies.display(),
             audit_log.display()
-        ),
-    )
-    .unwrap();
-
-    let mut child = Command::new(env!("CARGO_BIN_EXE_nono-cedar-pdp"))
-        .arg("serve")
-        .arg("--config")
-        .arg(&config)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-
-    // Wait for the listener rather than sleeping: a fixed sleep is either flaky or
-    // slow, and an exit here is a startup failure the test should report as one.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut health = String::new();
-    while Instant::now() < deadline {
-        if let Some(status) = child.try_wait().unwrap() {
-            let output = child.wait_with_output().unwrap();
-            panic!(
-                "the daemon exited during startup ({status}): {}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
-            health = get(addr, "/healthz");
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+        )
+    });
+    let health = get(addr, "/healthz");
 
     let approve = post(
         addr,
@@ -567,8 +712,10 @@ fn a_started_daemon_answers_healthz_and_approve_over_a_real_socket() {
     // The real binary's bootstrap load is on the record, ahead of any decision.
     // Only an out-of-process run can show this: the provenance line is written by
     // `main` after the audit log opens, so no in-process router test reaches it.
-    let provenance: Vec<&serde_json::Value> =
-        records.iter().filter(|r| r["kind"] == "policy-set").collect();
+    let provenance: Vec<&serde_json::Value> = records
+        .iter()
+        .filter(|r| r["kind"] == "policy-set")
+        .collect();
     assert_eq!(provenance.len(), 1, "{trail}");
     assert_eq!(provenance[0]["outcome"], "loaded");
     assert_eq!(provenance[0]["generation"], 1);
@@ -618,44 +765,14 @@ fn a_symlinked_policy_dir_is_resolved_before_serving() {
     let real = copy_shipped_policies(dir.path());
     let link = dir.path().join("link");
     std::os::unix::fs::symlink(&real, &link).unwrap();
-    let addr = free_loopback_addr();
-    let config = dir.path().join("config.toml");
-    std::fs::write(
-        &config,
+    let (addr, mut child) = start_daemon_on_a_free_port(dir.path(), |addr| {
         format!(
             "policy_dir = \"{}\"\naudit_log = \"{}\"\nbind = \"{addr}\"\n",
             link.display(),
             dir.path().join("decisions.jsonl").display()
-        ),
-    )
-    .unwrap();
-
-    let mut child = Command::new(env!("CARGO_BIN_EXE_nono-cedar-pdp"))
-        .arg("serve")
-        .arg("--config")
-        .arg(&config)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut health = String::new();
-    while Instant::now() < deadline {
-        if let Some(status) = child.try_wait().unwrap() {
-            let output = child.wait_with_output().unwrap();
-            panic!(
-                "the daemon exited during startup ({status}): {}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
-            health = get(addr, "/healthz");
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+        )
+    });
+    let health = get(addr, "/healthz");
     child.kill().unwrap();
     child.wait().unwrap();
 

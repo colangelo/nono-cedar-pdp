@@ -1,14 +1,22 @@
 //! Trust checks on the daemon's own state paths: the hot-reloaded policy
-//! directory and the audit log. [`check`] runs once at startup; its refusal core,
-//! [`refuse_untrusted_policy_dir`], re-runs in the watcher before every reloaded
-//! policy set is adopted.
+//! directory, the audit log, and — when TLS is configured — the listener's
+//! private key. [`check`] runs once at startup and covers the first two; its
+//! refusal core, [`refuse_untrusted_policy_dir`], re-runs in the watcher before
+//! every reloaded policy set is adopted. [`refuse_a_readable_private_key`] is the
+//! key's, run at startup beside them and before anything binds.
 //!
 //! Why they need checking at all: write access to the policy directory *is* write
 //! access to every future decision. Dropping `permit (principal, action,
 //! resource);` into any `*.cedar` file there is adopted after the watcher's ~150 ms
 //! debounce, with nothing but an INFO line. Write access to the audit log is write
 //! access to the record of what was decided, which is the compensating control for
-//! an unauthenticated webhook.
+//! an unauthenticated webhook. **Read** access to the TLS private key is the
+//! ability to *be* this daemon: nono verifies the certificate and nothing else, so
+//! whoever holds the key answers approvals in our place with a handshake nono
+//! cannot distinguish from ours (T4). That inversion is the one thing here that
+//! does not follow the writability pattern — a key at `0640` passes every other
+//! check in this module — so the key's rule is its own (OpenSSH's `0o077` mask),
+//! while its ownership rule and ancestor walk are the shared ones.
 //!
 //! The refusal covers the **ancestor chain** too, because the mode of the policy
 //! directory itself never mattered if a parent is loose: whoever can write an
@@ -45,9 +53,10 @@
 //!
 //! One more rule makes the two above mean what they say: `serve` **resolves the
 //! configured paths once**, at startup and before any check (D7 — `policy_dir`
-//! through `canonicalize`, the audit log through [`resolve_existing_prefix`]),
-//! and constructs the engine, the watcher and the audit log with the resolved
-//! paths. The checked chain and the used chain are therefore the same object: a
+//! and, when TLS is configured, the certificate and key through `canonicalize`;
+//! the audit log through [`resolve_existing_prefix`]), and constructs the engine,
+//! the watcher, the audit log and the listener with the resolved paths. The
+//! checked chain and the used chain are therefore the same object: a
 //! symlink on the *configured* path cannot be repointed after startup to
 //! redirect a reload to a tree these checks never walked (that gap was live
 //! before D7 — the walk inspected the canonical chain while the loader
@@ -62,7 +71,7 @@
 //! complete answer is the profile-derived check and policy signing under
 //! epic #1.
 //!
-//! **Both checks here are much weaker than they look, and being precise about that
+//! **Every check here is much weaker than it looks, and being precise about that
 //! is the point of this module.**
 //!
 //! 1. **The refusal (group- or world-writable) does nothing about the sandboxed
@@ -73,7 +82,16 @@
 //!    different and weaker threat: another local user — a shared group, a service
 //!    account, anyone at all under `o+w` — who could otherwise add or rewrite a
 //!    policy. Worth refusing over, but it is not the sandbox-escape defence.
-//! 2. **The cwd warning is a heuristic proxy, and it is wrong in both
+//! 2. **The private-key refusal does nothing about the sandboxed agent either,
+//!    and for the identical reason.** The agent shares our uid, so it satisfies
+//!    an owner-only mode by construction; what separates it from the key is
+//!    *where the key sits relative to the nono profile's read grants*, never the
+//!    key's mode. This is the D13 argument for the policy directory with `read`
+//!    substituted for `write`, and it fails the same way — an operator who points
+//!    a profile's read grants at `~/.config/nono-cedar-pdp/tls/` has handed the
+//!    agent the ability to impersonate this daemon, and every check in this module
+//!    still passes. What the refusal buys is, again, other local users only.
+//! 3. **The cwd warning is a heuristic proxy, and it is wrong in both
 //!    directions.** It cannot read the nono profile, so it *misses* an absolute
 //!    `policy_dir` that happens to sit inside a granted tree — on macOS the default
 //!    profile groups grant write to `/tmp`, `/private/tmp`, `$TMPDIR` and
@@ -82,9 +100,10 @@
 //!    where no agent exists at all.
 //!
 //! The only control that actually stops a sandboxed agent from rewriting the
-//! policies that govern it is **the nono profile not granting write access to these
-//! paths**. README "Keep the policy directory out of the sandbox" has the procedure
-//! for checking a profile against that rule.
+//! policies that govern it — or reading the key that proves who it is talking to —
+//! is **the nono profile not granting access to these paths**. README "Keep the
+//! policy directory out of the sandbox" has the procedure for checking a profile
+//! against that rule.
 
 use std::ffi::OsString;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -143,13 +162,122 @@ pub enum IsolationError {
         euid: u32,
     },
     #[error(
-        "checking {path}: {source} — refusing to serve without knowing who can write the \
-         policies"
+        "TLS private key {path} is {who}-accessible (mode {mode}) — a private key must be \
+         reachable by its owner alone: another local user who can read it answers nono's \
+         approvals in this daemon's place with a handshake nono cannot tell from ours, and \
+         one who can write it substitutes a key the certificate does not match. So the \
+         daemon refuses to serve. Fix with `chmod 600 {path}` (a user-private group counts: \
+         this process cannot tell one from a shared group). This says nothing about a \
+         sandboxed agent, which runs as the same user as this daemon: what separates the \
+         agent from this key is where the key sits relative to its nono profile's read \
+         grants, never the key's mode"
+    )]
+    AccessibleKey {
+        path: PathBuf,
+        mode: String,
+        who: String,
+    },
+    #[error(
+        "checking {what} {path}: {source} — refusing to serve without knowing who else can \
+         reach it"
     )]
     Io {
+        what: &'static str,
         path: PathBuf,
         source: std::io::Error,
     },
+}
+
+/// The `what` the private-key refusals name, so the operator is sent to the
+/// right subsystem. Shared by the key's own judgement, its ancestor walk and the
+/// I/O failure that stands in for both.
+const PRIVATE_KEY: &str = "TLS private key";
+
+/// Refuse a TLS private key another local user could read (T4).
+///
+/// `Err` means **do not serve**, on the same terms as [`check`]: a key someone
+/// else can read is a key someone else can present this daemon's certificate
+/// with, and nono verifies the certificate and nothing else — it has no way to
+/// tell their handshake from ours. Unlike the policy directory, where the defect
+/// is *writability*, the defect on a private key is *readability*, so this rule
+/// is genuinely new; everything else here is the existing machinery — the
+/// ownership rule (owner-or-root, D6) and the ancestor walk, sticky-bit
+/// exemption included, because whoever can write a parent directory substitutes
+/// their own key file and the mode of ours stops mattering.
+///
+/// The mask is OpenSSH's: **any** group or other permission bit is a refusal,
+/// not just the read one. A key another local user can write is a key they can
+/// replace, which costs availability rather than secrecy, and no legitimate
+/// deployment needs a bit set there.
+///
+/// The certificate is deliberately *not* checked this way — it is public, and
+/// substituting it without the key produces a pair the daemon refuses to load
+/// rather than an impersonation.
+///
+/// Scope, as narrow as the rest of this module: **other local users only.** It
+/// does nothing about the sandboxed agent, which runs as the same uid and is
+/// separated from the key by where the key sits relative to the nono profile's
+/// *read* grants — the D13 argument for the policy directory, one grant kind
+/// over, and it fails the same way if an operator points a profile's read grants
+/// at the key.
+pub fn refuse_a_readable_private_key(key: &Path) -> Result<(), IsolationError> {
+    refuse_a_readable_private_key_as(key, daemon_euid())
+}
+
+/// [`refuse_a_readable_private_key`] with the effective uid passed in: the same
+/// seam [`refuse_untrusted_policy_dir_as`] uses, since the suite cannot `chown`
+/// and so cannot build a genuinely foreign-owned key.
+fn refuse_a_readable_private_key_as(key: &Path, euid: u32) -> Result<(), IsolationError> {
+    // Absolutized for the same reason the policy directory is: the ancestor walk
+    // has to run over the real, symlink-resolved chain. `serve` has already
+    // resolved the configured path (D7), so this is idempotent there.
+    let key = absolutize(key, None);
+    let metadata = std::fs::metadata(&key).map_err(|source| IsolationError::Io {
+        what: PRIVATE_KEY,
+        path: key.clone(),
+        source,
+    })?;
+    judge_private_key(&key, ComponentFacts::of(&metadata), euid)?;
+    refuse_on_untrusted_ancestors(PRIVATE_KEY, "ancestor of the TLS private key", &key, euid)
+}
+
+/// The refusal truth table for the private key. Ownership first, for
+/// [`judge_component`]'s reason — a foreign owner undoes any mode at will — then
+/// the accessibility rule that is this path's own.
+fn judge_private_key(path: &Path, facts: ComponentFacts, euid: u32) -> Result<(), IsolationError> {
+    if let Some(owner) = foreign_owner(facts.owner_uid, euid) {
+        return Err(IsolationError::ForeignOwner {
+            what: PRIVATE_KEY,
+            path: path.to_path_buf(),
+            owner,
+            euid,
+        });
+    }
+    if let Some(who) = loose_key_access(facts.mode) {
+        return Err(IsolationError::AccessibleKey {
+            path: path.to_path_buf(),
+            mode: format!("{:04o}", facts.mode),
+            who: who.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Who besides the owner has *any* access to the key, if anyone — OpenSSH's
+/// `0o077` rule, split into the group and world halves so the refusal can name
+/// which one it saw.
+///
+/// Deliberately not [`loose_writers`]: on a private key the load-bearing bit is
+/// the **read** one, and a key at `0640` passes every check in this module that
+/// predates it. Sticky is not a mitigation and is not consulted — it governs
+/// renames of directory entries, not who may open a file.
+fn loose_key_access(mode: u32) -> Option<&'static str> {
+    match (mode & 0o070 != 0, mode & 0o007 != 0) {
+        (true, true) => Some("group- and world"),
+        (true, false) => Some("group"),
+        (false, true) => Some("world"),
+        (false, false) => None,
+    }
 }
 
 /// Check the paths the daemon's own trust boundary rests on.
@@ -216,12 +344,14 @@ fn refuse_untrusted_policy_dir_as(policy_dir: &Path, euid: u32) -> Result<(), Is
     // editor's lock file or backup — decides nothing, and refusing over one would
     // stop the daemon for as long as a policy file is open in an editor.
     let entries = std::fs::read_dir(&policy_dir).map_err(|source| IsolationError::Io {
+        what: "policy directory",
         path: policy_dir.clone(),
         source,
     })?;
     for entry in entries {
         let path = entry
             .map_err(|source| IsolationError::Io {
+                what: "policy directory",
                 path: policy_dir.clone(),
                 source,
             })?
@@ -277,6 +407,7 @@ impl ComponentFacts {
 
 fn refuse_if_untrusted(what: &'static str, path: &Path, euid: u32) -> Result<(), IsolationError> {
     let metadata = std::fs::metadata(path).map_err(|source| IsolationError::Io {
+        what,
         path: path.to_path_buf(),
         source,
     })?;
@@ -354,6 +485,7 @@ fn refuse_a_foreign_owned_audit_log(audit_log: &Path, euid: u32) -> Result<(), I
             Ok(())
         }
         Err(source) => Err(IsolationError::Io {
+            what: "audit log",
             path: audit_log.to_path_buf(),
             source,
         }),
@@ -393,6 +525,7 @@ fn refuse_on_untrusted_ancestors(
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
             Err(source) => {
                 return Err(IsolationError::Io {
+                    what: ancestor_what,
                     path: ancestor.to_path_buf(),
                     source,
                 });
@@ -1119,6 +1252,167 @@ mod tests {
         std::fs::write(&blocker, "not a directory").unwrap();
         refuse_a_foreign_owned_audit_log(&blocker.join("decisions.jsonl"), EUID)
             .unwrap_or_else(|e| panic!("ENOTDIR is the open's error, not this check's: {e}"));
+    }
+
+    /// A TLS private key at `0600` inside a `0700` directory, both owned by
+    /// whoever runs the suite: the shape `just mint-cert` produces.
+    fn private_key(root: &Path) -> PathBuf {
+        let dir = root.join("tls");
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("key.pem");
+        std::fs::write(&key, "-----BEGIN PRIVATE KEY-----\nnot a real key\n").unwrap();
+        chmod(&dir, 0o700);
+        chmod(&key, 0o600);
+        key
+    }
+
+    /// T4, the whole point: a key another local user can *read* is a key they
+    /// can present with, and nono — which verifies the certificate and nothing
+    /// else — cannot tell their handshake from ours. Unlike the policy
+    /// directory, where writability is the defect, for a private key
+    /// readability is, so this rule cannot be borrowed from the checks above.
+    #[test]
+    fn a_group_readable_private_key_refuses_to_serve() {
+        let root = tempfile::tempdir().unwrap();
+        let key = private_key(root.path());
+        chmod(&key, 0o640);
+
+        let err = refuse_a_readable_private_key(&key).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            matches!(err, IsolationError::AccessibleKey { .. }),
+            "want a refusal, got {text}"
+        );
+        assert!(text.contains("group"), "{text}");
+        assert!(text.contains("0640"), "the mode must be named: {text}");
+        assert!(
+            text.contains(&key.display().to_string()),
+            "the path must be named: {text}"
+        );
+        assert!(
+            text.contains("chmod 600"),
+            "the operator needs the remedy: {text}"
+        );
+    }
+
+    #[test]
+    fn a_world_readable_private_key_refuses_to_serve() {
+        let root = tempfile::tempdir().unwrap();
+        let key = private_key(root.path());
+        chmod(&key, 0o604);
+
+        let err = refuse_a_readable_private_key(&key).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            matches!(err, IsolationError::AccessibleKey { .. }),
+            "want a refusal, got {text}"
+        );
+        assert!(text.contains("world"), "{text}");
+        assert!(text.contains("0604"), "the mode must be named: {text}");
+    }
+
+    /// The refusal must not be sold as more than it is. What separates the key
+    /// from a sandboxed agent is where the key sits relative to the profile's
+    /// **read** grants — not its mode, which the agent satisfies as the same
+    /// uid. Same house rule the writability refusals already carry.
+    #[test]
+    fn the_private_key_refusal_states_its_scope_honestly() {
+        let root = tempfile::tempdir().unwrap();
+        let key = private_key(root.path());
+        chmod(&key, 0o644);
+
+        let text = refuse_a_readable_private_key(&key).unwrap_err().to_string();
+        assert!(
+            text.contains("same user"),
+            "the refusal defends against other local users, not the agent: {text}"
+        );
+        assert!(
+            text.contains("read grants"),
+            "and it must name what actually separates the agent from the key: {text}"
+        );
+    }
+
+    /// The mode of the key never mattered if a parent is loose: whoever can
+    /// write the directory substitutes their own key file, and then the daemon
+    /// serves with a key they chose. Reusing the existing walk rather than
+    /// reimplementing it is what makes the sticky-bit and ownership rules apply
+    /// here for free.
+    #[test]
+    fn a_private_key_under_a_loose_ancestor_refuses_to_serve() {
+        let root = tempfile::tempdir().unwrap();
+        let key = private_key(root.path());
+        let parent = key.parent().unwrap().to_path_buf();
+        chmod(&parent, 0o770);
+
+        let err = refuse_a_readable_private_key(&key).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            matches!(err, IsolationError::WritableAncestor { .. }),
+            "want an ancestor refusal, got {text}"
+        );
+        assert!(
+            text.contains(&parent.display().to_string()),
+            "the ancestor must be named: {text}"
+        );
+        assert!(text.contains("0770"), "the mode must be named: {text}");
+        assert!(
+            text.contains("private key"),
+            "the message must say which state path is at stake: {text}"
+        );
+    }
+
+    /// The PASS row. Without it the three refusals above are satisfied by a
+    /// check that refuses everything, which would take the daemon out entirely.
+    #[test]
+    fn an_owner_only_private_key_passes() {
+        let root = tempfile::tempdir().unwrap();
+        let key = private_key(root.path());
+
+        refuse_a_readable_private_key(&key)
+            .unwrap_or_else(|e| panic!("a 0600 key we own must pass: {e}"));
+    }
+
+    /// D6's rule reaches the key too: an owner may chmod at will, so a tight
+    /// mode on a key owned by someone else proves nothing about who can read
+    /// it. Driven through the euid seam, since the suite cannot chown.
+    #[test]
+    fn a_private_key_owned_by_another_uid_refuses_to_serve() {
+        let root = tempfile::tempdir().unwrap();
+        let key = private_key(root.path());
+        let owner = std::fs::metadata(&key).unwrap().uid();
+
+        let err = refuse_a_readable_private_key_as(&key, owner + 1).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            matches!(err, IsolationError::ForeignOwner { .. }),
+            "want an ownership refusal, got {text}"
+        );
+        assert!(
+            text.contains("private key"),
+            "the message must name the subsystem: {text}"
+        );
+        assert!(
+            text.contains(&owner.to_string()),
+            "the owning uid must be named: {text}"
+        );
+    }
+
+    /// Fail closed: a key we cannot stat is a key whose readers are unknown.
+    /// The message has to name the key rather than the policies, or the
+    /// operator goes looking in the wrong subsystem.
+    #[test]
+    fn a_private_key_we_cannot_stat_refuses_to_serve() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("tls/key.pem");
+
+        let err = refuse_a_readable_private_key(&missing).unwrap_err();
+        let text = err.to_string();
+        assert!(matches!(err, IsolationError::Io { .. }), "{text}");
+        assert!(text.contains("key.pem"), "the path must be named: {text}");
+        assert!(
+            text.contains("private key"),
+            "the message must name the subsystem that failed: {text}"
+        );
     }
 
     #[test]
