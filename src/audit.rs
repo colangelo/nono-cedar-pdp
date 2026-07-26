@@ -101,10 +101,14 @@ pub struct PolicySetRecord<'a> {
     /// a file name in the policy directory is attacker-influenced in exactly the way
     /// the recording-boundary rule anticipates.
     pub files: Option<Vec<String>>,
-    /// Whether the startup isolation check produced advisory warnings — the policy
-    /// directory sitting somewhere an agent may write. A property of the process, so
-    /// it is carried on every line rather than only the first: an audit line is
-    /// supposed to be self-sufficient.
+    /// Whether the startup isolation checks produced advisory warnings — a state
+    /// path sitting somewhere an agent may reach: the policy directory or the audit
+    /// log where it may write, the TLS private key where it may read. The last one
+    /// belongs here for the same reason as the other two rather than a weaker one:
+    /// an agent that can read the key answers approvals in this daemon's place, and
+    /// those approvals are absent from this trail entirely. A property of the
+    /// process, so it is carried on every line rather than only the first: an audit
+    /// line is supposed to be self-sufficient.
     pub at_risk: bool,
     /// Why a reload adopted nothing, control-escaped. `null` on `loaded`.
     pub reason: Option<String>,

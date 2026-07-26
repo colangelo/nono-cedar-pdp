@@ -168,7 +168,7 @@ async fn run_serve(config_path: &std::path::Path) -> Result<(), String> {
             None
         }
     };
-    let warnings =
+    let mut warnings =
         nono_cedar_pdp::isolation::check(&config.policy_dir, &config.audit_log, cwd.as_deref())
             .map_err(|e| e.to_string())?;
     for warning in &warnings {
@@ -179,9 +179,19 @@ async fn run_serve(config_path: &std::path::Path) -> Result<(), String> {
     // certificate and has no other way to tell who answered (T4). Narrower than
     // it looks — other local users only; see `isolation`'s module docs for why
     // the sandboxed agent is bounded by its profile's read grants instead.
+    //
+    // Its warnings are logged here rather than with the batch above so that a
+    // *refusal* on the key does not swallow the policy and audit warnings
+    // already printed — and they join `warnings` because `at_risk` below is a
+    // statement about this trail's completeness: an agent that can read the key
+    // answers approvals in our place, and those approvals are recorded nowhere.
     if let Some(tls) = &config.tls {
-        nono_cedar_pdp::isolation::refuse_a_readable_private_key(&tls.key)
+        let key_warnings = nono_cedar_pdp::isolation::check_private_key(&tls.key, cwd.as_deref())
             .map_err(|e| e.to_string())?;
+        for warning in &key_warnings {
+            tracing::warn!("{warning}");
+        }
+        warnings.extend(key_warnings);
     }
 
     let schema = cedar::schema::load().map_err(|e| e.to_string())?;

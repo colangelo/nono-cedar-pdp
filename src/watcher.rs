@@ -69,11 +69,12 @@ const DEBOUNCE_CEILING: Duration = Duration::from_secs(2);
 /// Everything needed to write a `policy-set` provenance line, bundled so the
 /// watcher takes one argument rather than growing a parameter per field.
 ///
-/// `at_risk` is established once, by `isolation::check` at startup, and never
-/// changes for the life of the process — but it is carried on every line rather
-/// than looked up, because an audit line is supposed to be self-sufficient for
-/// review. A reader should not have to find the first line of the run to learn
-/// whether this daemon's policy directory sat somewhere an agent could write.
+/// `at_risk` is established once at startup, by `isolation::check` and
+/// `isolation::check_private_key` together, and never changes for the life of the
+/// process — but it is carried on every line rather than looked up, because an
+/// audit line is supposed to be self-sufficient for review. A reader should not
+/// have to find the first line of the run to learn whether this daemon's state
+/// paths sat somewhere an agent could reach them.
 #[derive(Clone)]
 pub struct Provenance {
     pub audit: Arc<crate::audit::AuditLog>,
@@ -154,10 +155,7 @@ impl Provenance {
 /// set without being able to record what it adopted cannot satisfy
 /// `decision-audit-log`'s provenance requirement — including, and especially, on
 /// the attempts that adopt nothing.
-pub fn spawn(
-    engine: Arc<Engine>,
-    provenance: Provenance,
-) -> notify::Result<RecommendedWatcher> {
+pub fn spawn(engine: Arc<Engine>, provenance: Provenance) -> notify::Result<RecommendedWatcher> {
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
     let mut watcher = notify::recommended_watcher(tx)?;
     watcher.watch(engine.policy_dir(), RecursiveMode::NonRecursive)?;
@@ -325,7 +323,6 @@ mod tests {
             },
         }
     }
-
 
     /// A provenance recorder writing to a real audit log, plus the path so a test
     /// can read back what the watcher recorded.
@@ -943,7 +940,8 @@ mod tests {
 
         let trail = policy_set_lines(&audit_path);
         assert_eq!(
-            trail.last().unwrap()["outcome"], reported,
+            trail.last().unwrap()["outcome"],
+            reported,
             "the health surface and the trail must never disagree about the last \
              reload: one call writes both"
         );

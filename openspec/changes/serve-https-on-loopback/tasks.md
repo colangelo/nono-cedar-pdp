@@ -35,6 +35,7 @@ docs around an unmeasured assumption is how a spec hardens around a wrong fact.
 - [x] 3.4 Failing test: a `0600` key owned by us passes
 - [x] 3.5 Implement, resolving the pair at startup alongside the other state paths (D7) so the checked chain is the read chain
 - [x] 3.6 Module docs state the scope honestly: **other local users only**, never the sandboxed agent (the house rule `tests/docs.rs` pins)
+- [x] 3.7 (**remediation, 2026-07-27**) The cwd containment warning reaches the key too. It covered `policy_dir` and `audit_log` and stopped there, so a key inside the working directory started silently — while module docs point 2 named that exact residual. `check_private_key` is now shaped like `check` (refuse + advisory `Vec<String>`); the warning names **read** grants, not write, because that is the grant kind that matters here and an operator drilled on the write rule would check the wrong column. It joins `at_risk`: an agent that can read the key answers approvals in our place and those approvals are in no trail of ours. Mutation: deleting the containment push reddens both the unit test and the through-the-binary one
 
 ## 4. The listener
 
@@ -59,6 +60,7 @@ test today; deleting one instead of repointing it removes a rule from the suite.
 - [x] 4.1 Failing test (T11): our own rustls client, configured like nono's, completes a handshake against a TLS-configured daemon and gets a real decision back
 - [x] 4.2 Failing test: a TLS-configured daemon does **not** answer a plaintext request — the no-silent-downgrade rule, asserted from the client side
 - [x] 4.3 Failing test: an unreadable / unparseable / mismatched cert-key pair exits non-zero without binding (T2)
+- [x] 4.3a (**remediation, 2026-07-27**) Those tests asserted only that *some* `[tls]` refusal happened, and three of them use the untrusted openssl fixture — so the T6 self-test, standing right behind them, satisfied every assertion. Measured: making the "mismatched" pair MATCH, and deleting the `chmod 000`, both left their tests green, as did replacing `load_pair`'s cert-read arm with `unwrap_or_default()`. Each now pins its own arm's message. Same shape one level down in 5.1's bind-address sibling: its `contains(addr.ip())` was satisfied by `main`'s `serving on {bind}:` wrapper, so dropping `{ip}` from the self-test message left it green. And `load_pair`'s three **key** arms had no test at all — every case above fails on the certificate or the pairing — so they have one now, all three mutation-proven
 - [x] 4.4 Implement: `axum-server` arm in `server::serve`; the router is untouched so existing `tests/server.rs` coverage carries over
 - [x] 4.5 Confirm every pre-existing `tests/server.rs` case still passes over plaintext — this change must be invisible to the default posture
 - [x] 4.6 Plaintext startup logs the impersonation WARN; assert on it rather than trusting it exists

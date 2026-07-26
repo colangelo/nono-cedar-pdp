@@ -2,8 +2,10 @@
 //! directory, the audit log, and — when TLS is configured — the listener's
 //! private key. [`check`] runs once at startup and covers the first two; its
 //! refusal core, [`refuse_untrusted_policy_dir`], re-runs in the watcher before
-//! every reloaded policy set is adopted. [`refuse_a_readable_private_key`] is the
-//! key's, run at startup beside them and before anything binds.
+//! every reloaded policy set is adopted. [`check_private_key`] is the key's, run
+//! at startup beside them and before anything binds, and has the same shape:
+//! [`refuse_a_readable_private_key`] is its refusal core, and it adds the same
+//! working-directory containment warning [`check`] raises for the other two.
 //!
 //! Why they need checking at all: write access to the policy directory *is* write
 //! access to every future decision. Dropping `permit (principal, action,
@@ -89,15 +91,22 @@
 //!    key's mode. This is the D13 argument for the policy directory with `read`
 //!    substituted for `write`, and it fails the same way — an operator who points
 //!    a profile's read grants at `~/.config/nono-cedar-pdp/tls/` has handed the
-//!    agent the ability to impersonate this daemon, and every check in this module
-//!    still passes. What the refusal buys is, again, other local users only.
+//!    agent the ability to impersonate this daemon, and every *refusal* in this
+//!    module still passes. What the refusal buys is, again, other local users
+//!    only. The cwd warning below does fire on the one case it can see — a key
+//!    inside the working directory — but it is a proxy for the profile, not a
+//!    reading of it, and the shipped default sits outside the cwd where it is
+//!    silent by construction.
 //! 3. **The cwd warning is a heuristic proxy, and it is wrong in both
 //!    directions.** It cannot read the nono profile, so it *misses* an absolute
 //!    `policy_dir` that happens to sit inside a granted tree — on macOS the default
 //!    profile groups grant write to `/tmp`, `/private/tmp`, `$TMPDIR` and
 //!    `/var/folders`, so a policy directory under any temp path is agent-writable
 //!    while this check stays quiet — and it *fires* on a plain development run
-//!    where no agent exists at all.
+//!    where no agent exists at all. It covers all three state paths, the private
+//!    key included, but the grant kind it stands in for differs: **write** for the
+//!    policy directory and the audit log, **read** for the key — the weaker grant,
+//!    and therefore the likelier one to have been handed over without thought.
 //!
 //! The only control that actually stops a sandboxed agent from rewriting the
 //! policies that govern it — or reading the key that proves who it is talking to —
@@ -222,6 +231,32 @@ const PRIVATE_KEY: &str = "TLS private key";
 /// at the key.
 pub fn refuse_a_readable_private_key(key: &Path) -> Result<(), IsolationError> {
     refuse_a_readable_private_key_as(key, daemon_euid())
+}
+
+/// The private key's startup entry point, shaped exactly like [`check`]: `Err`
+/// means **do not serve**, `Ok` carries advisory warnings for the caller to log.
+///
+/// [`refuse_a_readable_private_key`] is the refusal half. This adds the
+/// containment half — the same working-directory heuristic [`check`] applies to
+/// the policy directory and the audit log — because the key is the one state path
+/// where *location* is not merely the better control but the **only** one: module
+/// docs point 2 says a key's mode does nothing about the sandboxed agent, which
+/// shares our uid, and that what separates the two is where the key sits relative
+/// to the profile's *read* grants. Leaving the heuristic off the key while it
+/// covered the other two named that residual and then declined to warn about the
+/// one case it can actually see.
+pub fn check_private_key(key: &Path, cwd: Option<&Path>) -> Result<Vec<String>, IsolationError> {
+    let base = cwd.map(|c| absolutize(c, None));
+    let key = absolutize(key, base.as_deref());
+    refuse_a_readable_private_key(&key)?;
+
+    let mut warnings = Vec::new();
+    if let Some(base) = base {
+        if key.starts_with(&base) {
+            warnings.push(private_key_inside_cwd(&key, &base));
+        }
+    }
+    Ok(warnings)
 }
 
 /// [`refuse_a_readable_private_key`] with the effective uid passed in: the same
@@ -641,6 +676,34 @@ fn audit_log_inside_cwd(audit_log: &Path, cwd: &Path) -> String {
          A deployment points audit_log at a path no profile grants write access to (shipped \
          default: ~/.local/state/nono-cedar-pdp/decisions.jsonl)",
         log = audit_log.display(),
+        cwd = cwd.display(),
+    )
+}
+
+/// The key's containment warning. Same voice and same admitted-proxy caveat as
+/// its two siblings, and one difference that has to be in the text: the grant
+/// kind is **read**, not write. An operator who has internalised "keep the policy
+/// directory out of the agent's write grants" will check the wrong column
+/// otherwise — and a read grant on this path is total, since it does not tamper
+/// with a decision, it takes over making them, leaving nothing in our trail.
+fn private_key_inside_cwd(key: &Path, cwd: &Path) -> String {
+    format!(
+        "SECURITY: the TLS private key {key} is inside the current working directory {cwd}. \
+         Read access to this key is the ability to impersonate this daemon: nono verifies \
+         the certificate and nothing else, so an agent whose profile's read grants reach \
+         this tree can answer approvals in our place with a handshake nono cannot tell from \
+         ours — and those approvals appear in no audit trail, because they were never ours \
+         to record. A `read` or `readwrite` grant is enough: unlike the policy directory \
+         and the audit log, write access is not required. File modes cannot prevent it \
+         either, since the sandbox runs as the same user as this daemon. A deployment \
+         points the [tls] key at a path no profile grants read access to (shipped default: \
+         ~/.config/nono-cedar-pdp/tls/key.pem). Like this daemon's other containment \
+         warnings this is only a proxy for that rule: it cannot read your profile, so it \
+         also fires when no agent is involved, and it stays silent for a key outside the \
+         cwd that a profile does grant. \
+         Check the real thing with: nono profile show <profile> --format manifest | jq -r \
+         '.filesystem.grants[] | select(.access | test(\"read\")) | .path'",
+        key = key.display(),
         cwd = cwd.display(),
     )
 }
@@ -1427,6 +1490,74 @@ mod tests {
             text.contains("private key"),
             "the message must name the subsystem that failed: {text}"
         );
+    }
+
+    /// The containment heuristic has to reach the key, which is the one state
+    /// path where location is not merely the better control but the **only**
+    /// one. Module docs point 2 already names this residual — "an operator who
+    /// points a profile's read grants at ~/.config/nono-cedar-pdp/tls/ has handed
+    /// the agent the ability to impersonate this daemon, and every refusal in
+    /// this module still passes" — and it stayed unwarned while the same
+    /// heuristic covered the policy directory and the audit log, whose exposure
+    /// is *less* total: a forged policy still leaves a trail, a read key means
+    /// the approvals were never ours to record.
+    #[test]
+    fn a_private_key_inside_the_cwd_warns_that_the_agent_could_be_this_daemon() {
+        let root = tempfile::tempdir().unwrap();
+        let key = private_key(root.path());
+
+        let warnings = check_private_key(&key, Some(root.path())).unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        let text = warnings.join("\n");
+        assert!(
+            text.contains(&absolutize(&key, None).display().to_string()),
+            "the warning must name the key: {text}"
+        );
+        assert!(
+            text.contains("impersonat"),
+            "the warning must name what is at stake — being answered for, not \
+             merely a file in an awkward place: {text}"
+        );
+        assert!(
+            text.contains("read grants"),
+            "and the grant kind that decides it, which is `read` here and `write` \
+             for every other path in this module: {text}"
+        );
+        assert!(
+            text.contains("same user"),
+            "scope honesty, the house rule: modes cannot help, because the agent \
+             runs as this uid: {text}"
+        );
+        assert!(
+            text.contains("cannot read your profile"),
+            "and it must admit it is a proxy, like its two siblings: {text}"
+        );
+    }
+
+    /// The PASS row. Without it the warning above is satisfied by a check that
+    /// warns about every key, which would make the signal worthless — the shipped
+    /// default (`~/.config/nono-cedar-pdp/tls/`) is exactly this case.
+    #[test]
+    fn a_private_key_outside_the_cwd_passes_without_warnings() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let key = private_key(root.path());
+
+        let warnings = check_private_key(&key, Some(elsewhere.path())).unwrap();
+        assert!(warnings.is_empty(), "{warnings:#?}");
+    }
+
+    /// The containment half must not have softened the refusal half into an
+    /// advisory: a key another local user can read is still a refusal to serve,
+    /// through the new entry point as through the old one.
+    #[test]
+    fn the_containment_check_still_refuses_a_readable_key() {
+        let root = tempfile::tempdir().unwrap();
+        let key = private_key(root.path());
+        chmod(&key, 0o640);
+
+        let err = check_private_key(&key, Some(root.path())).unwrap_err();
+        assert!(matches!(err, IsolationError::AccessibleKey { .. }), "{err}");
     }
 
     #[test]

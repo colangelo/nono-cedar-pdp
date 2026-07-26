@@ -1730,7 +1730,11 @@ fn a_private_key_the_daemon_cannot_load_refuses_to_serve_without_binding() {
     let (cert, key) = untrusted_pair(dir.path());
 
     for (content, mode, expected) in [
-        ("not a PEM file at all\n", 0o600, "holds no PRIVATE KEY block"),
+        (
+            "not a PEM file at all\n",
+            0o600,
+            "holds no PRIVATE KEY block",
+        ),
         // A section that opens and never closes: `rustls_pemfile` reports it as a
         // parse failure rather than as an absent block.
         (
@@ -1778,6 +1782,57 @@ fn a_private_key_the_daemon_cannot_load_refuses_to_serve_without_binding() {
         assert!(!output.contains("listening"), "{output}");
     }
     drop(occupied);
+}
+
+/// The containment heuristic reaches the private key, through the binary.
+///
+/// `serve` warns when `policy_dir` or `audit_log` sit inside a tree a sandboxed
+/// agent may be granted — and did not warn for the key, which is the file whose
+/// *read* access is the ability to be this daemon and the whole premise of
+/// serving TLS at all. A key in the working directory started silently.
+///
+/// The audit log is deliberately put outside the working directory here, so the
+/// key's own warning is the only one available and cannot be confused with the
+/// audit log's. The daemon still refuses on the untrusted certificate afterwards
+/// — irrelevant to the claim, and asserted only so a run that failed *earlier*
+/// than the warning cannot pass by printing nothing.
+#[test]
+fn a_tls_private_key_inside_the_working_directory_warns_before_serving() {
+    let dir = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let (cert, key) = untrusted_pair(dir.path());
+
+    let (ok, output) = serve_from(
+        dir.path(),
+        &format!(
+            "policy_dir = \"{POLICY_DIR}\"\naudit_log = \"{}\"\nbind = \"127.0.0.1:0\"\n{}",
+            elsewhere.path().join("decisions.jsonl").display(),
+            tls_block_for(&cert, &key)
+        ),
+        Some(dir.path()),
+    );
+    let output = strip_ansi(&output);
+    assert!(!ok, "the untrusted certificate must still refuse: {output}");
+
+    let warned: Vec<&str> = output
+        .lines()
+        .filter(|line| line.contains("WARN") && line.contains(&key.display().to_string()))
+        .collect();
+    assert_eq!(
+        warned.len(),
+        1,
+        "no WARN line names the TLS private key {}. Read access to it is the \
+         ability to answer nono's approvals in this daemon's place, so a key \
+         inside a tree the agent may be granted is the loudest case this \
+         heuristic has — louder than the policy directory, which it does warn \
+         about: {output}",
+        key.display()
+    );
+    assert!(
+        warned[0].contains("impersonat"),
+        "the warning must name what is at stake: {}",
+        warned[0]
+    );
 }
 
 /// T6: a certificate this platform does not trust is a refusal to serve, decided
