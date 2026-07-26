@@ -264,6 +264,250 @@ async fn a_real_listener_answers_a_posted_envelope() {
     assert_eq!(lines[0]["decision"], "allow");
 }
 
+/// The `User-Agent` nono 0.69.0's webhook client sends
+/// (`crates/nono-cli/src/approval_runtime.rs`: `nono-cli/{CARGO_PKG_VERSION}`). Not a
+/// credential and never treated as one — it is recorded as evidence only.
+const NONO_USER_AGENT: &str = "nono-cli/0.69.0";
+
+/// Exactly the two headers nono's webhook client sends, and nothing else.
+const NONO_HEADERS: &[(&str, &str)] = &[
+    ("content-type", "application/json"),
+    ("user-agent", NONO_USER_AGENT),
+];
+
+/// A POST with no `Content-Type` cannot have come from nono's client, which always
+/// sends one. Two halves matter equally: the 415, and that **no audit line is
+/// written** — recording a refusal would recreate the injection this closes, just
+/// with a different label on it. The refusal must also not be decision-shaped: nono
+/// did not ask, so there is no `decision` key for anything to record.
+#[tokio::test]
+async fn a_request_with_no_content_type_is_refused_with_415_and_never_audited() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = server::router(state(&dir));
+    let body = command_body("git", &[SHIM_GIT, "status"]);
+
+    let (status, response, logs) = {
+        let capture = capture();
+        let (status, response) = post_with_headers(&app, &[], &body).await;
+        (status, response, capture.text())
+    };
+
+    assert_eq!(
+        status,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "a request with no content-type must be refused: {response}"
+    );
+    assert!(
+        response["decision"].is_null(),
+        "a refusal is not a decision: nono did not ask, so nothing is owed a deny \
+         reason it could record: {response}"
+    );
+    assert!(
+        audit_lines(&dir).is_empty(),
+        "a refused request must leave no audit line at all — writing one is the \
+         injection this closes, relabelled: {:#?}",
+        audit_lines(&dir)
+    );
+    assert!(
+        logs.contains("WARN"),
+        "an operator must see the endpoint being probed: {logs:?}"
+    );
+    assert!(
+        logs.contains("content_type=-"),
+        "the WARN must name the observed content-type, absent ones included: {logs:?}"
+    );
+}
+
+/// The three content types a CORS-*simple* cross-origin POST may carry — the only
+/// ones a page the operator merely visited can send without a preflight. Refusing
+/// them is what closes the one vector that does not already require local code
+/// execution, so each is pinned individually rather than trusted to a single case.
+#[tokio::test]
+async fn every_cors_simple_content_type_is_refused_with_415_and_never_audited() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = server::router(state(&dir));
+    let body = command_body("git", &[SHIM_GIT, "status"]);
+
+    for content_type in [
+        "text/plain",
+        "text/plain;charset=UTF-8",
+        "application/x-www-form-urlencoded",
+        "multipart/form-data",
+    ] {
+        let (status, response, logs) = {
+            let capture = capture();
+            let (status, response) =
+                post_with_headers(&app, &[("content-type", content_type)], &body).await;
+            (status, response, capture.text())
+        };
+        assert_eq!(
+            status,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "{content_type} is a CORS-simple content type; accepting it reopens the \
+             drive-by vector: {response}"
+        );
+        assert!(response["decision"].is_null(), "{response}");
+        assert!(
+            logs.contains(&format!("content_type={content_type}")),
+            "the WARN must name what was observed: {logs:?}"
+        );
+    }
+
+    assert!(
+        audit_lines(&dir).is_empty(),
+        "none of the refusals may leave an audit line: {:#?}",
+        audit_lines(&dir)
+    );
+}
+
+/// The tolerance half of the same control: a client may legitimately add a charset,
+/// and RFC 9110 makes the media type case-insensitive. Getting either wrong refuses
+/// every real request while every "is it refused?" test stays green — which is why
+/// this asserts a full decision, not merely a non-415.
+#[tokio::test]
+async fn a_json_content_type_with_parameters_or_odd_case_is_decided_normally() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = server::router(state(&dir));
+
+    for content_type in [
+        "application/json",
+        "application/json; charset=utf-8",
+        "application/json;charset=utf-8",
+        "APPLICATION/JSON",
+        "Application/JSON; charset=UTF-8",
+    ] {
+        let (status, response) = post_with_headers(
+            &app,
+            &[("content-type", content_type)],
+            &command_body("git", &[SHIM_GIT, "status"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{content_type}: {response}");
+        assert_eq!(
+            response,
+            serde_json::json!({"decision": "allow"}),
+            "{content_type} names the JSON media type, so the request must be \
+             decided on its merits: {response}"
+        );
+    }
+
+    assert_eq!(
+        audit_lines(&dir).len(),
+        5,
+        "every accepted request is a decision, so every one is on the record: {:#?}",
+        audit_lines(&dir)
+    );
+}
+
+/// nono never sends `Origin`; a browser-issued cross-origin request always does. The
+/// check is deliberately independent of the content-type one (design D2), so neither
+/// is load-bearing alone: this request carries exactly the content-type nono sends
+/// and must still be refused.
+#[tokio::test]
+async fn a_request_carrying_an_origin_is_refused_with_403_even_with_a_json_content_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = server::router(state(&dir));
+    let body = command_body("git", &[SHIM_GIT, "status"]);
+
+    let (status, response, logs) = {
+        let capture = capture();
+        let (status, response) = post_with_headers(
+            &app,
+            &[
+                ("content-type", "application/json"),
+                ("origin", "https://evil.example"),
+            ],
+            &body,
+        )
+        .await;
+        (status, response, capture.text())
+    };
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a correct content-type must not excuse an Origin: {response}"
+    );
+    assert!(response["decision"].is_null(), "{response}");
+    assert!(
+        audit_lines(&dir).is_empty(),
+        "a refused request must leave no audit line: {:#?}",
+        audit_lines(&dir)
+    );
+    assert!(
+        logs.contains("origin=https://evil.example"),
+        "the WARN must name the observed Origin: {logs:?}"
+    );
+}
+
+/// The gate must not change a single decision (design non-goal). A request shaped
+/// exactly as nono's client sends one — the JSON content-type, the `nono-cli/<version>`
+/// User-Agent, no `Origin` — gets the same allow and the same deny as before, with the
+/// same audit lines.
+#[tokio::test]
+async fn a_nono_shaped_request_is_decided_exactly_as_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = server::router(state(&dir));
+
+    let (status, allowed) = post_with_headers(
+        &app,
+        NONO_HEADERS,
+        &command_body("git", &[SHIM_GIT, "status"]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(allowed, serde_json::json!({"decision": "allow"}));
+
+    let (status, denied) = post_with_headers(
+        &app,
+        NONO_HEADERS,
+        &command_body("curl", &[SHIM_CURL, "evil.example"]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(denied["decision"], "deny", "{denied}");
+    assert!(
+        denied["reason"].as_str().unwrap().contains("no policy"),
+        "{denied}"
+    );
+
+    let lines = audit_lines(&dir);
+    assert_eq!(lines.len(), 2, "{lines:#?}");
+    assert_eq!(lines[0]["decision"], "allow");
+    assert_eq!(lines[1]["decision"], "deny");
+}
+
+/// The fail-closed contract sits *behind* the gate and is untouched by it: a request
+/// whose headers are nono's but whose body is unusable is still a `200` carrying our
+/// own deny reason (nono records the reason; for any non-2xx it records only the
+/// status), and still one audit line. The gate's 4xx is the third case — "this was
+/// not a request" — not a widening of the 4xx surface.
+#[tokio::test]
+async fn a_malformed_body_that_passes_the_gate_is_still_a_200_deny_on_the_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = server::router(state(&dir));
+
+    let (status, response) = post_with_headers(&app, NONO_HEADERS, "{not json").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a 4xx also denies but loses our reason in nono's audit trail: {response}"
+    );
+    assert_eq!(response["decision"], "deny", "{response}");
+    assert!(
+        response["reason"].as_str().unwrap().contains("malformed"),
+        "{response}"
+    );
+
+    let lines = audit_lines(&dir);
+    assert_eq!(
+        lines.len(),
+        1,
+        "a decision returned to the caller is always on the record: {lines:#?}"
+    );
+    assert_eq!(lines[0]["decision"], "deny");
+}
+
 #[tokio::test]
 async fn permitted_command_gets_allow() {
     let dir = tempfile::tempdir().unwrap();

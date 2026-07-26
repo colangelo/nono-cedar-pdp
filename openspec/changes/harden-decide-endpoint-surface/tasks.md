@@ -11,13 +11,13 @@ tracing max-level trap that once made filtered runs lie.
 
 ## 2. Refuse requests that cannot have come from nono (#8)
 
-- [ ] 2.1 Failing test: POST with no `Content-Type` is refused with 415, **no audit line is written**, and a WARN names the observed (absent) content-type
-- [ ] 2.2 Failing test: each CORS-simple content-type (`text/plain`, `application/x-www-form-urlencoded`, `multipart/form-data`) is refused with 415 and writes no audit line
-- [ ] 2.3 Failing test: `application/json; charset=utf-8` is accepted and decided normally; the type comparison is case-insensitive (`APPLICATION/JSON`)
-- [ ] 2.4 Failing test: a request carrying `Origin` is refused with 403 **even with a correct content-type**, and writes no audit line
-- [ ] 2.5 Failing test: a well-formed nono-shaped request (JSON content-type, no `Origin`) is decided exactly as before — assert an existing allow and an existing deny still behave identically
-- [ ] 2.6 Failing test: a request that passes the header checks but has a malformed body still gets the existing `200` + deny reason + audit line (the fail-closed contract is untouched)
-- [ ] 2.7 Implement the header gate in `src/server.rs` ahead of body reading; comment states why 4xx is correct here and not a violation of "deny and broken are different signals" (D3)
+- [x] 2.1 Failing test: POST with no `Content-Type` is refused with 415, **no audit line is written**, and a WARN names the observed (absent) content-type
+- [x] 2.2 Failing test: each CORS-simple content-type (`text/plain`, `application/x-www-form-urlencoded`, `multipart/form-data`) is refused with 415 and writes no audit line
+- [x] 2.3 Failing test: `application/json; charset=utf-8` is accepted and decided normally; the type comparison is case-insensitive (`APPLICATION/JSON`)
+- [x] 2.4 Failing test: a request carrying `Origin` is refused with 403 **even with a correct content-type**, and writes no audit line
+- [x] 2.5 Failing test: a well-formed nono-shaped request (JSON content-type, no `Origin`) is decided exactly as before — assert an existing allow and an existing deny still behave identically
+- [x] 2.6 Failing test: a request that passes the header checks but has a malformed body still gets the existing `200` + deny reason + audit line (the fail-closed contract is untouched)
+- [x] 2.7 Implement the header gate in `src/server.rs` ahead of body reading; comment states why 4xx is correct here and not a violation of "deny and broken are different signals" (D3)
 
 ## 3. Record the observed User-Agent as evidence (#8)
 

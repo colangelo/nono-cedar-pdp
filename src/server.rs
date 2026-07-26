@@ -4,6 +4,33 @@
 //! because every unusable body — malformed, unsupported, oversized — must produce
 //! a `200 {"decision":"deny"}` carrying our own reason. nono records the reason
 //! we hand back; for any non-2xx it records only `returned HTTP <status>`.
+//!
+//! # The header gate, and why both halves of it exist
+//!
+//! The webhook carries no credential, so nothing here identifies the caller — and
+//! nothing here claims to. What the gate does is refuse requests whose *shape* proves
+//! they did not come from nono's client, before the body is read.
+//!
+//! **`Content-Type: application/json` is the load-bearing control, not a formality.**
+//! The CORS "simple request" exemption — the one that needs no preflight — permits
+//! only `text/plain`, `application/x-www-form-urlencoded` and `multipart/form-data`.
+//! To send `application/json` cross-origin a browser must first preflight with
+//! `OPTIONS`; this service serves no CORS headers and no `OPTIONS` route, so the
+//! preflight fails and the POST is never issued. **Requiring JSON is therefore what
+//! closes the only vector that does not already require local code execution: a page
+//! the operator merely visits.** Relaxing it to "accept anything" reopens that vector
+//! silently, because every unit test about *bodies* would keep passing.
+//!
+//! **`Origin` is refused independently, and the redundancy is the point.** nono never
+//! sends `Origin`; a browser-issued cross-origin request always does. Today the check
+//! is redundant with the content-type one — but if a future nono changed its
+//! content-type, that check would have to be relaxed and this one would still hold.
+//! Two independent controls, neither load-bearing alone; do not collapse them.
+//!
+//! Neither check authenticates nono. A local process running as the same user
+//! presents a correct content-type and no `Origin` trivially, and can therefore still
+//! forge an audit record. That residual is inherent while the webhook carries no
+//! credential; closing it needs an upstream bearer token or a unix socket.
 
 use crate::adapter::nono_webhook::RejectedContext;
 use crate::audit::AuditLog;
@@ -12,6 +39,7 @@ use crate::config::Config;
 use crate::decision::Decision;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
+use axum::http::header::{HeaderMap, HeaderName, CONTENT_TYPE, ORIGIN, USER_AGENT};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -82,7 +110,101 @@ pub fn with_middleware(router: Router) -> Router {
     router.layer(CatchPanicLayer::new())
 }
 
-async fn approve(State(state): State<AppState>, body: Body) -> Response {
+/// The value of `name` as the caller sent it, lossily decoded.
+///
+/// Lossy UTF-8 rather than `HeaderValue::to_str`, which accepts only visible ASCII: a
+/// header value carrying a C1 control (`0xC2 0x9B`, CSI) passes hyper's parser, and
+/// collapsing such a value to `None` would hide exactly the request an investigator
+/// most wants to see. Not escaped here — each destination escapes at its own boundary
+/// (the audit record in [`crate::audit`], the WARN lines below), so no caller can
+/// receive a value that has been quietly rewritten.
+fn observed(headers: &HeaderMap, name: HeaderName) -> Option<String> {
+    headers
+        .get(name)
+        .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+}
+
+/// Refuse a request whose shape proves it did not come from nono's webhook client.
+/// Runs before the body is read and before anything is recorded; see the module docs
+/// for why each of the two checks exists and why neither may be dropped.
+///
+/// **A 4xx here does not violate "deny and broken are different signals."** That rule
+/// covers *decision-shaped* failures: a malformed or oversized body is a question nono
+/// asked, so it gets a `200` with our deny reason, because nono records our reason and
+/// reduces any non-2xx to a bare `returned HTTP <status>`. A request that fails this
+/// gate is the third case — **it was not a question nono asked**. There is no nono
+/// waiting on a reason, so none is owed, and no audit line claiming a decision may be
+/// written: doing so would recreate the unauthenticated audit-record injection this
+/// gate closes, differing only in the label on the line. The refusal body is
+/// deliberately *not* decision-shaped for the same reason.
+///
+/// Both refusals are logged at WARN with the observed values control-escaped, so an
+/// operator can see the endpoint being probed.
+///
+/// Returns the refusal to send back, or `None` when the request may proceed. (An
+/// `Option`, not a `Result`: the success case carries nothing, and a `Result` whose
+/// error is a whole `Response` trips `clippy::result_large_err`.)
+fn header_gate(headers: &HeaderMap) -> Option<Response> {
+    let content_type = observed(headers, CONTENT_TYPE);
+    let user_agent = observed(headers, USER_AGENT);
+    // Header text is caller-chosen and lands in an operator's terminal, so it is
+    // escaped here exactly like every other request-derived value we log.
+    let escaped = |value: Option<&String>| {
+        value
+            .map(|value| crate::sanitize::control_escape(value))
+            .unwrap_or_else(|| UNKNOWN.to_string())
+    };
+
+    if !is_json_content_type(content_type.as_deref()) {
+        tracing::warn!(
+            content_type = %escaped(content_type.as_ref()),
+            user_agent = %escaped(user_agent.as_ref()),
+            "refusing a request whose content-type is not application/json: \
+             nono's webhook client always sends it, so this did not come from nono"
+        );
+        return Some(
+            (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                Json(serde_json::json!({
+                    "error": format!("this endpoint requires Content-Type: {NONO_CONTENT_TYPE}"),
+                })),
+            )
+                .into_response(),
+        );
+    }
+
+    // Checked independently of the content-type above, on purpose (module docs): a
+    // correct content-type must not excuse an `Origin`.
+    if let Some(origin) = observed(headers, ORIGIN) {
+        tracing::warn!(
+            origin = %crate::sanitize::control_escape(&origin),
+            content_type = %escaped(content_type.as_ref()),
+            user_agent = %escaped(user_agent.as_ref()),
+            "refusing a request carrying an Origin header: nono never sends one and \
+             a browser always does"
+        );
+        return Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "this endpoint refuses requests carrying an Origin header",
+                })),
+            )
+                .into_response(),
+        );
+    }
+
+    None
+}
+
+async fn approve(State(state): State<AppState>, headers: HeaderMap, body: Body) -> Response {
+    // First, before the body is read and before any audit line exists: a request that
+    // cannot have come from nono is not a decision to make, and recording it would be
+    // the injection the gate closes.
+    if let Some(refusal) = header_gate(&headers) {
+        return refusal;
+    }
+
     // Defence in depth: bootstrap refuses an empty policy dir, so this should be
     // unreachable. If it ever fires, 503 tells nono "PDP broken", which is a
     // different signal from "policy said no".
