@@ -329,7 +329,7 @@ fn load_entries(
             path: dir.to_path_buf(),
             source,
         })?;
-        if !path.extension().is_some_and(|e| e == "cedar") {
+        if path.extension().is_none_or(|e| e != "cedar") {
             continue;
         }
         // The file is a policy the operator wrote and this daemon will not

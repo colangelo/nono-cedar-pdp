@@ -226,7 +226,7 @@ fn refuse_untrusted_policy_dir_as(policy_dir: &Path, euid: u32) -> Result<(), Is
                 source,
             })?
             .path();
-        if !path.extension().is_some_and(|e| e == "cedar") {
+        if path.extension().is_none_or(|e| e != "cedar") {
             continue;
         }
         if !crate::cedar::engine::is_loadable_policy_file(&path) {
