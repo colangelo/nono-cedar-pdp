@@ -1315,14 +1315,15 @@ fn https(addr: SocketAddr, request: &str) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;
     let mut response = Vec::new();
-    // `Connection: close` means the peer closes once the response is written, so
-    // a clean end-of-stream here is the response ending — not an error.
-    match stream.read_to_end(&mut response) {
-        Ok(_) => {}
-        Err(e) if !response.is_empty() => {
-            let _ = e;
+    // A peer that drops the connection without a `close_notify` surfaces here as
+    // `UnexpectedEof`, and hyper does exactly that after answering a
+    // `Connection: close` request. The bytes already read are the whole response,
+    // so that is the ordinary path — only an error that produced *nothing* is a
+    // failure to report.
+    if let Err(e) = stream.read_to_end(&mut response) {
+        if response.is_empty() {
+            return Err(e.to_string());
         }
-        Err(e) => return Err(e.to_string()),
     }
     Ok(String::from_utf8_lossy(&response).to_string())
 }

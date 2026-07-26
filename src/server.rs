@@ -565,7 +565,6 @@ fn load_pair(tls: &crate::config::Tls) -> std::io::Result<rustls::ServerConfig> 
     Ok(config)
 }
 
-
 /// How long either end of the self-test waits before giving up. Generous for a
 /// handshake against a socket on this machine, and bounded so that a wedged peer
 /// cannot leave the daemon neither serving nor exiting.
