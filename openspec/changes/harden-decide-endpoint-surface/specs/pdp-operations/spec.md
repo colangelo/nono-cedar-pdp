@@ -21,6 +21,14 @@ requested — SHALL be logged only at DEBUG. It remains available deliberately, 
 development and for diagnosing a policy that will not match, but it is off by default
 and the operator opts in.
 
+"Only at DEBUG" binds **every** default-level event about a request, not just the
+per-decision line. In particular the refusal of an ambiguous endpoint path stays at
+WARN — an operator should see a refused path without opting in — but SHALL name the
+ambiguity it found and the `request_id`, not the path: nono's proxy forwards the
+request target verbatim, query string included, and for a credential proxy the query
+string is the sensitive part. The deny reason handed to nono, and therefore the audit
+line, SHALL still carry the whole target as sent.
+
 The audit log is unchanged and remains the complete record: nothing is *lost* by this
 requirement, only relocated to the file that has permissions.
 
@@ -32,6 +40,17 @@ sensitivity without its permissions.
 
 - **WHEN** a command request is decided at the default log level
 - **THEN** the emitted line names the `request_id`, `session_id`, `backend`, action, outcome, matched policy identifiers and timing, and does **not** contain the attempted command line or its arguments
+
+#### Scenario: The default decision line carries identifiers, not the requested API path
+
+- **WHEN** an endpoint request is decided at the default log level
+- **THEN** the emitted line names the identifiers, action, outcome, matched policy identifiers and timing, and does **not** contain the request target or its query string
+
+#### Scenario: A refused ambiguous path is reported by cause, not by path
+
+- **WHEN** an endpoint request is refused at the default log level because its path is ambiguous
+- **THEN** the WARN names the ambiguity found and the `request_id` and contains no part of the path
+- **AND** the deny reason returned to nono and the audit line still carry the whole target as sent, so nothing is lost
 
 #### Scenario: The resource summary is available at DEBUG
 

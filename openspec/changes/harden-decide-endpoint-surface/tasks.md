@@ -63,3 +63,33 @@ tracing max-level trap that once made filtered runs lie.
   outcome with no command line in it. Daemon killed afterwards; nothing left behind
   in the tree.
 - [x] 6.4 `openspec validate --changes harden-decide-endpoint-surface` passes
+
+## 7. Remediation round (2026-07-26, re-audit of the #9 half)
+
+The re-audit proved the INFO/DEBUG split stopped at the decision line. Section 4 swept
+`server::approve` and left the *other* default-level event about a request:
+`Engine::evaluate`'s ambiguity refusal logged `reason = %decision.reason` at WARN, and
+that reason quotes the request target verbatim — query string included, which for a
+credential proxy is the sensitive half. No test covered the endpoint variant at the
+default level (4.1 uses a command request), and README overstated the protection.
+
+- [x] 7.1 Failing test (engine unit, default-level capture): the ambiguity refusal names the cause and `request_id` and contains no part of the path, while the returned deny reason still carries the whole target. Observed before the fix: `the request target must not reach stdout at the default level … WARN … reason=ambiguous endpoint path "/repos/../user/keys?token=leaked-at-default-level" …`
+- [x] 7.2 Failing test (HTTP, default level) for the **endpoint** variant of 4.1: a decided endpoint request logs identifiers and outcome and neither the target nor its query string; and an ambiguous one logs the WARN with no path while body + audit line keep the whole target. The refusal case failed as above; the decided case passed on arrival, so it is a regression pin rather than a fix
+- [x] 7.3 Test (HTTP, DEBUG): the refused target is still recoverable and joinable by `request_id` — otherwise 7.1/7.2 would be satisfied by deleting the detail, the opposite of D6
+- [x] 7.4 Implement: the WARN carries `request_id` + the ambiguity cause, control-escaped; the path stays in the deny reason, the audit line, and the DEBUG detail event
+- [x] 7.5 Spec + design: the delta spec says "only at DEBUG" binds every default-level event and pins the refusal's shape; D6 records that the split is a sweep, with the rule of thumb for anything added later (identifiers and causes at the default level, never the resource)
+- [x] 7.6 README: the default level carries no resource summary at all — including the ambiguity WARN — and the DEBUG event names the query string explicitly as part of what it exposes
+- [x] 7.7 Full + filtered tests green, `just lint` clean, `openspec validate` passes
+- [x] 7.8 Live re-probe of the finding's own scenario, scratch policy dir + scratch audit log on `127.0.0.1:8291`, real endpoint envelope with `path=/repos/../user/keys?secret=leaked-at-default-level`:
+
+  | level | daemon stdout | occurrences of the secret on stdout |
+  |---|---|---|
+  | default (no `RUST_LOG`) | `WARN … request_id=probe-endpoint ambiguity=a ".." path segment appears in the path as sent…` + the clean INFO decision line | **0** |
+  | `RUST_LOG=debug` | the same WARN + `DEBUG … decision detail request_id=probe-debug resource=GET https://api.github.com/repos/../user/keys?secret=only-at-debug` | 1, opted in |
+
+  `status=200`, `audit_before=0 audit_after=1`, and the audit line still carries
+  `"resource":"GET https://api.github.com/repos/../user/keys?secret=leaked-at-default-level"`
+  plus the same path in `reason` — relocated, not lost. A decided (unambiguous)
+  endpoint request with `?token=…` likewise put 0 occurrences on stdout and 1 in the
+  audit log. Daemons killed afterwards; everything under the scratch dir, nothing left
+  in the tree.

@@ -101,6 +101,16 @@ event carrying `request_id` plus the resource, rather than one event whose field
 vary by level (`tracing` fields are fixed per event). The DEBUG event must repeat
 `request_id` or it cannot be joined to anything.
 
+The split is a *sweep*, not one edit: the decision line is not the only default-level
+event about a request. `Engine::evaluate`'s ambiguity refusal logged the deny reason at
+WARN, and that reason quotes the request target verbatim — so cleaning the INFO line
+alone left the whole target, query string included, on stdout for any agent willing to
+send a `..`. That WARN stays at WARN (a refused path is worth seeing without opting in)
+and reports the ambiguity plus `request_id`; the target is recoverable from the DEBUG
+detail event and was never absent from the deny reason or the audit line. Rule of
+thumb for anything added later: a default-level event may name identifiers and causes,
+never the resource.
+
 ## Risks / Trade-offs
 
 - **[The Content-Type requirement could break a real nono release]** If a future
