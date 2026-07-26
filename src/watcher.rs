@@ -157,6 +157,36 @@ mod tests {
         predicate()
     }
 
+    /// Block until the watch thread has processed an event and refused the reload.
+    ///
+    /// **Call this before asserting the absence of an adoption, never after.** The
+    /// refusal tests below prove a negative — that a policy set read from a loosened
+    /// tree was not adopted — and a negative is only evidence once the thing that
+    /// would have adopted it has actually run. The watch thread has to receive the
+    /// `notify` event, drain the debounce and run the trust re-check before it can
+    /// refuse, so a bare `!within(…)` over the adoption predicate returns "nothing was
+    /// adopted" just as readily when nothing has happened *yet*.
+    ///
+    /// That was Gitea #31: one window was serving as both "long enough to prove
+    /// nothing was adopted" and "long enough for the refusal to have been logged", and
+    /// only the first was guaranteed. It failed ~1 run in 10-20 under load, and — the
+    /// reason it was worth fixing beyond the red run — it would equally have sat
+    /// *green* through a genuine regression in the re-check, because the test could
+    /// pass before the behaviour happened.
+    ///
+    /// The timeout is deliberately generous. A slow machine must stay green; only a
+    /// re-check that never refuses may go red. Waiting on the log is not a proxy for
+    /// the behaviour under test — `pdp-operations` requires the refusal to reach the
+    /// operator at ERROR, so "the operator was told" *is* the deliverable.
+    fn await_refusal_at_error(capture: &crate::test_log::Capture) {
+        assert!(
+            within(Duration::from_secs(10), || capture.text().contains("ERROR")),
+            "no refusal ever reached the log at ERROR: either the trust re-check did \
+             not run, or it ran and did not refuse. Captured log: {:?}",
+            capture.text()
+        );
+    }
+
     /// The mid-session typo an operator actually makes takes the *watcher's* failure
     /// branch, not a direct `Engine::reload` call. Retention is covered at the engine
     /// level, but nothing exercised the watcher thread's own error path: a `?` or a
@@ -245,18 +275,23 @@ mod tests {
         chmod(dir.path(), 0o770);
         std::fs::write(&policy, r#"forbid (principal, action, resource);"#).unwrap();
 
+        // Order matters — see `await_refusal_at_error`. The refusal is the proof that
+        // the watcher reached the re-check at all; only then does "nothing was
+        // adopted" mean the re-check held rather than that nothing has happened yet.
+        await_refusal_at_error(&capture);
         assert!(
-            !within(Duration::from_secs(2), || engine.snapshot().generation != 1
+            !within(Duration::from_secs(1), || engine.snapshot().generation != 1
                 || !engine.evaluate(&git_status()).allow),
-            "a policy set read from a loosened directory must not be adopted: \
-             generation {}",
+            "a policy set read from a loosened directory must not be adopted, and a \
+             set adopted late is as bad as one adopted now: generation {}",
             engine.snapshot().generation
         );
-        let log = capture.text();
-        assert!(
-            log.contains("ERROR"),
-            "the refusal must be ERROR, not a level an operator filters out: {log:?}"
+        assert_eq!(
+            engine.snapshot().generation,
+            1,
+            "the last-good set must still be the active one"
         );
+        let log = capture.text();
         assert!(log.contains("0770"), "the mode must be named: {log:?}");
         assert!(
             log.contains(&dir.path().display().to_string()),
@@ -292,17 +327,21 @@ mod tests {
         chmod(&policy, 0o660);
         std::fs::write(&policy, r#"forbid (principal, action, resource);"#).unwrap();
 
+        // Order matters — see `await_refusal_at_error`.
+        await_refusal_at_error(&capture);
         assert!(
-            !within(Duration::from_secs(2), || engine.snapshot().generation != 1
+            !within(Duration::from_secs(1), || engine.snapshot().generation != 1
                 || !engine.evaluate(&git_status()).allow),
-            "a policy set read past a loosened file must not be adopted: generation {}",
+            "a policy set read past a loosened file must not be adopted, and a set \
+             adopted late is as bad as one adopted now: generation {}",
             engine.snapshot().generation
         );
-        let log = capture.text();
-        assert!(
-            log.contains("ERROR"),
-            "the refusal must be ERROR, not a level an operator filters out: {log:?}"
+        assert_eq!(
+            engine.snapshot().generation,
+            1,
+            "the last-good set must still be the active one"
         );
+        let log = capture.text();
         assert!(log.contains("0660"), "the mode must be named: {log:?}");
         assert!(
             log.contains(&policy.display().to_string()),
@@ -338,17 +377,23 @@ mod tests {
         chmod(&holder, 0o770);
         std::fs::write(&policy, r#"forbid (principal, action, resource);"#).unwrap();
 
+        // Order matters — see `await_refusal_at_error`. #31 named two tests; this one
+        // has the same shape and was found by the controlled experiment that
+        // reproduced the mechanism, not by the intermittent failure.
+        await_refusal_at_error(&capture);
         assert!(
-            !within(Duration::from_secs(2), || engine.snapshot().generation != 1
+            !within(Duration::from_secs(1), || engine.snapshot().generation != 1
                 || !engine.evaluate(&git_status()).allow),
-            "a policy set below a loosened ancestor must not be adopted: generation {}",
+            "a policy set below a loosened ancestor must not be adopted, and a set \
+             adopted late is as bad as one adopted now: generation {}",
             engine.snapshot().generation
         );
-        let log = capture.text();
-        assert!(
-            log.contains("ERROR"),
-            "the refusal must be ERROR, not a level an operator filters out: {log:?}"
+        assert_eq!(
+            engine.snapshot().generation,
+            1,
+            "the last-good set must still be the active one"
         );
+        let log = capture.text();
         assert!(log.contains("0770"), "the mode must be named: {log:?}");
         assert!(
             log.contains(&holder.display().to_string()),
