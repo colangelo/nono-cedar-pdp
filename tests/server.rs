@@ -1733,3 +1733,163 @@ async fn healthz_reports_the_loaded_generation() {
     assert_eq!(json["generation"], 1);
     assert_eq!(json["policies"], 2, "{json}");
 }
+
+/// The third default-level event about a request, and the last one to be swept: a body
+/// that fails to *parse* is refused with a WARN, and serde's error text quotes the
+/// offending value verbatim — `invalid type: string "…", expected a sequence`. The
+/// value it quotes came off the wire, so an argv fragment reaches stdout at the default
+/// level through a field labelled `error` rather than one labelled `resource`.
+///
+/// The decision itself is untouched: the caller still gets `200` with a deny reason and
+/// still gets an audit line. What moves is where the *detail* of the parse failure is
+/// readable, on the same rule the resource summary follows — a default-level event may
+/// name identifiers and causes, never request-derived content.
+#[tokio::test]
+async fn a_parse_failure_keeps_the_offending_value_out_of_the_default_log() {
+    let dir = tempfile::tempdir().unwrap();
+    // `args` must be a sequence; a string there makes serde quote it back at us.
+    let body = serde_json::json!({
+        "backend": "cedar",
+        "request": {
+            "capability_type": "command",
+            "request_id": "parse-1",
+            "command": "git",
+            "args": "LEAKED-BY-A-SERDE-ERROR",
+            "caller": "session",
+            "intercept_rule": "status",
+            "reason": null,
+            "child_pid": 42,
+            "session_id": "s1"
+        }
+    })
+    .to_string();
+
+    let (response, logs) = {
+        let capture = capture();
+        let (status, response) = post(&dir, &body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        (response, capture.text())
+    };
+
+    // Still visible, still joinable.
+    assert!(
+        logs.contains("WARN") && logs.contains("parse-1"),
+        "the refusal must be visible at the default level: {logs:?}"
+    );
+
+    assert!(
+        !logs.contains("LEAKED-BY-A-SERDE-ERROR"),
+        "a request-supplied value must not reach stdout at the default level, whatever \
+         field it arrives in: {logs:?}"
+    );
+
+    // Nothing is lost: the caller is told, and the audit log keeps the record.
+    assert_eq!(response["decision"], "deny", "{response}");
+    let lines = audit_lines(&dir);
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+}
+
+/// And the detail is still recoverable when the operator opts in — otherwise the test
+/// above would be satisfied by deleting the diagnostic, which is the opposite of D6.
+#[tokio::test]
+async fn a_parse_failure_reports_its_detail_at_debug() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = serde_json::json!({
+        "backend": "cedar",
+        "request": {
+            "capability_type": "command",
+            "request_id": "parse-2",
+            "command": "git",
+            "args": "RECOVERABLE-AT-DEBUG",
+            "caller": "session",
+            "intercept_rule": "status",
+            "reason": null,
+            "child_pid": 42,
+            "session_id": "s1"
+        }
+    })
+    .to_string();
+
+    let logs = {
+        let capture = capture_at(tracing::Level::DEBUG);
+        let (status, _) = post(&dir, &body).await;
+        assert_eq!(status, StatusCode::OK);
+        capture.text()
+    };
+
+    assert!(
+        logs.contains("RECOVERABLE-AT-DEBUG"),
+        "the parse detail must be available when the operator asks for it: {logs:?}"
+    );
+    assert!(
+        logs.contains("parse-2"),
+        "and it must be joinable to the refusal: {logs:?}"
+    );
+}
+
+/// The refusal path is the *only* sink for the observed header values — a refused
+/// request writes no audit line by design — so the escaping there has nothing else
+/// backing it up. The approval-webhook delta makes it a SHALL ("logged at WARN with
+/// the reason and the observed header values, control-escaped"), and it was
+/// implemented but unpinned: nothing failed if the escaping were dropped.
+///
+/// **What is actually reachable through a header matters here.** DEL and the C0
+/// controls cannot be tested, because they cannot arrive: `http` rejects them in a
+/// field value outright (RFC 9110 limits field values to visible ASCII, space, HTAB
+/// and obs-text), so the harness fails to build the request at all. What *does* arrive
+/// is obs-text — bytes `0x80..=0xFF` — and `observed()` reads the raw bytes through
+/// `from_utf8_lossy` rather than `to_str()`, so `0xC2 0x9B` becomes U+009B, a real C1
+/// control (CSI). That is the escaping's whole job, and a C0 probe would have proved
+/// nothing: the `tracing` formatter escapes C0 by itself.
+#[tokio::test]
+async fn control_bytes_in_the_refused_headers_are_escaped_in_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = server::router(state(&dir));
+    // U+009B (CSI) as UTF-8 obs-text: 0xC2 0x9B, which a header value may carry.
+    let hostile_type = "text/plain\u{9b}31mFORGED";
+    let hostile_origin = "https://evil.example\u{9b}0m";
+
+    let logs = {
+        let capture = capture();
+        // 415 path: the observed content-type is what gets logged.
+        let (status, _) = post_with_headers(
+            &app,
+            &[("content-type", hostile_type)],
+            &command_body("git", &[nono_cedar_pdp::wire::EXAMPLE_SHIM_ARGV0, "status"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        // 403 path: the observed origin is what gets logged.
+        let (status, _) = post_with_headers(
+            &app,
+            &[
+                ("content-type", "application/json"),
+                ("origin", hostile_origin),
+            ],
+            &command_body("git", &[nono_cedar_pdp::wire::EXAMPLE_SHIM_ARGV0, "status"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        capture.text()
+    };
+
+    assert!(
+        !logs.contains('\u{9b}'),
+        "a raw CSI from a refused request's headers reached the log: {logs:?}"
+    );
+    // Escaped, not dropped: an operator still sees what was probed with.
+    assert!(
+        logs.contains("\\u{009b}"),
+        "the observed value must survive, escaped: {logs:?}"
+    );
+    assert!(
+        logs.contains("FORGED") && logs.contains("evil.example"),
+        "and must still name what was sent: {logs:?}"
+    );
+
+    // The premise of the test: neither refusal wrote an audit line.
+    assert!(
+        audit_lines(&dir).is_empty(),
+        "a refusal must not be audited"
+    );
+}

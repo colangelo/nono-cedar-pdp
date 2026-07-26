@@ -234,6 +234,10 @@ async fn approve(State(state): State<AppState>, headers: HeaderMap, body: Body) 
                 &decision,
                 user_agent.as_deref(),
             );
+            // Safe at the default level, unlike the parse failure below: this `e` is
+            // axum's body error — a length-limit refusal or a transport failure — so it
+            // describes how reading stopped and cannot quote bytes from a body that was
+            // never parsed. Escaped anyway, since it is still not ours.
             tracing::warn!(
                 error = %crate::sanitize::control_escape(&e.to_string()),
                 limit = MAX_REQUEST_BYTES,
@@ -253,14 +257,25 @@ async fn approve(State(state): State<AppState>, headers: HeaderMap, body: Body) 
             state
                 .audit
                 .record_rejected(&context, &decision, user_agent.as_deref());
+            // The cause, not the content. serde's error text quotes the offending
+            // value verbatim — `invalid type: string "…", expected a sequence` — and
+            // that value came off the wire, so putting it here would leak an argv
+            // fragment to stdout at the default level through a field called `error`
+            // rather than one called `resource`. `deny_reason()` is one of our own
+            // fixed strings, so it names what went wrong without echoing what was
+            // sent. The full text is one event below, at DEBUG.
             tracing::warn!(
-                // Cedar and serde error text can quote request-supplied values.
-                error = %crate::sanitize::control_escape(&e.to_string()),
+                cause = %decision.reason,
                 request_id = context.request_id.as_deref().unwrap_or(UNKNOWN),
                 session_id = context.session_id.as_deref().unwrap_or(UNKNOWN),
                 backend = context.backend.as_deref().unwrap_or(UNKNOWN),
                 capability_type = context.capability_type.as_deref().unwrap_or(UNKNOWN),
                 "rejecting approval request"
+            );
+            tracing::debug!(
+                request_id = context.request_id.as_deref().unwrap_or(UNKNOWN),
+                error = %crate::sanitize::control_escape(&e.to_string()),
+                "approval request parse failure detail"
             );
             return (StatusCode::OK, Json(decision.to_wire())).into_response();
         }

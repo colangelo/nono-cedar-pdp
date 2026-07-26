@@ -188,11 +188,13 @@ proves nothing. It does not authenticate the caller and is not a credential.
 protections.** At the default level the per-decision log line carries the identifiers
 and the outcome only — `request_id`, `session_id`, `backend`, the action, allow/deny,
 the matched policy ids and the timing — which is enough to correlate it with the audit
-line. Nothing the daemon logs by default carries the resource summary: the one other
-default-level line about a request, the WARN that refuses an endpoint path as
-ambiguous, names the ambiguity it found and the `request_id`, not the path. (The path
-is still in the deny reason nono receives and in the audit line — this is about what
-reaches *stdout*.)
+line. The rule is not specific to that one line: **every** default-level event about a
+request may name identifiers and causes, never request-derived content. The two
+refusals are where that bites, and both follow it — the WARN that refuses an ambiguous
+endpoint path names the ambiguity it found and the `request_id`, not the path; the WARN
+that refuses an unparseable body names our own fixed cause, not serde's error text,
+which quotes the offending value verbatim. (Both are still in the deny reason nono
+receives and in the audit line — this is about what reaches *stdout*.)
 
 `RUST_LOG=debug` adds a second event, keyed by the same `request_id`, carrying the
 resource summary: the command line an agent attempted, or the API path — query string

@@ -186,11 +186,15 @@ fn the_webhook_header_contract_is_pinned_to_the_nono_version_it_was_read_from() 
         child_pid: 42,
         session_id: "s1".into(),
     };
-    let body = serde_json::json!({ "backend": "cedar", "request": serde_json::to_value(&upstream).unwrap() });
+    // Assert on what UPSTREAM produced, not on a wrapper this test builds: a
+    // `serde_json::json!({...})` literal is a `Value::Object` by construction, so
+    // asserting `is_object()` on it can never fail and would pin nothing while
+    // reading as though it pinned this.
+    let serialized = serde_json::to_value(&upstream).unwrap();
     assert!(
-        body.is_object(),
+        serialized.is_object(),
         "nono's own approval request no longer serializes to a JSON object, so \
-         `application/json` no longer describes the body: {body}"
+         `application/json` no longer describes the body: {serialized}"
     );
 
     // (3) The gate itself, against the upstream literal and against the three types a
