@@ -499,6 +499,19 @@ startup. Hot-reload parses + validates into a staging `PolicySet` and swaps the
 `ArcSwap` only on success. `GET /healthz` reports policy-set generation + load time
 for launchd/monitoring.
 
+> **Correction trail (2026-07-26, `harden-the-health-surface`, Gitea #7).** As shipped,
+> `/healthz` reported generation but *not* load time — `loaded_at` was written on every
+> load and never read — and it additionally reported the absolute `policy_dir`, which
+> this paragraph never asked for and which hands the policy-rewrite target to an
+> unauthenticated caller. It also could not distinguish a daemon serving fresh policies
+> from one whose every reload since startup had been refused. The path is now removed
+> (not shortened or hashed — the space of real policy directory paths is enumerable),
+> load time is reported as this paragraph always said it would be, and `last_reload`
+> carries the outcome of the most recent attempt with no reason text and no path. A
+> failed reload deliberately stays `200`: the daemon is serving correctly from its
+> last-known-good set, and a 503 would invite a restart that re-runs the same failing
+> bootstrap load and takes the daemon down. Monitoring keys on the outcome field.
+
 ## 8. Deployment & rollout
 
 No dry-run code in the PDP; stage through nono's own config:
