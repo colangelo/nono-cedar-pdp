@@ -659,26 +659,46 @@ fn a_symlinked_policy_dir_is_resolved_before_serving() {
     child.kill().unwrap();
     child.wait().unwrap();
 
-    let body = health
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or_else(|| panic!("no body in the healthz response: {health:?}"));
-    let json: serde_json::Value = serde_json::from_str(body.trim())
-        .unwrap_or_else(|e| panic!("unparseable healthz body ({e}): {health:?}"));
-    let reported = json["policy_dir"]
-        .as_str()
-        .unwrap_or_else(|| panic!("healthz reports no policy_dir: {json:#}"));
+    assert!(
+        !health.is_empty(),
+        "the daemon never answered /healthz, so it never got far enough to load"
+    );
+
+    // D7's observable used to be `healthz.policy_dir`, which #7 removed as an
+    // unauthenticated disclosure of the policy-rewrite target. The `files` array of
+    // the provenance line is the replacement, and it is stronger evidence: the old
+    // field was the daemon reporting a path *about itself*, which it could get right
+    // while loading through a different chain. This is the list of paths the loader
+    // actually opened, so a daemon that resolved correctly and one that did not now
+    // differ in what they enumerate — which is what D7 is actually about.
+    let trail = std::fs::read_to_string(dir.path().join("decisions.jsonl"))
+        .unwrap_or_else(|e| panic!("nothing at the configured audit log: {e}"));
+    let loaded: serde_json::Value = trail
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["kind"] == "policy-set")
+        .unwrap_or_else(|| panic!("no policy-set line in the trail: {trail}"));
+    let files: Vec<&str> = loaded["files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no files on the provenance line: {loaded}"))
+        .iter()
+        .map(|f| f.as_str().unwrap())
+        .collect();
+    assert!(!files.is_empty(), "{loaded}");
 
     let resolved = std::fs::canonicalize(&real).unwrap();
-    assert_eq!(
-        reported,
-        resolved.display().to_string(),
-        "the daemon must serve from the resolved chain, not the configured symlink"
-    );
-    assert!(
-        !reported.contains("link"),
-        "the symlink path is the chain the checks never walked: {reported}"
-    );
+    for file in &files {
+        assert!(
+            file.starts_with(&resolved.display().to_string()),
+            "the daemon must load from the resolved chain, not the configured \
+             symlink: {file} is not under {}",
+            resolved.display()
+        );
+        assert!(
+            !file.contains("link"),
+            "the symlink path is the chain the checks never walked: {file}"
+        );
+    }
 }
 
 /// A policy directory a second local user can write is a directory in which
