@@ -553,3 +553,117 @@ fn the_documented_openssl_fallback_mints_a_leaf_a_verifier_accepts() {
          above prove nothing about its SANs"
     );
 }
+
+const JUSTFILE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Justfile"));
+
+/// The body of one `just` recipe, so a needle satisfied by a *different* recipe
+/// cannot stand in for it — `mkcert -install` appears in `mint-cert` as well.
+fn recipe(name: &str) -> String {
+    let mut body: Option<String> = None;
+    for line in JUSTFILE.lines() {
+        match &mut body {
+            None => {
+                let head = line.split_whitespace().next().unwrap_or_default();
+                if head == format!("{name}:") || head == name {
+                    body = Some(String::new());
+                }
+            }
+            Some(collected) => {
+                if !line.is_empty() && !line.starts_with([' ', '\t']) {
+                    return collected.clone();
+                }
+                collected.push_str(line);
+                collected.push('\n');
+            }
+        }
+    }
+    body.unwrap_or_else(|| panic!("the Justfile has no `{name}` recipe"))
+}
+
+/// `just smoke-tls` is the only verification that drives real nono against a
+/// squatter, and nothing in `cargo test` can run it: it needs the `nono` binary,
+/// `nono setup` to have been run, and a local CA installed by a human with an admin
+/// password. So what is pinned here is the handful of details that decide whether a
+/// *run* of it means anything at all.
+///
+/// Each of these has a specific way of failing silently:
+///
+/// - The **skip** has to name `mkcert -install`. A recipe that skips without saying
+///   what to install reads like a pass, and T10 exists because that is how a
+///   verification step stops being one.
+/// - The block has to be asserted as **exit 126 specifically**. Both of nono's
+///   blocking paths — `Err(SandboxInit)` from a transport failure and
+///   `Err(BlockedCommand)` from a policy denial — reach the same `write_response(…,
+///   126, …)` in upstream's `handle_shim_stream`, so "non-zero" would be satisfied
+///   by the daemon simply denying, which is not what this proves.
+/// - Which is why the recipe also has to read the **message**: `approval_denied` is
+///   the denial shape and must be absent, `Sandbox initialization failed` is the
+///   transport shape and must be present. That distinction is T1, and it is the
+///   thing a future reader will get wrong.
+#[test]
+fn the_squat_recipe_keeps_what_makes_a_run_of_it_mean_something() {
+    let body = recipe("smoke-tls");
+    for (why, needle) in [
+        (
+            "the skip names the command that fixes it (T10)",
+            "mkcert -install",
+        ),
+        (
+            "and announces itself as a skip rather than reading like a pass",
+            "SKIPPED",
+        ),
+        (
+            "the block is asserted as exit 126, not merely non-zero (T1)",
+            "126",
+        ),
+        (
+            "the denial shape must be absent — a denial exits 126 too",
+            "approval_denied",
+        ),
+        (
+            "and the transport shape must be present",
+            "Sandbox initialization failed",
+        ),
+        (
+            "and specifically the certificate — connection-refused is also a \
+             transport failure at exit 126, so without this the whole block half \
+             passes with nothing listening",
+            "invalid peer certificate",
+        ),
+    ] {
+        assert!(
+            body.contains(needle),
+            "the smoke-tls recipe no longer pins {why:?} (looked for {needle:?})"
+        );
+    }
+}
+
+/// `[ "$a" != "$b" ] && VAR=…` under `set -e` **exits the script** when the test is
+/// false: the `&&` list returns the test's status, and there is no `else` to make it
+/// a compound. It cost a full round trip in #32, in the recipe path least exercised
+/// while developing — a normal checkout rather than a worktree — and every recipe
+/// here runs `set -euo pipefail`.
+///
+/// So the shape is refused outright rather than remembered. `if … then VAR=…; fi` is
+/// the same thing without the trap.
+#[test]
+fn no_recipe_gates_an_assignment_on_a_test_under_set_e() {
+    for (number, line) in JUSTFILE.lines().enumerate() {
+        let Some((test, rest)) = line.split_once("] &&") else {
+            continue;
+        };
+        if !test.trim_start().starts_with('[') {
+            continue;
+        }
+        let rest = rest.trim();
+        let assignment = rest.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+        assert!(
+            !assignment,
+            "Justfile line {}: `[ … ] && VAR=…` takes the whole recipe down under \
+             `set -e` whenever the test is false. Use `if … then VAR=…; fi`.\n  {line}",
+            number + 1
+        );
+    }
+}
