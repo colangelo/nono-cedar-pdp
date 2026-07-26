@@ -158,6 +158,7 @@ mod tests {
             policy_dir: "/tmp/p".into(),
             audit_log: "/tmp/a.jsonl".into(),
             agents,
+            tls: None,
         }
     }
 

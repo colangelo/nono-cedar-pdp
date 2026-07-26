@@ -21,11 +21,11 @@ docs around an unmeasured assumption is how a spec hardens around a wrong fact.
 
 ## 2. Config surface
 
-- [ ] 2.1 Failing test: a config with no `[tls]` table loads and reports no TLS configured
-- [ ] 2.2 Failing test: `[tls]` with `cert` but no `key` (and the reverse) is a load error naming the missing key (T2)
-- [ ] 2.3 Failing test: an unknown key *inside* `[tls]` is a load error — the strictness rule must reach the nested table, which `deny_unknown_fields` does not give for free on a nested struct unless it is declared there too
-- [ ] 2.4 Failing test: `~/`-relative `cert` and `key` expand, like `policy_dir` does
-- [ ] 2.5 Implement: `Tls { cert, key }` as `Option<Tls>` on `Config`, `deny_unknown_fields`, `de_path` on both
+- [x] 2.1 Failing test: a config with no `[tls]` table loads and reports no TLS configured
+- [x] 2.2 Failing test: `[tls]` with `cert` but no `key` (and the reverse) is a load error naming the missing key (T2)
+- [x] 2.3 Failing test: an unknown key *inside* `[tls]` is a load error — the strictness rule must reach the nested table, which `deny_unknown_fields` does not give for free on a nested struct unless it is declared there too
+- [x] 2.4 Failing test: `~/`-relative `cert` and `key` expand, like `policy_dir` does
+- [x] 2.5 Implement: `Tls { cert, key }` as `Option<Tls>` on `Config`, `deny_unknown_fields`, `de_path` on both
 
 ## 3. Key protection
 

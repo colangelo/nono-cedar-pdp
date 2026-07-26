@@ -896,6 +896,7 @@ mod tests {
             policy_dir: dir.path().to_path_buf(),
             audit_log: path.clone(),
             agents: std::collections::BTreeMap::new(),
+        tls: None,
         };
 
         let body = serde_json::json!({
@@ -1175,6 +1176,7 @@ mod tests {
             policy_dir: dir.path().to_path_buf(),
             audit_log: dir.path().join("unused.jsonl"),
             agents,
+            tls: None,
         };
         // Zero bytes of space: every record fails, and there is nothing to roll back.
         let full = FullDisk::with_budget(0);

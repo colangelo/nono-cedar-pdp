@@ -23,6 +23,7 @@ fn config() -> Config {
         policy_dir: PathBuf::from(POLICY_DIR),
         audit_log: PathBuf::from("/dev/null"),
         agents,
+        tls: None,
     }
 }
 

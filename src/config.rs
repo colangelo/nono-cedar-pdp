@@ -42,6 +42,33 @@ pub struct Config {
     pub audit_log: PathBuf,
     #[serde(default)]
     pub agents: BTreeMap<String, String>,
+    /// Absent ⇒ plaintext, exactly as before (T2). TLS is opt-in because the
+    /// shipped defaults have to start without a certificate ceremony; what is
+    /// *not* optional is that a `[tls]` table which is present and broken
+    /// refuses to serve rather than falling back to plaintext.
+    pub tls: Option<Tls>,
+}
+
+/// The certificate and private key of the https listener.
+///
+/// `deny_unknown_fields` is repeated here on purpose: it does **not** recurse
+/// from `Config`, so without it a typo inside `[tls]` deserializes into a struct
+/// with the mistyped key silently dropped — the precise thing the strict-config
+/// rule exists to prevent, one level deeper than the rule was written.
+///
+/// Both fields are required — no `Option`, no `default`. A `[tls]` with one half
+/// is a half-configured transport, and serde's own "missing field `key`" is the
+/// error the operator needs (T2).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tls {
+    /// The leaf certificate, plus any intermediates, in PEM.
+    #[serde(deserialize_with = "de_path")]
+    pub cert: PathBuf,
+    /// The private key in PEM. Its mode, owner and ancestor chain are checked
+    /// before the daemon serves — see [`crate::isolation::refuse_a_readable_private_key`].
+    #[serde(deserialize_with = "de_path")]
+    pub key: PathBuf,
 }
 
 fn default_bind() -> SocketAddr {
@@ -108,6 +135,10 @@ mod tests {
         f
     }
 
+    /// TLS is opt-in (T2). A config with no `[tls]` table is the shipped default
+    /// posture — plaintext loopback — and must keep loading: the certificate
+    /// ceremony cannot be a precondition for starting the daemon at all, or the
+    /// security outcome is a daemon nobody runs.
     #[test]
     fn loads_minimal_config_with_defaults() {
         let f = write_config(r#"policy_dir = "/tmp/policies""#);
@@ -115,6 +146,11 @@ mod tests {
         assert_eq!(c.bind.to_string(), "127.0.0.1:8181");
         assert_eq!(c.policy_dir, std::path::Path::new("/tmp/policies"));
         assert!(c.agents.is_empty());
+        assert!(
+            c.tls.is_none(),
+            "no [tls] table must mean no TLS configured, not a half-built one: {:?}",
+            c.tls
+        );
     }
 
     #[test]
@@ -172,6 +208,52 @@ cedar = "claude-code"
         );
     }
 
+    /// A `[tls]` table with only one of the pair is a half-configured transport,
+    /// and T2 says a half-configured transport must not start: the operator who
+    /// wrote `cert` and mistyped `key` believes the listener is authenticated.
+    /// Silently ignoring the half they did write, or serving plaintext behind a
+    /// profile whose URL says `https`, are both worse than a failed start.
+    #[test]
+    fn rejects_a_half_configured_tls_table() {
+        for (half, missing) in [
+            ("cert = \"/tmp/tls/cert.pem\"", "key"),
+            ("key = \"/tmp/tls/key.pem\"", "cert"),
+        ] {
+            let f = write_config(&format!("policy_dir = \"/tmp/p\"\n\n[tls]\n{half}\n"));
+            let err = Config::load(f.path()).unwrap_err();
+            assert!(matches!(err, ConfigError::Parse(_)), "{half}: {err}");
+            let text = err.to_string();
+            assert!(
+                text.contains(&format!("missing field `{missing}`")),
+                "the message must name the half that is missing: {text}"
+            );
+        }
+    }
+
+    /// `deny_unknown_fields` does not recurse: declaring it on `Config` says
+    /// nothing about a nested table, so without it on `Tls` too a typo inside
+    /// `[tls]` deserializes to a struct with the mistyped key silently dropped —
+    /// and then the required-pair rule above catches the wrong thing or nothing
+    /// at all. The strictness rule is worth exactly as much as its reach.
+    #[test]
+    fn rejects_unknown_keys_inside_the_tls_table() {
+        let f = write_config(
+            "policy_dir = \"/tmp/p\"\n\n[tls]\ncert = \"/tmp/tls/cert.pem\"\n\
+             key = \"/tmp/tls/key.pem\"\ncerificate = \"typo\"\n",
+        );
+        let err = Config::load(f.path()).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("unknown field `cerificate`"),
+            "the message must name the offending key inside the table: {text}"
+        );
+        assert!(
+            text.contains("cert"),
+            "and the keys the table does define: {text}"
+        );
+    }
+
     /// nono sends no credential and cannot authenticate the decider, so the only
     /// access control this daemon has is being unreachable from other hosts. A
     /// config that removes it must not load.
@@ -210,5 +292,24 @@ cedar = "claude-code"
         let c = Config::load(f.path()).unwrap();
         assert!(c.policy_dir.is_absolute(), "got {:?}", c.policy_dir);
         assert!(!c.policy_dir.to_string_lossy().contains('~'));
+    }
+
+    /// The shipped `[tls]` block is written home-anchored (T8), so the tilde has
+    /// to expand here for the same reason it does on `policy_dir`: an unexpanded
+    /// `~` is a relative path whose meaning depends on the daemon's working
+    /// directory, and the key-protection check would then walk a different chain
+    /// from the one the listener reads.
+    #[test]
+    fn expands_tilde_in_tls_paths() {
+        let f = write_config(
+            "policy_dir = \"/tmp/p\"\n\n[tls]\ncert = \"~/.config/nono-cedar-pdp/tls/cert.pem\"\n\
+             key = \"~/.config/nono-cedar-pdp/tls/key.pem\"\n",
+        );
+        let c = Config::load(f.path()).unwrap();
+        let tls = c.tls.unwrap();
+        for path in [&tls.cert, &tls.key] {
+            assert!(path.is_absolute(), "got {path:?}");
+            assert!(!path.to_string_lossy().contains('~'), "got {path:?}");
+        }
     }
 }
