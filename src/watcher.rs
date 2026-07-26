@@ -65,8 +65,7 @@ pub fn spawn(engine: Arc<Engine>) -> notify::Result<RecommendedWatcher> {
                 // not WARN: a quieter level would let the "adopted silently"
                 // failure this closes recur one level down. See the module docs
                 // for the TOCTOU window and the other-local-users scope.
-                if let Err(e) = crate::isolation::refuse_untrusted_policy_dir(engine.policy_dir())
-                {
+                if let Err(e) = crate::isolation::refuse_untrusted_policy_dir(engine.policy_dir()) {
                     tracing::error!(
                         error = %e,
                         "policy directory is no longer trusted; keeping the \

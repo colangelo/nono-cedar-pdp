@@ -359,7 +359,11 @@ mod tests {
             }
             .describe()
         };
-        assert!(described(0).contains("in the path as sent"), "{}", described(0));
+        assert!(
+            described(0).contains("in the path as sent"),
+            "{}",
+            described(0)
+        );
         assert!(
             described(1).contains("after one percent-decode pass"),
             "{}",

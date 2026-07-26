@@ -303,7 +303,12 @@ pub fn load_dir(
         path: dir.to_path_buf(),
         source,
     })?;
-    load_entries(dir, listing.map(|e| e.map(|e| e.path())), schema, generation)
+    load_entries(
+        dir,
+        listing.map(|e| e.map(|e| e.path())),
+        schema,
+        generation,
+    )
 }
 
 /// The whole load, from a directory listing already in hand. Split from

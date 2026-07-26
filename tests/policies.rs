@@ -323,10 +323,7 @@ fn the_baseline_forbid_names_the_exported_fallback_constant() {
         .find(|p| p.annotation("id").map(AsRef::as_ref) == Some("no-unknown-agents"))
         .unwrap_or_else(|| panic!("the shipped baseline lost its no-unknown-agents forbid"));
     assert_eq!(forbid.effect(), cedar_policy::Effect::Forbid, "{forbid}");
-    let needle = format!(
-        "Nono::Agent::\"{}\"",
-        nono_cedar_pdp::config::UNKNOWN_AGENT
-    );
+    let needle = format!("Nono::Agent::\"{}\"", nono_cedar_pdp::config::UNKNOWN_AGENT);
     assert!(
         forbid.to_string().contains(&needle),
         "the forbid must name the resolver's fallback {needle}: {forbid}"

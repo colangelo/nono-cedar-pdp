@@ -880,10 +880,7 @@ mod tests {
             text.contains("/x/policies"),
             "the path must be named: {text}"
         );
-        assert!(
-            text.contains("501"),
-            "the owning uid must be named: {text}"
-        );
+        assert!(text.contains("501"), "the owning uid must be named: {text}");
         assert!(
             text.contains("root"),
             "the rule is owner-or-root and the message must say so: {text}"
