@@ -2095,3 +2095,176 @@ fn a_daemon_on_the_ipv6_loopback_serves_a_certificate_minted_for_only_that_addre
         "GET /healthz over https on the IPv6 loopback: {health:?} (log: {logs})"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The operator's minting path (6.1): `just mint-cert`.
+//
+// The recipe is the only part of this feature an operator runs by hand, and the
+// two daemon refusals standing between them and a listening daemon — T6 on the
+// certificate, T4 on the key — are both things a minting recipe can trip. So it
+// is exercised here rather than described: the pair it writes is handed to the
+// real daemon, and the daemon is asked to serve over it.
+// ---------------------------------------------------------------------------
+
+/// Run a `just` recipe from the repository root, or `None` when `just` is not
+/// installed — announced, never silent, on the same terms as the missing-CA skip.
+fn just(args: &[&str]) -> Option<std::process::Output> {
+    let output = Command::new("just")
+        .args(args)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output();
+    match output {
+        Ok(output) => Some(output),
+        Err(_) => {
+            announce(
+                "\n  SKIPPED (not run, not passed): `just` is not installed, so the \
+                 operator recipes cannot be exercised.\n      brew install just\n",
+            );
+            None
+        }
+    }
+}
+
+/// The permission bits of `path`.
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+/// Combined stdout and stderr of a finished command.
+fn merged(output: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// `just mint-cert` has to write a pair **this daemon serves**, not merely two
+/// files with the right names.
+///
+/// Two of the daemon's own refusals stand between an operator and a running
+/// listener, and the minting step can trip either: T6 refuses a certificate the
+/// platform verifier does not accept for the bind address, and T4 refuses a
+/// private key other local users can read. Both refusals arrive at startup, long
+/// after the ceremony — so the recipe is run here and its output is handed to the
+/// real daemon, which is the only assertion that cannot pass by coincidence.
+///
+/// `TRUST_STORES=system` is the invisible half of the recipe: mkcert probes the
+/// Java keystore on *every* invocation and aborts before issuing anything when
+/// `keytool` fails, which on a Mac without a JDK it does. Without it there is no
+/// `cert.pem` here at all.
+#[test]
+fn just_mint_cert_writes_a_pair_this_daemon_serves() {
+    if Command::new("mkcert").arg("-CAROOT").output().is_err() {
+        announce(
+            "\n  SKIPPED (not run, not passed): mkcert is not installed, so the minting \
+             recipe cannot run.\n      brew install mkcert && mkcert -install\n",
+        );
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let tls = dir.path().join("tls");
+    let Some(output) = just(&["mint-cert", tls.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(
+        output.status.success(),
+        "`just mint-cert` failed: {}",
+        merged(&output)
+    );
+
+    let cert = tls.join("cert.pem");
+    let key = tls.join("key.pem");
+    // What the operator ends up holding, which is the property worth pinning — not
+    // which line produced it. Measured: mkcert writes `0600`/`0644` itself, ignoring
+    // the umask, so the recipe's own `chmod` lines are what keep this true if that
+    // undocumented choice ever changes, and deleting them today reddens nothing
+    // here. The directory mode is the one this test does hold to the recipe: `mkdir`
+    // under the usual umask gives `0755`.
+    assert_eq!(
+        mode_of(&key),
+        0o600,
+        "the minted private key must not be readable by other local users"
+    );
+    assert_eq!(
+        mode_of(&cert),
+        0o644,
+        "the certificate is public; only the key is secret"
+    );
+    assert_eq!(mode_of(&tls), 0o700, "and the directory holding them");
+
+    if !platform_trusts(&cert, std::net::Ipv4Addr::LOCALHOST.into()) {
+        announce(
+            "\n  SKIPPED (not run, not passed): the recipe minted a pair, but this \
+             machine's platform trust store holds no local CA, so nothing here proves \
+             the daemon would serve it.\n      mkcert -install\n",
+        );
+        return;
+    }
+    // Every address the shipped configuration accepts, because the recipe cannot
+    // know which one the operator will bind — and a certificate that covers only
+    // the default turns `bind = "[::1]:8181"` into a daemon that refuses to start.
+    assert!(
+        platform_trusts(&cert, std::net::Ipv6Addr::LOCALHOST.into()),
+        "the minted certificate must cover ::1 as well as 127.0.0.1: {}",
+        merged(&output)
+    );
+
+    let mut daemon = start_daemon(dir.path(), &tls_config(dir.path(), &cert, &key));
+    let addr = daemon.addr;
+    let health = https(
+        addr,
+        &format!("GET /healthz HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"),
+    );
+    let logs = daemon.stop();
+    let health = health.unwrap_or_else(|e| {
+        panic!("the daemon would not serve the pair its own recipe minted: {e} (log: {logs})")
+    });
+    assert!(
+        health.starts_with("HTTP/1.1 200 OK"),
+        "GET /healthz over https with the minted pair: {health:?} (log: {logs})"
+    );
+}
+
+/// Minting over a pair that is already there is destructive in a way nothing
+/// downstream can recover: the running daemon is serving the old certificate, the
+/// operator's own CA may have signed it, and the file is the only copy of the key.
+/// So the recipe refuses, names the file, and says what to do — rather than
+/// silently replacing it, which is the behaviour that reads as success.
+///
+/// The same shape `install-policies` already takes with a policy file it did not
+/// write.
+#[test]
+fn just_mint_cert_refuses_to_overwrite_an_existing_pair() {
+    if Command::new("mkcert").arg("-CAROOT").output().is_err() {
+        announce(
+            "\n  SKIPPED (not run, not passed): mkcert is not installed, so the minting \
+             recipe cannot run.\n      brew install mkcert && mkcert -install\n",
+        );
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let tls = dir.path().join("tls");
+    std::fs::create_dir_all(&tls).unwrap();
+    let key = tls.join("key.pem");
+    std::fs::write(&key, "the operator's real key\n").unwrap();
+
+    let Some(output) = just(&["mint-cert", tls.to_str().unwrap()]) else {
+        return;
+    };
+    let output = merged(&output);
+    assert!(
+        !output.contains("SUCCESS") && !output.is_empty(),
+        "the recipe must say something: {output}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&key).unwrap(),
+        "the operator's real key\n",
+        "`just mint-cert` overwrote an existing private key: {output}"
+    );
+    assert!(
+        output.contains("key.pem"),
+        "the refusal must name the file that stopped it: {output}"
+    );
+}

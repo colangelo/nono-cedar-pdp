@@ -383,11 +383,7 @@ fn a_dropped_argv_entry_defeats_the_glob_forbid_but_not_the_membership_forbid() 
 /// answers for one input.
 #[test]
 fn a_dropped_argv_entry_leaves_a_request_indistinguishable_from_a_legitimate_one() {
-    let hostile = upstream_args(&[
-        SHIM_GIT.as_bytes(),
-        b"--exec-path=/tmp/evil\xff",
-        b"status",
-    ]);
+    let hostile = upstream_args(&[SHIM_GIT.as_bytes(), b"--exec-path=/tmp/evil\xff", b"status"]);
     let legitimate = upstream_args(&[SHIM_GIT.as_bytes(), b"status"]);
     assert_eq!(
         hostile, legitimate,

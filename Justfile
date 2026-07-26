@@ -31,6 +31,71 @@ serve config="./nono-cedar-pdp.toml":
 serve-dev:
     cargo run -- serve --config ./nono-cedar-pdp.dev.toml
 
+# Mint the locally-trusted TLS pair the [tls] block names; never overwrites.
+mint-cert dir="~/.config/nono-cedar-pdp/tls":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    DIR='{{dir}}'
+    DIR="${DIR/#\~/$HOME}"
+    CERT="$DIR/cert.pem"
+    KEY="$DIR/key.pem"
+    command -v mkcert >/dev/null || {
+      echo "FAIL: mkcert is not installed." >&2
+      echo "  brew install mkcert && mkcert -install    # the second needs an admin password" >&2
+      echo "  Or follow the openssl fallback in README.md — which needs the same admin" >&2
+      echo "  step, because a leaf is only trusted through a CA that is a trust ANCHOR." >&2
+      exit 1
+    }
+    # Never overwrite. The daemon may be serving this pair right now, the key file
+    # is the only copy of the key, and the certificate may have been signed by the
+    # operator's own CA rather than mkcert's — none of which this recipe can see.
+    # Silently replacing it would read as success and take the listener down at the
+    # next restart.
+    for existing in "$CERT" "$KEY"; do
+      if [ -e "$existing" ]; then
+        echo "FAIL: $existing already exists; refusing to overwrite it." >&2
+        echo "  Move it aside first, then re-run:" >&2
+        echo "      mv \"$existing\" \"$existing.old\"" >&2
+        exit 1
+      fi
+    done
+    mkdir -p "$DIR"
+    chmod 700 "$DIR"
+    # TRUST_STORES=system is load-bearing, not tidiness: mkcert probes the Java
+    # keystore on EVERY invocation and aborts before issuing anything when `keytool`
+    # fails, which on a Mac without a JDK it does. Measured 2026-07-26 — without it
+    # this recipe writes no certificate at all.
+    #
+    # All three loopback names, because the recipe cannot know which the operator
+    # will bind: a certificate covering only 127.0.0.1 turns `bind = "[::1]:8181"`
+    # into a daemon that refuses to start (T6), and that refusal arrives at the next
+    # restart rather than here.
+    TRUST_STORES=system mkcert -cert-file "$CERT" -key-file "$KEY" localhost 127.0.0.1 ::1
+    # Set here rather than left to mkcert's choice: a private key other local users
+    # can read is a refusal to serve (T4), so the recipe that mints it is where that
+    # is settled. It defends against other local users only — never against the
+    # sandboxed agent, which runs as the same uid; what keeps the key away from the
+    # agent is its location relative to the profile's read grants.
+    chmod 600 "$KEY"
+    chmod 644 "$CERT"
+    echo
+    echo "cert: $CERT"
+    echo "key:  $KEY  (0600 — other local users cannot read it)"
+    echo
+    echo "Add to nono-cedar-pdp.toml:"
+    echo
+    echo "    [tls]"
+    echo "    cert = \"$CERT\""
+    echo "    key  = \"$KEY\""
+    echo
+    echo "and point the nono profile at the LITERAL bind address, never a hostname:"
+    echo
+    echo '    "url": "https://127.0.0.1:8181/v1/approve"'
+    echo
+    echo '(`localhost` resolves ::1 before 127.0.0.1 on macOS, so a squatter on the'
+    echo " other loopback address answers every localhost request. README.md has the"
+    echo " long version, and what TLS does not buy.)"
+
 # Copy the starter pack into policy_dir; never overwrites.
 install-policies dir="~/.config/nono-cedar-pdp/policies":
     #!/usr/bin/env bash
