@@ -459,6 +459,13 @@ fn fenced_block_containing(needle: &str) -> String {
 /// "would a verifier that trusts this CA accept this leaf for `127.0.0.1`", which
 /// is exactly what the operator's platform verifier will be asked once the anchor
 /// is installed.
+///
+/// Measured while mutating the block, and recorded because it bounds what this
+/// test can claim: dropping an address from `subjectAltName` reddens it
+/// (`NotValidForName`), and naming a *different* EKU reddens it ("does not allow
+/// extended key usage for server authentication") — but deleting the
+/// `extendedKeyUsage` line altogether does **not**, because an absent EKU extension
+/// is unrestricted. That one is held by the README needle above instead.
 #[test]
 fn the_documented_openssl_fallback_mints_a_leaf_a_verifier_accepts() {
     use rustls::client::danger::ServerCertVerifier;

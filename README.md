@@ -465,10 +465,12 @@ openssl req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 \
   -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
   -addext "keyUsage=critical,keyCertSign,cRLSign"
 
-# 2. The leaf. Both extensions are load-bearing: without serverAuth the verifier
-#    refuses it outright, and an address missing from the SANs is refused for that
-#    address (NotValidForName) — which you find out at the next startup, after the
-#    admin-password step below.
+# 2. The leaf. Neither of these failures shows up until the daemon's next startup,
+#    after the admin-password step below. An address missing from the SANs is
+#    refused for that address (NotValidForName). An EKU naming anything but
+#    serverAuth is refused outright — measured; an EKU extension left out
+#    altogether is merely unrestricted, so this line is what stops a leaf minted
+#    for some other purpose from being reused here.
 openssl req -newkey rsa:2048 -nodes -keyout key.pem -out leaf.csr \
   -subj "/CN=nono-cedar-pdp"
 openssl x509 -req -in leaf.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial \
