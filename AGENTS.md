@@ -101,12 +101,17 @@ disposable half.
 
 ## Upstream source — read it at `../nono`
 
-`nolabs-ai/nono` is cloned at `../nono` — a sibling of this checkout — as a **read-only
-reference**, so any claim about the upstream contract can be checked against source rather
-than recalled. If it is missing:
+`nolabs-ai/nono` is cloned as a **sibling of the primary checkout** — `../nono` from there
+— as a **read-only reference**, so any claim about the upstream contract can be checked
+against source rather than recalled. If it is missing:
 `git clone https://github.com/nolabs-ai/nono.git ../nono`. It is not a fork, not a remote
 of this repo, and not a build input — ADR-001 keeps `nono` a dev-dependency, and
 `tests/conformance.rs` stays the mechanical drift guard.
+
+`../nono` holds **from the primary checkout only**. `wt` worktrees no longer live beside
+the repo (house default since 2026-07-26 puts them under `~/dev/worktrees/`, off the
+synced tree), so from inside one that relative path silently resolves to nothing —
+address the clone by its own path there rather than assuming the sibling.
 
 **It is checked out detached at `v0.69.0`, deliberately — do not switch it to `main` and
 read on.** Upstream tags releases on a release branch and had not merged v0.69.0 back:
