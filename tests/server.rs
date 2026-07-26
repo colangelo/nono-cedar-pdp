@@ -224,29 +224,78 @@ fn http(addr: std::net::SocketAddr, request: &str) -> String {
 /// operator runs their own daemon, so a test that claimed it would fail on a
 /// developer's machine. What matters here is that the address `serve` is handed is
 /// the address that answers.
+///
+/// **The readiness probe has to prove it reached *this* state, not merely that
+/// something on the port answered.** Releasing the probe socket is precisely what
+/// makes the port available to `serve` — and to everything else asking the kernel
+/// for an ephemeral port at that moment — so a bare TCP connect is satisfied by a
+/// transient foreign listener while our own bind is still losing the race. The
+/// marker is this engine's own bootstrap instant, read out of `/healthz` in
+/// process first: nothing else can be reporting it. A lost race is a retry, since
+/// it says nothing about the listener under test. `tests/cli.rs` removed the guess
+/// entirely by letting the kernel choose the port and reading the answer back out
+/// of the daemon's log; in process there is no such channel, so this is the
+/// closest sound equivalent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_real_listener_answers_a_posted_envelope() {
+    const ATTEMPTS: u32 = 5;
+
     let dir = tempfile::tempdir().unwrap();
     let state = state(&dir);
+    let (_, own) = healthz_of(state.clone()).await;
+    let loaded_at = own["loaded_at"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no loaded_at to identify this daemon by: {own}"))
+        .to_string();
 
-    // Take an ephemeral port and release it, so `serve` does its own bind.
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = probe.local_addr().unwrap();
-    drop(probe);
+    let mut bound = None;
+    for _ in 0..ATTEMPTS {
+        // Take an ephemeral port and release it, so `serve` does its own bind.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
 
-    let serving = tokio::spawn(async move { server::serve(state, addr).await });
+        let serving = {
+            let state = state.clone();
+            tokio::spawn(async move { server::serve(state, addr).await })
+        };
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200))
-        .is_err()
-    {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "serve never accepted a connection on {addr}"
-        );
-        assert!(!serving.is_finished(), "serve returned instead of serving");
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let ready = loop {
+            if serving.is_finished() {
+                // The bind lost the race for this port. Nothing to learn from it.
+                break false;
+            }
+            if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200))
+                .is_ok()
+            {
+                let health = tokio::task::spawn_blocking(move || {
+                    http(
+                        addr,
+                        &format!(
+                            "GET /healthz HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+                        ),
+                    )
+                })
+                .await
+                .unwrap();
+                break health.contains(&loaded_at);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "serve never accepted a connection on {addr}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        if ready {
+            bound = Some((addr, serving));
+            break;
+        }
+        serving.abort();
     }
+    let (addr, serving) = bound.unwrap_or_else(|| {
+        panic!("no ephemeral port survived {ATTEMPTS} attempts between the probe and the bind")
+    });
 
     let body = command_body("git", &[SHIM_GIT, "status"]);
     let response = tokio::task::spawn_blocking(move || {

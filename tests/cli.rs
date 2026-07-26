@@ -8,7 +8,7 @@
 //! in-process.
 #![allow(clippy::unwrap_used, clippy::panic)]
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::process::Command;
@@ -282,94 +282,236 @@ fn a_valid_policy_directory_reports_the_count_and_exits_zero() {
     );
 }
 
-/// A free loopback address, released before it is handed out. Racy in principle;
-/// in practice nothing else claims an ephemeral port between these two lines, and
-/// the alternative — a hard-coded port — collides with a developer's own daemon.
-fn free_loopback_addr() -> SocketAddr {
-    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = probe.local_addr().unwrap();
-    drop(probe);
-    addr
+// `free_loopback_addr` — bind `127.0.0.1:0`, read the port, release it, hand it
+// out — used to live here and has no replacement on purpose. It cannot hand out a
+// *reserved* port: releasing the probe socket is exactly what makes the port
+// available to the daemon and to everything else asking the kernel for one at the
+// same moment. Every test that wanted a daemon on a free port now lets the kernel
+// choose one and reads the answer back ([`start_daemon`]); every test that wants a
+// *specific* address holds it for the whole run. Neither guesses.
+
+/// A running daemon: the address it **actually bound**, and its own output
+/// streamed while it runs rather than collected after it dies.
+///
+/// Streaming is what makes the address knowable. The alternative every version
+/// of this file used before — take an ephemeral port, release it, hand it to the
+/// daemon — cannot hand out a *reserved* port, because releasing the probe socket
+/// is precisely what makes the port available to the daemon and to everything
+/// else asking the kernel for one at the same moment. Worse, the liveness probe
+/// that followed treated "something accepted a connection on this port" as "our
+/// child bound this port", so a transient foreign listener satisfied it and the
+/// caller was handed an address its own child never bound. Letting the kernel
+/// choose (`bind = "127.0.0.1:0"`) and reading the answer back out of the
+/// daemon's own `listening` line removes the guess entirely: nobody else can hold
+/// a port this daemon has bound.
+struct Daemon {
+    addr: SocketAddr,
+    child: Option<std::process::Child>,
+    logs: std::sync::Arc<std::sync::Mutex<String>>,
+    readers: Vec<std::thread::JoinHandle<()>>,
 }
 
-/// Start a daemon listening on an ephemeral loopback port, returning the address
-/// it bound and the running child. Panics — with the daemon's own output — if it
-/// exits during startup or never listens.
-///
-/// The retry is the point. [`free_loopback_addr`] cannot hand out a *reserved*
-/// port: releasing the probe socket is precisely what makes the port available
-/// to the daemon, and to everything else asking the kernel for an ephemeral port
-/// at the same moment. Several tests in this file allocate one in parallel, so
-/// the window is small but real — measured at roughly one run in ten once two
-/// more allocators joined the file. Retrying on `Address already in use`
-/// specifically keeps every guarantee the caller asserts (the daemon still has
-/// to bind exactly the address its configuration named) while removing a flake
-/// that says nothing about the daemon.
-fn start_daemon_on_a_free_port(
-    config_dir: &Path,
-    config_body: impl Fn(SocketAddr) -> String,
-) -> (SocketAddr, std::process::Child) {
-    const ATTEMPTS: u32 = 5;
-    for attempt in 1..=ATTEMPTS {
-        let addr = free_loopback_addr();
-        let config = config_dir.join("config.toml");
-        std::fs::write(&config, config_body(addr)).unwrap();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_nono-cedar-pdp"))
-            .arg("serve")
-            .arg("--config")
-            .arg(&config)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
+impl Daemon {
+    /// Everything the daemon has written so far.
+    fn snapshot(&self) -> String {
+        self.logs.lock().unwrap().clone()
+    }
 
-        // Wait for the listener rather than sleeping: a fixed sleep is either
-        // flaky or slow, and an exit here is a startup failure to report as one.
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                let output = child.wait_with_output().unwrap();
-                let text = format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                if text.to_lowercase().contains("address already in use") && attempt < ATTEMPTS {
+    /// Stop it and return everything it wrote, readers joined so the output is
+    /// complete rather than whatever had been drained when the kill landed.
+    fn stop(&mut self) -> String {
+        if let Some(mut child) = self.child.take() {
+            child.kill().ok();
+            child.wait().ok();
+        }
+        for reader in self.readers.drain(..) {
+            reader.join().ok();
+        }
+        self.snapshot()
+    }
+}
+
+/// A test that panics part-way through must not leave a daemon holding a port.
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Drain one of the child's pipes into the shared buffer, line by line so a
+/// chunk boundary cannot split a UTF-8 character out of a path or a message.
+fn pump(
+    source: impl std::io::Read + Send + 'static,
+    sink: std::sync::Arc<std::sync::Mutex<String>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(source).lines() {
+            match line {
+                Ok(line) => {
+                    let mut sink = sink.lock().unwrap();
+                    sink.push_str(&line);
+                    sink.push('\n');
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+/// ANSI escape sequences removed. `tracing_subscriber`'s default formatter
+/// colours field names even when stdout is a pipe, so the literal `bind=` never
+/// appears in the raw stream.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        if chars.next() == Some('[') {
+            for c in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&c) {
                     break;
                 }
-                panic!("the daemon exited during startup ({status}): {text}");
             }
-            if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
-                return (addr, child);
-            }
-            if Instant::now() >= deadline {
-                child.kill().ok();
-                panic!("the daemon never listened on {addr}");
-            }
-            std::thread::sleep(Duration::from_millis(50));
         }
     }
-    panic!("no ephemeral port survived {ATTEMPTS} attempts between the probe and the bind");
+    out
+}
+
+/// The address out of the daemon's own `listening` line, which it writes
+/// immediately after a successful bind.
+fn bound_addr(logs: &str) -> Option<SocketAddr> {
+    let plain = strip_ansi(logs);
+    let rest = plain.split_once("listening bind=")?.1;
+    rest.chars()
+        .take_while(|c| !c.is_whitespace())
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+/// Start a daemon and wait until it reports the address it bound. Panics — with
+/// the daemon's own output — if it exits during startup or never gets there.
+///
+/// `config_body` must ask for an ephemeral port (`bind = "127.0.0.1:0"`); a test
+/// that needs a *specific* address is testing something else and should hold the
+/// port rather than guess it, the way
+/// `a_daemon_binds_exactly_the_address_its_configuration_names` does.
+fn start_daemon(config_dir: &Path, config_body: &str) -> Daemon {
+    let config = config_dir.join("config.toml");
+    std::fs::write(&config, config_body).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nono-cedar-pdp"))
+        .arg("serve")
+        .arg("--config")
+        .arg(&config)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let readers = vec![
+        pump(child.stdout.take().unwrap(), std::sync::Arc::clone(&logs)),
+        pump(child.stderr.take().unwrap(), std::sync::Arc::clone(&logs)),
+    ];
+    let mut daemon = Daemon {
+        // Replaced below before the daemon is handed to a caller; a placeholder
+        // rather than an `Option` so `Drop` still reaps the child on every panic
+        // path in the loop.
+        addr: "127.0.0.1:0".parse().unwrap(),
+        child: Some(child),
+        logs,
+        readers,
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let logs = daemon.snapshot();
+        match bound_addr(&logs) {
+            Some(addr) if addr.port() == 0 => panic!(
+                "the daemon reported the address its configuration named rather than the \
+                 one it bound, so nothing can reach a daemon told to take a free port: \
+                 {logs}"
+            ),
+            // The log line lands after the bind, so this connect is a formality
+            // — but a failure here is a far clearer error than the same failure
+            // inside whichever test asked for the daemon.
+            Some(addr) if TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok() => {
+                daemon.addr = addr;
+                return daemon;
+            }
+            _ => {}
+        }
+        if let Some(child) = daemon.child.as_mut() {
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("the daemon exited during startup ({status}): {logs}");
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!("the daemon never reported a bound address: {logs}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `bind = "127.0.0.1:0"` asks the kernel for whatever port is free, and the
+/// daemon has to report **the one it got** rather than the placeholder it was
+/// configured with. Without that, nothing downstream can reach it, and every
+/// test wanting a daemon on a free port is forced to guess an address instead —
+/// which is a guess that can be wrong, and was: a released probe port can be
+/// taken by anything else on the machine before the daemon binds it.
+#[test]
+fn a_daemon_told_to_bind_port_zero_reports_the_port_it_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let policies = copy_shipped_policies(dir.path());
+    let mut daemon = start_daemon(
+        dir.path(),
+        &format!(
+            "policy_dir = \"{}\"\naudit_log = \"{}\"\nbind = \"127.0.0.1:0\"\n",
+            policies.display(),
+            dir.path().join("decisions.jsonl").display()
+        ),
+    );
+    let addr = daemon.addr;
+    let health = get(addr, "/healthz");
+    let logs = daemon.stop();
+
+    assert_ne!(
+        addr.port(),
+        0,
+        "the reported port must be the one the kernel handed out: {logs}"
+    );
+    assert!(
+        health.starts_with("HTTP/1.1 200 OK"),
+        "the reported address must be the one that answers: {health:?} (daemon log: {logs})"
+    );
 }
 
 /// Startup must fail *before* the socket exists: a daemon that binds first and
 /// validates second answers requests for the window in between, and nono treats a
 /// connection refusal (fail closed) very differently from a 503 or a hang.
 ///
-/// Proven three ways, because the process is gone by the time the assertions run:
-/// the exit is non-zero and names the policy problem; the `listening` line the
-/// daemon logs immediately after a successful bind never appears; and the address
-/// is still free afterwards.
+/// The observable is the `listening` line, which the daemon writes immediately
+/// after a successful bind and which now carries the address it actually got —
+/// so its absence is exact, and it needs no port of its own. That is why the
+/// configuration asks for an ephemeral one: two assertions here used to reach for
+/// a *specific* free address (nothing answers on it afterwards; it can still be
+/// bound), and both were statements about the state of a global port at an
+/// instant this test does not control. Anything else on the machine taking that
+/// port turned a passing daemon into a red test. The ordering half — that the
+/// load is reported before the bind is even attempted — is
+/// `a_policy_load_failure_is_reported_before_the_port_is_touched`, which holds
+/// its port for the whole run and so states it without guessing.
 #[test]
 fn a_policy_load_failure_exits_without_binding_a_port() {
     let policies = policy_dir_with(&[]);
-    let addr = free_loopback_addr();
     let dir = tempfile::tempdir().unwrap();
 
     let (ok, output) = serve_from(
         dir.path(),
         &format!(
-            "policy_dir = \"{}\"\naudit_log = \"{}\"\nbind = \"{addr}\"\n",
+            "policy_dir = \"{}\"\naudit_log = \"{}\"\nbind = \"127.0.0.1:0\"\n",
             policies.path().display(),
             dir.path().join("decisions.jsonl").display()
         ),
@@ -389,14 +531,50 @@ fn a_policy_load_failure_exits_without_binding_a_port() {
         "the daemon logs `listening` right after a successful bind, so this run bound \
          a port before failing: {output}"
     );
-    assert!(
-        TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_err(),
-        "something is still listening on {addr} after a failed startup"
+}
+
+/// The daemon binds **exactly** the address its configuration names, and nothing
+/// else. `a_daemon_told_to_bind_port_zero_reports_the_port_it_bound` cannot say
+/// this — it reads the address back out of the daemon's own log, so a daemon that
+/// ignored `bind` entirely would satisfy it — and every ephemeral-port test now
+/// lets the kernel choose, so the guarantee needs its own home.
+///
+/// Stated by holding the port for the whole run: a daemon that binds the
+/// configured address collides and says so, naming it. A daemon that binds
+/// anything else does not. No guess about a free port is involved, which is the
+/// property that made the previous version of this claim — asserting a daemon
+/// answers on a *released* probe address — flake.
+#[test]
+fn a_daemon_binds_exactly_the_address_its_configuration_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let policies = copy_shipped_policies(dir.path());
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = occupied.local_addr().unwrap();
+
+    let (ok, output) = serve_from(
+        dir.path(),
+        &format!(
+            "policy_dir = \"{}\"\naudit_log = \"{}\"\nbind = \"{addr}\"\n",
+            policies.display(),
+            dir.path().join("decisions.jsonl").display()
+        ),
+        None,
     );
     assert!(
-        TcpListener::bind(addr).is_ok(),
-        "{addr} is not free after a failed startup"
+        !ok,
+        "the configured address is held, so the bind must fail: {output}"
     );
+    assert!(
+        output.to_lowercase().contains("address already in use"),
+        "the daemon must have tried the address its configuration named — anything \
+         else means `bind` is not what it binds: {output}"
+    );
+    assert!(
+        output.contains(&addr.to_string()),
+        "the failure must name the address, or an operator cannot tell which one \
+         was taken: {output}"
+    );
+    drop(occupied);
 }
 
 // A test asserting the documented default `127.0.0.1:8181` by occupying it used to live
@@ -406,8 +584,9 @@ fn a_policy_load_failure_exits_without_binding_a_port() {
 // running, or not, depending on timing. Deliberately not replaced: the default *value* is
 // pinned by `config::tests::loads_minimal_config_with_defaults`, and that the daemon binds
 // exactly the address its configuration names is pinned by
-// `a_started_daemon_answers_healthz_and_approve_over_a_real_socket` on an ephemeral port.
-// Together those cover the guarantee without claiming a port a developer may be using.
+// `a_daemon_binds_exactly_the_address_its_configuration_names`, which holds the port
+// rather than betting on a free one. Together those cover the guarantee without claiming
+// a port a developer may be using.
 
 /// The ordering proof the previous tests cannot give on their own: hold the port the
 /// daemon is configured to bind, and the failure it reports still has to be the
@@ -437,6 +616,11 @@ fn a_policy_load_failure_is_reported_before_the_port_is_touched() {
     assert!(
         !output.to_lowercase().contains("address already in use"),
         "the daemon reached the listener before validating its policies: {output}"
+    );
+    assert!(
+        !output.contains("listening"),
+        "the daemon logs `listening` right after a successful bind, so this run bound \
+         a port before failing: {output}"
     );
     drop(occupied);
 }
@@ -731,27 +915,32 @@ fn post(addr: SocketAddr, path: &str, body: &str) -> String {
 
 /// The whole startup sequence, then real requests over a real socket: every other
 /// HTTP test in this repo drives the axum `Router` in-process, so nothing else
-/// proves that `serve` binds anything, that it binds the *configured* address, or
-/// that a decision made over a socket reaches the configured audit log.
+/// proves that `serve` binds anything, or that a decision made over a socket
+/// reaches the configured audit log.
 ///
-/// Pinned to an ephemeral port rather than the documented default `127.0.0.1:8181`
-/// deliberately: 8181 is where the README tells an operator to run their own
-/// daemon, so claiming it in a test would fail on a developer's machine. The
-/// default itself is pinned by `config::tests::loads_minimal_config_with_defaults`,
-/// and the assertion below that the daemon answers on exactly the address its
-/// configuration named closes the gap between the two.
+/// The kernel picks the port rather than the test: `127.0.0.1:8181` is where the
+/// README tells an operator to run their own daemon, so claiming it here would
+/// fail on a developer's machine — and *guessing* a free one, which is what this
+/// test used to do, hands out an address anything else on the machine may take in
+/// the window before the daemon binds it. The default value is pinned by
+/// `config::tests::loads_minimal_config_with_defaults` and the configured address
+/// by `a_daemon_binds_exactly_the_address_its_configuration_names`; neither claim
+/// belongs to this test, which is about what happens over the wire once a daemon
+/// is up.
 #[test]
 fn a_started_daemon_answers_healthz_and_approve_over_a_real_socket() {
     let dir = tempfile::tempdir().unwrap();
     let policies = copy_shipped_policies(dir.path());
     let audit_log = dir.path().join("state/decisions.jsonl");
-    let (addr, mut child) = start_daemon_on_a_free_port(dir.path(), |addr| {
-        format!(
-            "policy_dir = \"{}\"\naudit_log = \"{}\"\nbind = \"{addr}\"\n\n[agents]\ncedar = \"claude-code\"\n",
+    let mut daemon = start_daemon(
+        dir.path(),
+        &format!(
+            "policy_dir = \"{}\"\naudit_log = \"{}\"\nbind = \"127.0.0.1:0\"\n\n[agents]\ncedar = \"claude-code\"\n",
             policies.display(),
             audit_log.display()
-        )
-    });
+        ),
+    );
+    let addr = daemon.addr;
     let health = get(addr, "/healthz");
 
     let approve = post(
@@ -773,18 +962,8 @@ fn a_started_daemon_answers_healthz_and_approve_over_a_real_socket() {
         .unwrap(),
     );
 
-    child.kill().unwrap();
-    let output = child.wait_with_output().unwrap();
-    let logs = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let logs = daemon.stop();
 
-    assert!(
-        logs.contains(&addr.to_string()),
-        "the daemon must listen on the address its configuration named: {logs}"
-    );
     assert!(
         health.starts_with("HTTP/1.1 200 OK"),
         "GET /healthz over a real socket: {health:?} (daemon log: {logs})"
@@ -878,16 +1057,16 @@ fn a_symlinked_policy_dir_is_resolved_before_serving() {
     let real = copy_shipped_policies(dir.path());
     let link = dir.path().join("link");
     std::os::unix::fs::symlink(&real, &link).unwrap();
-    let (addr, mut child) = start_daemon_on_a_free_port(dir.path(), |addr| {
-        format!(
-            "policy_dir = \"{}\"\naudit_log = \"{}\"\nbind = \"{addr}\"\n",
+    let mut daemon = start_daemon(
+        dir.path(),
+        &format!(
+            "policy_dir = \"{}\"\naudit_log = \"{}\"\nbind = \"127.0.0.1:0\"\n",
             link.display(),
             dir.path().join("decisions.jsonl").display()
-        )
-    });
-    let health = get(addr, "/healthz");
-    child.kill().unwrap();
-    child.wait().unwrap();
+        ),
+    );
+    let health = get(daemon.addr, "/healthz");
+    daemon.stop();
 
     assert!(
         !health.is_empty(),

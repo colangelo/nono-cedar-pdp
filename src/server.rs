@@ -373,6 +373,13 @@ fn rfc3339(t: std::time::SystemTime) -> Option<String> {
 
 pub async fn serve(state: AppState, bind: SocketAddr) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
+    // The address the kernel gave us, not the one we asked for. They differ only
+    // when `bind` names port 0 — and then the configured value is a placeholder
+    // that reaches nothing, so logging it would make the daemon unaddressable to
+    // anyone reading its own output. `?` rather than a fallback: a listener whose
+    // address cannot be read is not one to serve on quietly, and nothing has been
+    // accepted yet, so the refusal costs no request.
+    let bind = listener.local_addr()?;
     tracing::info!(%bind, "listening");
     axum::serve(listener, router(state)).await
 }
