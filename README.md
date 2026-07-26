@@ -103,9 +103,36 @@ mistaken for a deployment.
 
 Endpoints:
 
-- `POST /v1/approve` — the decision endpoint. Always `200` with an allow or a deny;
-  a malformed body gets *our* deny reason rather than axum's `400`, so the reason
-  lands in nono's audit trail.
+- `POST /v1/approve` — the decision endpoint. Every request that gets as far as being
+  a *question* is answered `200` with an allow or a deny; a malformed body gets *our*
+  deny reason rather than axum's `400`, so the reason lands in nono's audit trail.
+
+  Two headers are checked **before** the body is read, because a request that fails
+  them cannot have come from nono:
+
+  - `Content-Type: application/json` is required — nono's webhook client always sends
+    it. Anything else, or nothing, is `415` and is **not** a decision: no deny reason
+    (nono did not ask, so none is owed) and no audit line. Parameters are fine
+    (`application/json; charset=utf-8`), and the type is compared case-insensitively.
+  - A request carrying an `Origin` header is `403`, even with a correct content-type.
+    nono never sends one; a browser always does. The two checks are independent on
+    purpose, so neither is load-bearing alone.
+
+  This is what closes the drive-by vector: a CORS-*simple* cross-origin POST — the
+  kind a page you merely visit can make without your involvement — may only use
+  `text/plain`, `application/x-www-form-urlencoded` or `multipart/form-data`, so
+  requiring JSON forces a preflight, and this service sends no CORS headers, so the
+  preflight fails and the POST never arrives. Both refusals are logged at `WARN` with
+  the observed values, so you can see the endpoint being probed.
+
+  Driving the endpoint by hand? Add the header — one flag:
+
+  ```bash
+  curl -s -X POST http://127.0.0.1:8181/v1/approve \
+    -H 'Content-Type: application/json' \
+    --data @tests/fixtures/git-status.json
+  ```
+
 - `GET /healthz` — `{"generation":1,"policies":5,"policy_dir":"/Users/you/.config/nono-cedar-pdp/policies"}`.
   `503` if no policies are loaded, so "PDP broken" is distinguishable from
   "policy said no".
@@ -140,9 +167,33 @@ Each decision appends one line to the audit log:
 {"ts":"2026-07-25T14:36:37.569566Z","request_id":"tool-sandbox-approve-git-1784990197567145000",
  "session_id":"35abc0894927242e","backend":"cedar","agent":"claude-code",
  "principal":"Nono::Caller::\"session\"","action":"launchCommand",
- "resource":"git [/private/.../shims/git status]","decision":"allow",
- "matched":["10-git:git-read-only"],"reason":"permitted by 10-git:git-read-only","eval_us":1670}
+ "resource":"git [/private/.../shims/git status]","child_pid":13820,
+ "intercept_rule":"status","rule_label":null,"user_agent":"nono-cli/0.69.0",
+ "decision":"allow","matched":["10-git:git-read-only"],
+ "reason":"permitted by 10-git:git-read-only","eval_us":1670}
 ```
+
+The key set is identical on every line, so a consumer can tell "not known" from "not
+recorded": a command line carries a null `rule_label`, an endpoint line a null
+`intercept_rule`, and a line for a request that never parsed carries nulls for
+`child_pid` and both rule fields.
+
+`user_agent` is what the caller presented, recorded verbatim — **evidence, not
+verification**. Browser JavaScript cannot set `User-Agent` at all, so a line whose
+agent is absent or unexpected is a signal worth having; a local process running as
+your user sets it to anything it likes, so a line whose agent reads `nono-cli/0.69.0`
+proves nothing. It does not authenticate the caller and is not a credential.
+
+**Raising the log level puts this content into a stream that has none of the log's
+protections.** At the default level the per-decision log line carries the identifiers
+and the outcome only — `request_id`, `session_id`, `backend`, the action, allow/deny,
+the matched policy ids and the timing — which is enough to correlate it with the audit
+line. `RUST_LOG=debug` adds a second event carrying the resource summary, i.e. the
+command line an agent attempted or the API path it requested. That is genuinely the
+first thing you want when a policy will not match, but **DEBUG output inherits the
+audit log's sensitivity without its permissions**: the log is `0600`, while stdout goes
+wherever you redirected it — a shared journal, a log aggregator, terminal scrollback.
+The audit log is unchanged at any level and remains the complete record.
 
 The log is safe to rotate under a running daemon. An append handle survives a
 `rename`, and its writes keep succeeding, so the naive version silently stops
@@ -470,6 +521,31 @@ suspicious allow is traceable. That role is why the log is kept `0600`, why the 
 notices a rotation instead of writing into a detached inode, and why its path belongs
 outside every write grant in your profile (see
 [Keep the policy directory out of the sandbox](#keep-the-policy-directory-out-of-the-sandbox)).
+
+### What the header checks do and do not buy
+
+The decide endpoint refuses requests whose shape proves they did not come from nono —
+no JSON content-type is `415`, an `Origin` header is `403` (see
+[Endpoints](#quick-start) above) — and neither refusal writes an audit line, because a
+request nono never made must not be able to put one there.
+
+**But none of this authenticates nono.** The checks close the *remote* case completely:
+a page you merely visit cannot reach the endpoint at all, because the content-type it
+would need forces a CORS preflight this service fails. What remains is the local case,
+and it remains fully open: a process running as your user presents
+`Content-Type: application/json`, omits `Origin`, sets `User-Agent` to
+`nono-cli/0.69.0`, and can therefore still forge an audit record that is
+indistinguishable from a real one. The recorded `User-Agent` is evidence, **not
+verification** — read it as "what was presented", never as "who this was".
+
+That residual is inherent while the webhook carries no credential: nono 0.69.0's
+webhook config has no field for a token or for custom headers, so a shared secret is
+not merely unimplemented, it is impossible from this side. Closing it needs an upstream
+change — a bearer token, or a unix socket where peer credentials can be read (macOS
+exposes no peer uid for TCP loopback). Note also what is *not* here and why: there is
+no rate limit, because nono maps any non-2xx to `Denied`, so a limit would convert
+"someone can pollute the log" into "someone can deny your agent's legitimate work",
+which is the worse failure for a fail-closed daemon.
 
 ## Docs
 

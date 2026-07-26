@@ -242,6 +242,34 @@ fn the_documented_caveats_and_risks_are_still_in_the_readme() {
         ),
         // The raw-path caveat.
         ("endpoint paths arrive raw", "denied outright"),
+        // The header gate: what an operator driving the endpoint by hand must send,
+        // and the one-flag fix, since the failure mode is a 415 rather than a deny.
+        (
+            "the decide endpoint requires a JSON content-type",
+            "Content-Type: application/json",
+        ),
+        (
+            "the one-flag fix for anyone POSTing by hand",
+            "-H 'Content-Type: application/json'",
+        ),
+        ("a request carrying an Origin is refused", "`Origin`"),
+        // The residual, in the same words as the spec and the module docs: recording
+        // the User-Agent must never read as authenticating the caller.
+        (
+            "none of this authenticates nono",
+            "none of this authenticates nono",
+        ),
+        (
+            "a local process as the same user can still forge a record",
+            "forge an audit record",
+        ),
+        ("the User-Agent is evidence, not verification", "not verification"),
+        // Raising the log level relocates the audit log's content into a stream with
+        // none of its permissions.
+        (
+            "DEBUG output has the audit log's sensitivity without its permissions",
+            "without its permissions",
+        ),
         // Impersonation risk, loopback-only, and the planned mitigation.
         (
             "nono cannot authenticate the decider",

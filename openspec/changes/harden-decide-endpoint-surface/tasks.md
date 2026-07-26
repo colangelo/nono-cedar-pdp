@@ -35,9 +35,9 @@ tracing max-level trap that once made filtered runs lie.
 
 ## 5. Documentation
 
-- [ ] 5.1 README: the header requirement (and the one-flag fix for anyone POSTing by hand); that raising to DEBUG puts attempted command lines into an unprotected stream; and the residual stated plainly — **none of this authenticates nono**, a local process as the same user can still forge records, and closing that needs an upstream bearer token or unix socket
-- [ ] 5.2 `src/server.rs` module docs: the CORS-simple mechanism (D1) and why `Origin` is checked independently (D2), so a later reader does not "simplify" either away
-- [ ] 5.3 Confirm no wording anywhere implies the daemon identifies its caller
+- [x] 5.1 README: the header requirement (and the one-flag fix for anyone POSTing by hand); that raising to DEBUG puts attempted command lines into an unprotected stream; and the residual stated plainly — **none of this authenticates nono**, a local process as the same user can still forge records, and closing that needs an upstream bearer token or unix socket
+- [x] 5.2 `src/server.rs` module docs: the CORS-simple mechanism (D1) and why `Origin` is checked independently (D2), so a later reader does not "simplify" either away
+- [x] 5.3 Confirm no wording anywhere implies the daemon identifies its caller
 
 ## 6. Verification
 
