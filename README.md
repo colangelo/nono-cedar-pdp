@@ -455,15 +455,17 @@ The same shape with more steps — a local CA, a leaf signed by it, and the CA
 installed as an anchor. A bare self-signed leaf is not a shortcut, for the reason
 just above.
 
-The whole block is one subshell, so `set -e` and the refusal below cannot take your
-own shell down with them, and the `TLS_DIR`/`CA_DIR` it works in are two *different*
-directories on purpose — the reason is under the block.
+The minting half is one subshell, so `set -e` and the refusal inside it cannot take
+your own shell down with them. The two directories are set outside it and exported,
+because the `add-trusted-cert` step after the block is a separate command that has to
+name the same `$CA_DIR` — and they are two *different* directories on purpose, for the
+reason under the block.
 
 ```bash
+export TLS_DIR="${TLS_DIR:-$HOME/.config/nono-cedar-pdp/tls}"   # what [tls] names
+export CA_DIR="${CA_DIR:-$HOME/.config/nono-cedar-pdp/ca}"      # the CA, kept apart
 (
 set -euo pipefail
-TLS_DIR="${TLS_DIR:-$HOME/.config/nono-cedar-pdp/tls}"   # what [tls] names
-CA_DIR="${CA_DIR:-$HOME/.config/nono-cedar-pdp/ca}"      # the CA, kept apart
 
 # 0. Never overwrite, for the reason `just mint-cert` gives: the daemon may be
 #    serving the old pair right now, your own CA may have signed it, and the key

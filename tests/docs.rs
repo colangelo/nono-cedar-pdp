@@ -700,6 +700,104 @@ fn the_documented_openssl_fallback_refuses_to_overwrite_an_existing_pair() {
     }
 }
 
+/// The anchor step has to install the CA the block before it actually wrote.
+///
+/// It is the one part of the fallback no test can run for real — it needs an
+/// administrator — and the one that costs a password to get wrong: pointed at a
+/// path nothing was written to, `security add-trusted-cert` installs nothing, and
+/// the operator learns that at the daemon's next startup from a refusal about the
+/// *leaf*, which does not mention the anchor at all.
+///
+/// It is a *separate shell command* from the block that mints, so it depends on
+/// `$CA_DIR` surviving between them. Neither `tests/docs.rs` nor a reader notices
+/// that if the environment already carries the variable — so this test deliberately
+/// sets neither `TLS_DIR` nor `CA_DIR`, and overrides `HOME` instead, which is the
+/// operator's situation exactly: whatever the block's own defaults are, the anchor
+/// step must resolve to the same place. Measured while writing it: with the
+/// assignments inside the minting subshell the anchor step ran on `/ca.pem`.
+///
+/// `sudo` and `security` are shimmed onto `PATH` — the first to run its argument
+/// without privileges, the second to record what it was handed. Shimming rather
+/// than parsing, so a change to the command's flags cannot make this pass by
+/// matching a string that no longer means what it did.
+#[test]
+fn the_documented_anchor_step_installs_the_ca_the_block_wrote() {
+    let mint = fenced_block_containing("nono-cedar-pdp local CA");
+    let anchor = fenced_block_containing("add-trusted-cert");
+    let home = tempfile::tempdir().unwrap();
+    let bin = home.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let recorded = home.path().join("anchored");
+
+    let shim = |name: &str, body: String| {
+        use std::os::unix::fs::PermissionsExt;
+        let path = bin.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    shim("sudo", "#!/bin/sh\nexec \"$@\"\n".to_string());
+    // The last argument is the file being trusted, whatever the flags before it.
+    shim(
+        "security",
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do :; done\nprintf '%s' \"$a\" > '{}'\n",
+            recorded.display()
+        ),
+    );
+
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(format!("{mint}\n{anchor}"))
+        .env("HOME", home.path())
+        .env_remove("TLS_DIR")
+        .env_remove("CA_DIR")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "the documented mint-then-anchor sequence does not run: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let anchored = std::fs::read_to_string(&recorded)
+        .unwrap_or_else(|e| panic!("the anchor step ran no `security` command ({e})"));
+    let anchored = std::path::PathBuf::from(&anchored);
+    assert!(
+        anchored.is_file(),
+        "the documented anchor step installs {anchored:?}, which the block before it \
+         never wrote — so it trusts nothing, silently, after asking for an admin \
+         password. The operator finds out at the daemon's next startup, from a \
+         refusal that talks about the leaf."
+    );
+    let pem = std::fs::read(&anchored).unwrap();
+    let certs = rustls_pemfile::certs(&mut pem.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|e| panic!("{anchored:?} is not a certificate: {e}"));
+    assert_eq!(
+        certs.len(),
+        1,
+        "the anchor step must install exactly one certificate: {anchored:?}"
+    );
+    // The CA and not the leaf: installing the leaf is the mistake the section
+    // above this block exists to talk an operator out of, so the block must not
+    // then do it.
+    assert!(
+        home.path().join(".config/nono-cedar-pdp/ca/ca.pem") == anchored,
+        "the anchor step installs {anchored:?} rather than the CA the block minted \
+         — a leaf in a keychain is not an anchor, which is the whole point of this \
+         section"
+    );
+}
+
 const JUSTFILE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Justfile"));
 
 /// The body of one `just` recipe, so a needle satisfied by a *different* recipe

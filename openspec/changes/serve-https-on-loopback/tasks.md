@@ -99,7 +99,13 @@ test today; deleting one instead of repointing it removes a rule from the suite.
   and that refusal cannot take a pasting operator's shell down. `tests/docs.rs` asserts
   `$TLS_DIR` holds `cert.pem` and `key.pem` and **nothing else** — the whole set, because a
   leftover CSR beside the daemon is the same mistake made smaller — and the
-  `security add-trusted-cert` step, the one part no test can run, is pinned at `$CA_DIR/ca.pem`
+  `security add-trusted-cert` step, the one part no test can run for real, is now **run
+  with `sudo` and `security` shimmed onto `PATH`** — which immediately caught a defect the
+  subshell had just introduced: the two directory variables were assigned *inside* it, so
+  the anchor step, a separate command, ran on `/ca.pem` and would have trusted nothing
+  after asking for an admin password. They are exported outside the subshell now. The test
+  sets neither variable and overrides `HOME` instead, because an environment that already
+  carries them is an environment in which this defect is invisible
 - [x] 6.3 README §"Serving https on loopback": the `[tls]` block, the refusal list, the literal-address URL rule with the `::1`-before-`127.0.0.1` reason and what it costs (every `localhost` request reaches the squatter), and the CT/user-anchor note including why `security verify-cert` cannot answer the question. Each pinned by its own needle in `tests/docs.rs`
 - [x] 6.4 README §"What TLS does not buy", in the register's voice and cross-linked to it: same-uid key readers, nono's identity, availability, and the fourth one that only shows up end-to-end — a caught squatter produces no record of ours, because we were never asked. `## Security posture` no longer calls TLS "the first follow-up"
 
@@ -143,9 +149,10 @@ test today; deleting one instead of repointing it removes a rule from the suite.
   artifacts that were not true — the write-only profile procedure it leans on, and the CA
   key minted into the daemon's own directory — rather than being quietly corrected
 - [x] 8.4 Re-run after the stage-3 remediation (2026-07-27): `just test` green — 170 lib +
-  33 `cli` + 5 conformance + 9 `docs` + 14 `policies` + 1 `public_api` + 45 `server`;
+  33 `cli` + 5 conformance + 10 `docs` + 14 `policies` + 1 `public_api` + 45 `server`;
   filtered green too (`--lib config` 12, `--lib isolation` 36, `--test cli tls` 12,
-  `--test docs squat` 2, `--test docs fallback` 2, `--test cli at_risk` 1); `just lint`
+  `--test docs squat` 2, `--test docs fallback` 2, `--test docs anchor` 1,
+  `--test cli at_risk` 1); `just lint`
   clean; `just smoke` still passes over plaintext, which is the check that this change
   stayed invisible to the default posture; and `just smoke-tls` passes end to end,
   including the new read sweep. Re-run at close-out if anything lands after this
