@@ -268,8 +268,7 @@ smoke:
       || { echo "FAIL: the real webhook client did not present a nono-cli User-Agent — read crates/nono-cli/src/approval_runtime.rs, the header contract has changed"; exit 1; }
     echo "SMOKE PASSED"
 
-# The squat test (T10): a real `nono run` blocked because the port is held by a
-# process that does not have our key. Skips loudly without a local CA.
+# Squat test (T10): a real `nono run` blocked by a keyless squatter; skips loudly without a CA.
 smoke-tls:
     #!/usr/bin/env bash
     set -euo pipefail
