@@ -1997,6 +1997,38 @@ async fn healthz_names_no_path_and_no_reload_error() {
     );
 }
 
+/// T9: the health surface reports nothing about the transport. A client that
+/// completed a handshake already knows it did; one that did not cannot read the
+/// response either way, so a `tls` field would disclose the daemon's posture to
+/// exactly the caller who has no use for it.
+///
+/// Pinned as an **exact key set**, not as the absence of `tls`. The requirement is
+/// "says nothing new", and a test naming today's forbidden field only forbids that
+/// spelling — `transport`, `https`, `cert_expires_at` would each ship green. Three
+/// separate review passes flagged T9 as satisfied by construction with nothing
+/// holding it there; this is what holds it. Adding a field is then a deliberate act
+/// that reddens a test whose message says why the burden is on the addition.
+#[tokio::test]
+async fn healthz_reports_nothing_about_the_transport() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_status, json) = healthz_of(state(&dir)).await;
+    let object = json
+        .as_object()
+        .unwrap_or_else(|| panic!("healthz must be a JSON object: {json}"));
+
+    let mut got: Vec<&str> = object.keys().map(String::as_str).collect();
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        ["generation", "last_reload", "loaded_at", "policies"],
+        "the health surface grew or lost a field. If you are ADDING one, note T9: \
+         #7 removed disclosure from this endpoint and the burden is on additions, \
+         not omissions. Anything naming the transport, the certificate or its \
+         expiry belongs nowhere on an unauthenticated endpoint. Update this list \
+         only once the new field has its own justification: {json}"
+    );
+}
+
 /// Design §7 promised operators "generation + load time". `loaded_at` has been
 /// written on every load since the engine was built; this is the first thing that
 /// ever read it.

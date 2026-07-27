@@ -505,7 +505,6 @@ smoke-tls:
     [ -n "$HELD" ] || { echo "FAIL: the squatter never took the port"; cat "$STATE/squatter.log"; exit 1; }
     echo
     echo "--- expect BLOCKED: git status, with a squatter holding 127.0.0.1:8181"
-    LINES_BEFORE=$(wc -l < "$AUDIT" 2>/dev/null || echo 0)
     set +e
     OUT=$(nono run --allow-cwd --profile "$PROFILE" -- git status 2>&1)
     CODE=$?
@@ -551,12 +550,16 @@ smoke-tls:
          echo "  exactly the outcome this test exists to rule out."; exit 1;;
       *) ;;
     esac
-    LINES_AFTER=$(wc -l < "$AUDIT" 2>/dev/null || echo 0)
-    if [ "$LINES_AFTER" != "$LINES_BEFORE" ]; then
-      echo "FAIL: this daemon recorded a decision while a squatter held the port"
-      exit 1
-    fi
+    # There is deliberately NO "our audit log gained no line" check here, and it is
+    # worth saying why so nobody adds one back. Our daemon is killed above — the
+    # squatter needs the port, so the two cannot both hold it — which makes any
+    # before/after comparison of $AUDIT a tautology: nothing is running that could
+    # append to it, so the counts are equal by construction and the assertion can
+    # never fail. It read as evidence and was none. What actually proves nono was
+    # never answered is the certificate check above: `invalid peer certificate`
+    # requires a peer that presented one, so something WAS listening, it DID answer
+    # the handshake, and nono refused to believe it.
     echo
     echo "OK: blocked by the transport path (exit 126, Err(SandboxInit)), not by a policy,"
-    echo "    and no decision of ours was recorded — because we were never asked."
+    echo "    and the block was the certificate — so a squatter did answer, and was refused."
     echo "SMOKE-TLS PASSED"
