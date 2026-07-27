@@ -35,6 +35,16 @@ docs around an unmeasured assumption is how a spec hardens around a wrong fact.
 - [x] 3.4 Failing test: a `0600` key owned by us passes
 - [x] 3.5 Implement, resolving the pair at startup alongside the other state paths (D7) so the checked chain is the read chain
 - [x] 3.6 Module docs state the scope honestly: **other local users only**, never the sandboxed agent (the house rule `tests/docs.rs` pins)
+- [x] 3.7a (**remediation, 2026-07-27**) …and reaches `at_risk` on the trail, which was a
+  separate claim with **no test at all**. Measured: deleting `warnings.extend(key_warnings)`
+  from `serve` left all 272 tests green — the only assertion on `at_risk` anywhere asserted
+  *false*, and the one through-the-binary key-in-cwd test uses the untrusted fixture, so the
+  daemon refuses at the T6 self-test and never opens an audit log; the at-risk path was
+  unreachable from it by construction. `a_tls_key_inside_the_working_directory_marks_the_audit_trail_at_risk`
+  mints a **trusted** pair inside the cwd and lets the daemon serve, with `policy_dir` and
+  `audit_log` outside it so the key's warning is the only one in play. Re-run of the
+  mutation with it in place: red on `left: Bool(false)` with the SECURITY warning in the
+  daemon's own log
 - [x] 3.7 (**remediation, 2026-07-27**) The cwd containment warning reaches the key too. It covered `policy_dir` and `audit_log` and stopped there, so a key inside the working directory started silently — while module docs point 2 named that exact residual. `check_private_key` is now shaped like `check` (refuse + advisory `Vec<String>`); the warning names **read** grants, not write, because that is the grant kind that matters here and an operator drilled on the write rule would check the wrong column. It joins `at_risk`: an agent that can read the key answers approvals in our place and those approvals are in no trail of ours. Mutation: deleting the containment push reddens both the unit test and the through-the-binary one
 
 ## 4. The listener
@@ -77,6 +87,19 @@ test today; deleting one instead of repointing it removes a rule from the suite.
 
 - [x] 6.1 `just mint-cert` — mkcert for `localhost 127.0.0.1 ::1`, `0600` key and `0644` cert, `0700` directory, defaulting to `~/.config/nono-cedar-pdp/tls/` and taking a path so a test can run it. It **refuses to overwrite** an existing pair: the daemon may be serving it, the file is the only copy of the key, and the certificate may be from the operator's own CA. `tests/cli.rs` runs the recipe and hands the result to the real daemon over https, which is the only assertion that cannot pass by coincidence. Mutation, four ways: dropping `chmod 700`, dropping `TRUST_STORES=system` (mkcert aborts on the keytool probe), dropping `::1` from the names, and dropping the overwrite guard each redden it for their own reason. Measured and recorded in the test: mkcert sets `0600`/`0644` itself regardless of umask, so the recipe's own `chmod` lines pin nothing today and are there for the day that changes
 - [x] 6.2 An `openssl` fallback in the README — CA, leaf, and the `security add-trusted-cert` step, since a bare self-signed leaf is not an anchor. **Run rather than read**: `tests/docs.rs` executes the block into a temp dir and puts its leaf in front of a real webpki verifier for all three loopback names, with `example.com` as the negative row. Mutations: removing an address from `subjectAltName` reddens it (`NotValidForName`), naming a *different* EKU reddens it ("does not allow extended key usage for server authentication") — and removing the `extendedKeyUsage` line altogether does **not**, because an absent EKU is unrestricted. That last one corrected the block's own comment, which claimed otherwise, and is held by a README needle instead
+- [x] 6.2a (**remediation, 2026-07-27**) The fallback block was **run** and two things it
+  did were wrong. It `cd`'d into `$TLS_DIR` and minted the local **CA key** there, so
+  `ca-key.pem` landed in the directory the `[tls]` block names — eight lines above prose
+  saying that key "belongs nowhere near the daemon" — which made A04's read-grant residual
+  on that tree yield a CA key good for *any name this machine trusts*, strictly wider than
+  A04 states. And it overwrote an existing pair in silence while `just mint-cert` refuses
+  and has a test pinning the refusal; measured, a sentinel `key.pem` was replaced and the
+  block exited 0. Now: a separate `$CA_DIR` (CSR and serial with it), an overwrite guard on
+  all three files each proven on its own run, and the whole thing a subshell so `set -e`
+  and that refusal cannot take a pasting operator's shell down. `tests/docs.rs` asserts
+  `$TLS_DIR` holds `cert.pem` and `key.pem` and **nothing else** — the whole set, because a
+  leftover CSR beside the daemon is the same mistake made smaller — and the
+  `security add-trusted-cert` step, the one part no test can run, is pinned at `$CA_DIR/ca.pem`
 - [x] 6.3 README §"Serving https on loopback": the `[tls]` block, the refusal list, the literal-address URL rule with the `::1`-before-`127.0.0.1` reason and what it costs (every `localhost` request reaches the squatter), and the CT/user-anchor note including why `security verify-cert` cannot answer the question. Each pinned by its own needle in `tests/docs.rs`
 - [x] 6.4 README §"What TLS does not buy", in the register's voice and cross-linked to it: same-uid key readers, nono's identity, availability, and the fourth one that only shows up end-to-end — a caught squatter produces no record of ours, because we were never asked. `## Security posture` no longer calls TLS "the first follow-up"
 
@@ -85,6 +108,29 @@ test today; deleting one instead of repointing it removes a rule from the suite.
 - [x] 7.1 `just smoke-tls`, run for real 2026-07-27. Two halves against the same profile and command, changing only who holds `127.0.0.1:8181`: with this daemon there, real nono completes the handshake and Cedar answers (`"decision":"allow"` from `10-git:git-read-only`) — the half that gives the other one meaning, and the only place anything proves nono's own *binary* accepts our certificate; with a keyless openssl `s_server` there, the command is blocked. Mutating the profile URL to `http://` reddens the ALLOW half (`protocol: http parse fail: invalid HTTP version`), so it is not vacuous
 - [x] 7.2 The skip is **measured through the daemon's own T6 refusal**, not guessed at from the keychain — `security verify-cert` answers uniformly wrong (T7), and the refusal already names `mkcert -install`. Verified by running `CAROOT=$(mktemp -d) just smoke-tls`: it prints the refusal in full, names `mkcert -install`, and exits **0**. And the pair is re-minted every run, because that verification leaves a pair behind signed by a CA nothing trusts — reusing it would make the recipe skip for ever, which is the failure T10 is about. Confirmed: the next ordinary run recovers and passes
 - [x] 7.3 **Exit 126 alone does not distinguish them** — read at the source rather than assumed: upstream's `handle_shim_stream` writes 126 for *every* `Err`, so `Err(BlockedCommand)` from a policy denial and `Err(SandboxInit)` from a transport failure share it. So the recipe asserts the code *and* the message: `Sandbox initialization failed` present, `approval_denied` absent, `invalid peer certificate` present, and no new line in our own audit log. That third one has teeth — swapping the squatter for a plaintext `python3 -m http.server` reddens it (`received corrupt message of type InvalidContentType`), which is what stops connection-refused, or nothing listening at all, from satisfying the whole BLOCK half
+- [x] 7.3a (**remediation, 2026-07-27**) The guards on 7.2 and 7.3 were satisfied by the
+  *prose around* the checks. `"126"` matched four comments and echoes as well as the `if`,
+  so deleting the whole `[ "$CODE" -ne 126 ]` block left the test green (recipe still
+  parses, `just --dry-run smoke-tls` → 0); `"mkcert -install"` matched four places, so the
+  remedy could be dropped from the T6 arm — the one 7.2 is about. Needles are now the
+  assertion's own syntax, matched **exactly once**, against a comment-stripped body, and
+  the skip is a separate per-arm test: every `exit 0` must announce "SKIPPED (not run, not
+  passed)" and name `mkcert -install` within its own arm. The first version of that test
+  still passed the mutation — the window held a *comment* saying the refusal "names
+  `mkcert -install`" — which is why `code_of` exists. Eight README needles were vacuous the
+  same way (`"is not a substitute"` also matched a sentence about the cwd warning eight
+  sections down), so exactly-once is now the rule there too, and it immediately caught a
+  needle the read-sweep commit itself made ambiguous
+- [x] 7.3b (**remediation, 2026-07-27**) The profile sweep sweeps **read** as well. It
+  folded the TLS directory into the existing *write* loop, while the jq edit it exists to
+  police is itself a read-grant edit and read is the grant kind that hands the private key
+  over whole (A04). Measured against a profile granting read on the recipe's own TLS
+  directory under `~/.cache`: the shipped write sweep caught nothing, the new read sweep
+  catches it. The comment claiming the write sweep covered the key is corrected, and the
+  README's operator procedure — which had the identical hole, being write-only — now
+  carries the read half, since that is where an operator gets the command for their own
+  profile. `just smoke-tls` re-run end to end: both sweeps pass, ALLOW and BLOCK halves
+  unchanged
 - [x] 7.4 The worktree grant goes into the **command policy** (`commands.git.from.session.sandbox.fs_read`) as well as the top-level read, exactly as `just smoke` does, with the reason in the recipe. Proven by the run: it passed from this worktree, where a run-level `--read` alone fails identically-looking
 - [x] 7.5 The shape is now **refused by a test** rather than remembered: `no_recipe_gates_an_assignment_on_a_test_under_set_e` scans every Justfile line for `[ … ] && NAME=…`. Every readiness and wait loop in the new recipe uses `if … then … fi` for the same reason
 
@@ -93,5 +139,14 @@ test today; deleting one instead of repointing it removes a rule from the suite.
 - [x] 8.1 Design §10 ticked and pointed at the T1–T11 doc, with the two limits stated beside the tick rather than under it. §2's impersonation note gets a correction trail: it said nono "denies" a failed handshake, and nono *blocks* — a reader inheriting that word looks for a deny reason that is never there
 - [x] 8.2 A02 revisited rather than edited: it listed #5 and #13 together under "what would close it", and they close different directions — #5 closed the outbound one, A02 *is* the inbound one and is untouched. The residual TLS introduces is filed separately as **A04** (same-uid key readers; the mirror of D13, where the dangerous grant is write and here it is **read**), so that "we fixed #5" cannot come to read as "A02 is smaller now"
 - [x] 8.3 `openspec validate --changes serve-https-on-loopback` — passes (2026-07-27)
-- [x] 8.4 Run at the end of stage 3 (2026-07-27): `just test` green — 170 lib + 32 `cli` + 5 conformance + 7 `docs` + 14 `policies` + 1 `public_api` + 45 `server`; filtered green too (`--lib config` 12, `--lib isolation` 36, `--test cli tls` 11, `--test docs squat` 1); `just lint` clean; `just smoke` still passes over plaintext, which is the check that this change stayed invisible to the default posture; and `just smoke-tls` passes end to end. Re-run at close-out if anything lands after this
+- [x] 8.2a (**remediation, 2026-07-27**) A04 records the two things it assumed of the
+  artifacts that were not true — the write-only profile procedure it leans on, and the CA
+  key minted into the daemon's own directory — rather than being quietly corrected
+- [x] 8.4 Re-run after the stage-3 remediation (2026-07-27): `just test` green — 170 lib +
+  33 `cli` + 5 conformance + 9 `docs` + 14 `policies` + 1 `public_api` + 45 `server`;
+  filtered green too (`--lib config` 12, `--lib isolation` 36, `--test cli tls` 12,
+  `--test docs squat` 2, `--test docs fallback` 2, `--test cli at_risk` 1); `just lint`
+  clean; `just smoke` still passes over plaintext, which is the check that this change
+  stayed invisible to the default posture; and `just smoke-tls` passes end to end,
+  including the new read sweep. Re-run at close-out if anything lands after this
 - [ ] 8.5 Push to `internal` **and** `origin`; close #5 with the evidence, including the measured IP SAN result from task 1
