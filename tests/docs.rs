@@ -440,6 +440,16 @@ fn the_documented_caveats_and_risks_are_still_in_the_readme() {
             "the fallback leaf carries all three loopback names",
             "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1",
         ),
+        // The anchor step is the one part of the fallback no test can run — it
+        // needs an administrator — and it is also the one that costs a password
+        // to get wrong. The CA now lives beside the daemon's directory rather
+        // than in it, so this is the line that has to have moved with it: pointed
+        // at `$TLS_DIR/ca.pem` it installs nothing and the operator finds out at
+        // the next startup, from a refusal about the leaf.
+        (
+            "the fallback installs the CA from where the block actually wrote it",
+            "-k /Library/Keychains/System.keychain \"$CA_DIR/ca.pem\"",
+        ),
     ] {
         // Matched against the README with every whitespace run collapsed, so
         // re-wrapping a paragraph is not a test failure — only deleting the guidance
@@ -510,6 +520,13 @@ fn fenced_block_containing(needle: &str) -> String {
 /// extended key usage for server authentication") — but deleting the
 /// `extendedKeyUsage` line altogether does **not**, because an absent EKU extension
 /// is unrestricted. That one is held by the README needle above instead.
+///
+/// The file *placement* is asserted here too, because it is a security property
+/// and prose alone had it wrong: the block used to `cd "$TLS_DIR"` and mint the CA
+/// there, so `ca-key.pem` landed in the directory the `[tls]` block names — eight
+/// lines above prose saying that key "belongs nowhere near the daemon". A read
+/// grant on that tree (A04) then yielded not just the serving key but a CA key good
+/// for **any name this machine trusts**, which is strictly wider than A04 states.
 #[test]
 fn the_documented_openssl_fallback_mints_a_leaf_a_verifier_accepts() {
     use rustls::client::danger::ServerCertVerifier;
@@ -519,11 +536,14 @@ fn the_documented_openssl_fallback_mints_a_leaf_a_verifier_accepts() {
     // selector that is itself the mutation target turns a verification failure
     // into "no such block", which is red for the wrong reason.
     let block = fenced_block_containing("nono-cedar-pdp local CA");
-    let dir = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("tls");
+    let ca_dir = root.path().join("ca");
     let out = std::process::Command::new("bash")
         .arg("-c")
         .arg(&block)
-        .env("TLS_DIR", dir.path())
+        .env("TLS_DIR", &dir)
+        .env("CA_DIR", &ca_dir)
         .output()
         .unwrap();
     assert!(
@@ -533,20 +553,40 @@ fn the_documented_openssl_fallback_mints_a_leaf_a_verifier_accepts() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let read_pem = |name: &str| {
-        let pem = std::fs::read(dir.path().join(name)).unwrap_or_else(|e| {
+    // Exactly the two files the `[tls]` block names, and nothing else. The CA's
+    // key is the one that matters — it signs future leaves, so whoever reads it
+    // mints a certificate this machine trusts for any name at all — but the
+    // assertion is the whole set rather than that one name, because a serial file
+    // or a leftover CSR in the daemon's directory is the same mistake made
+    // smaller, and `just mint-cert` leaves exactly these two.
+    let mut left: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        vec!["cert.pem".to_string(), "key.pem".to_string()],
+        "the documented fallback left {left:?} in the directory the [tls] block \
+         names. Only `cert` and `key` belong there: the CA's private key signs \
+         future leaves and belongs nowhere near the daemon, and a read grant on \
+         this tree hands over everything in it (A04)."
+    );
+
+    let read_pem = |at: &std::path::Path, name: &str| {
+        let pem = std::fs::read(at.join(name)).unwrap_or_else(|e| {
             panic!("the documented fallback wrote no {name} ({e}): {}", &block)
         });
         rustls_pemfile::certs(&mut pem.as_slice())
             .collect::<Result<Vec<_>, _>>()
             .unwrap_or_else(|e| panic!("{name} is not a certificate: {e}"))
     };
-    let mut chain = read_pem("cert.pem");
+    let mut chain = read_pem(&dir, "cert.pem");
     assert!(!chain.is_empty(), "the fallback wrote an empty cert.pem");
     let leaf = chain.remove(0);
 
     let mut roots = rustls::RootCertStore::empty();
-    for ca in read_pem("ca.pem") {
+    for ca in read_pem(&ca_dir, "ca.pem") {
         roots.add(ca).unwrap();
     }
     let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
@@ -596,6 +636,68 @@ fn the_documented_openssl_fallback_mints_a_leaf_a_verifier_accepts() {
         "the fallback's leaf is accepted for a name it does not carry, so the rows \
          above prove nothing about its SANs"
     );
+}
+
+/// The documented fallback is the *other* path to the same pair, so it has to
+/// refuse an existing one for the reason `just mint-cert` does — and did not.
+///
+/// `just_mint_cert_refuses_to_overwrite_an_existing_pair` states the reason
+/// verbatim: the running daemon is serving the old certificate, the operator's own
+/// CA may have signed it, and the file is the only copy of the key. None of that
+/// gets less true because the operator has no `mkcert`. Measured before the guard
+/// existed: writing a sentinel `key.pem` and running the block replaced it and
+/// exited 0.
+///
+/// Each of the three files is checked on its own run, because a guard that only
+/// looks at the first one it happens to reach is the same defect one file along —
+/// and `ca-key.pem` is the one whose loss is worst, since every leaf the operator
+/// has ever signed with it chains to a CA they can no longer reissue from.
+#[test]
+fn the_documented_openssl_fallback_refuses_to_overwrite_an_existing_pair() {
+    let block = fenced_block_containing("nono-cedar-pdp local CA");
+    const SENTINEL: &str = "the operator's real file\n";
+
+    for (subdir, name) in [
+        ("tls", "cert.pem"),
+        ("tls", "key.pem"),
+        ("ca", "ca-key.pem"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("tls");
+        let ca_dir = root.path().join("ca");
+        let existing = root.path().join(subdir).join(name);
+        std::fs::create_dir_all(root.path().join(subdir)).unwrap();
+        std::fs::write(&existing, SENTINEL).unwrap();
+
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&block)
+            .env("TLS_DIR", &dir)
+            .env("CA_DIR", &ca_dir)
+            .output()
+            .unwrap();
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&existing).unwrap(),
+            SENTINEL,
+            "the documented fallback overwrote an existing {name}, which is the \
+             only copy of what it replaced: {said}"
+        );
+        assert!(
+            !out.status.success(),
+            "the documented fallback found an existing {name} and exited 0, which \
+             reads as success: {said}"
+        );
+        assert!(
+            said.contains(name),
+            "the refusal must name the file that stopped it, or the operator \
+             cannot act on it: {said}"
+        );
+    }
 }
 
 const JUSTFILE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Justfile"));

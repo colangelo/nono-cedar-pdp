@@ -189,6 +189,17 @@ Two further residuals belong here rather than in a paragraph nobody re-reads:
   still denies service — we fail to bind and exit, or nono's handshake fails and every
   intercepted action is blocked. Correct for a fail-closed daemon, and still a cost.
 
+**Two things this entry assumed of the artifacts that were not true, both fixed
+2026-07-27.** The profile-checking procedure it leans on swept **write** grants only —
+the column that does not matter here — so an operator following it to the letter
+verified the wrong thing about the key, and `just smoke-tls`'s own assertion had the
+same hole while the jq edit it exists to police is itself a read-grant edit. Both now
+sweep read as well. And the documented `openssl` fallback minted the local **CA key**
+into `$TLS_DIR`, so a read grant on that tree yielded not one serving key but a CA key
+good for *any name this machine trusts* — strictly wider than this entry states. It
+mints into a separate `$CA_DIR` now, and `tests/docs.rs` runs the block and asserts
+`$TLS_DIR` holds `cert.pem` and `key.pem` and nothing else.
+
 **Why accepted.** Not closable at this boundary. Defending a key from code running as
 its own owner needs something outside the process — a hardware-backed key, or a
 different uid for the daemon, which upends the "runs as you, on your loopback" model the

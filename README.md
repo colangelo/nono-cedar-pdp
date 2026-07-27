@@ -455,13 +455,33 @@ The same shape with more steps — a local CA, a leaf signed by it, and the CA
 installed as an anchor. A bare self-signed leaf is not a shortcut, for the reason
 just above.
 
-```bash
-TLS_DIR="${TLS_DIR:-$HOME/.config/nono-cedar-pdp/tls}"
-mkdir -p "$TLS_DIR" && chmod 700 "$TLS_DIR" && cd "$TLS_DIR"
+The whole block is one subshell, so `set -e` and the refusal below cannot take your
+own shell down with them, and the `TLS_DIR`/`CA_DIR` it works in are two *different*
+directories on purpose — the reason is under the block.
 
-# 1. The local CA. This is what gets installed, and what a bare leaf can never be.
+```bash
+(
+set -euo pipefail
+TLS_DIR="${TLS_DIR:-$HOME/.config/nono-cedar-pdp/tls}"   # what [tls] names
+CA_DIR="${CA_DIR:-$HOME/.config/nono-cedar-pdp/ca}"      # the CA, kept apart
+
+# 0. Never overwrite, for the reason `just mint-cert` gives: the daemon may be
+#    serving the old pair right now, your own CA may have signed it, and the key
+#    file is the only copy of the key. Replacing one silently reads as success and
+#    takes the listener down at the next restart.
+for f in "$TLS_DIR/cert.pem" "$TLS_DIR/key.pem" "$CA_DIR/ca-key.pem"; do
+  if [ -e "$f" ]; then
+    echo "$f already exists; move it aside first — this block never overwrites" >&2
+    exit 1
+  fi
+done
+mkdir -p "$TLS_DIR" "$CA_DIR" && chmod 700 "$TLS_DIR" "$CA_DIR"
+
+# 1. The local CA, in its OWN directory. This is what gets installed, and what a
+#    bare leaf can never be.
 openssl req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 \
-  -keyout ca-key.pem -out ca.pem -subj "/CN=nono-cedar-pdp local CA" \
+  -keyout "$CA_DIR/ca-key.pem" -out "$CA_DIR/ca.pem" \
+  -subj "/CN=nono-cedar-pdp local CA" \
   -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
   -addext "keyUsage=critical,keyCertSign,cRLSign"
 
@@ -471,27 +491,37 @@ openssl req -x509 -newkey rsa:4096 -days 3650 -nodes -sha256 \
 #    serverAuth is refused outright — measured; an EKU extension left out
 #    altogether is merely unrestricted, so this line is what stops a leaf minted
 #    for some other purpose from being reused here.
-openssl req -newkey rsa:2048 -nodes -keyout key.pem -out leaf.csr \
+#
+#    The CSR and the serial file are written next to the CA, not next to the
+#    daemon: $TLS_DIR ends up holding cert.pem and key.pem and nothing else.
+openssl req -newkey rsa:2048 -nodes \
+  -keyout "$TLS_DIR/key.pem" -out "$CA_DIR/leaf.csr" \
   -subj "/CN=nono-cedar-pdp"
-openssl x509 -req -in leaf.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial \
-  -days 825 -sha256 -out cert.pem -extfile <(printf '%s\n' \
+openssl x509 -req -in "$CA_DIR/leaf.csr" \
+  -CA "$CA_DIR/ca.pem" -CAkey "$CA_DIR/ca-key.pem" -CAcreateserial \
+  -days 825 -sha256 -out "$TLS_DIR/cert.pem" -extfile <(printf '%s\n' \
     "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1" \
     "extendedKeyUsage=serverAuth" \
     "basicConstraints=critical,CA:FALSE")
 
-chmod 600 key.pem ca-key.pem && chmod 644 cert.pem ca.pem
+chmod 600 "$TLS_DIR/key.pem" "$CA_DIR/ca-key.pem"
+chmod 644 "$TLS_DIR/cert.pem" "$CA_DIR/ca.pem"
+)
 ```
 
 Then the step that needs an administrator — the one `mkcert -install` does for you:
 
 ```bash
 sudo security add-trusted-cert -d -r trustRoot \
-  -k /Library/Keychains/System.keychain "$TLS_DIR/ca.pem"
+  -k /Library/Keychains/System.keychain "$CA_DIR/ca.pem"
 ```
 
-`cert.pem` and `key.pem` are what the `[tls]` block names. `ca-key.pem` signs future
-leaves and belongs nowhere near the daemon: anyone holding it can mint a certificate
-this machine trusts for any name at all.
+`cert.pem` and `key.pem` are what the `[tls]` block names, and they are the only two
+files in `$TLS_DIR`. `ca-key.pem` signs future leaves and belongs nowhere near the
+daemon — anyone holding it can mint a certificate this machine trusts for any name at
+all — which is why it goes in `$CA_DIR`: a profile that grants **read** on the tree
+the daemon's key sits in would otherwise hand over that too, and a CA key is a
+strictly wider bypass than one serving key ([A04](docs/audits/)).
 
 ### What TLS does not buy
 
