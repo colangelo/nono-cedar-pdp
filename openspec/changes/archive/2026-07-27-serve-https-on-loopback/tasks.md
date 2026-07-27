@@ -156,4 +156,4 @@ test today; deleting one instead of repointing it removes a rule from the suite.
   clean; `just smoke` still passes over plaintext, which is the check that this change
   stayed invisible to the default posture; and `just smoke-tls` passes end to end,
   including the new read sweep. Re-run at close-out if anything lands after this
-- [ ] 8.5 Push to `internal` **and** `origin`; close #5 with the evidence, including the measured IP SAN result from task 1
+- [x] 8.5 Merged to `main` as `ab01d03`, pushed to `internal` and `origin` (both at `ab01d03`); #5 closed with the squat-test output, the measured IP SAN table and its negative controls, and the A04 residual. Follow-up #33 filed for the `rustls-platform-verifier` version drift
