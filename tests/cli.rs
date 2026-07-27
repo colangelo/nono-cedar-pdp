@@ -400,16 +400,28 @@ fn bound_addr(logs: &str) -> Option<SocketAddr> {
 /// port rather than guess it, the way
 /// `a_daemon_binds_exactly_the_address_its_configuration_names` does.
 fn start_daemon(config_dir: &Path, config_body: &str) -> Daemon {
+    start_daemon_in(config_dir, config_body, None)
+}
+
+/// [`start_daemon`] with a working directory, for the one heuristic that reads
+/// one: `serve` warns when a state path — including the TLS private key — sits
+/// inside the tree an agent may be working in. `serve_from` can show the warning
+/// but not what it *does*, because it is for daemons that must never reach the
+/// listener, and the consequence lands in the audit log of one that does.
+fn start_daemon_in(config_dir: &Path, config_body: &str, cwd: Option<&Path>) -> Daemon {
     let config = config_dir.join("config.toml");
     std::fs::write(&config, config_body).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_nono-cedar-pdp"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_nono-cedar-pdp"));
+    command
         .arg("serve")
         .arg("--config")
         .arg(&config)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(std::process::Stdio::piped());
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let mut child = command.spawn().unwrap();
     let logs = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let readers = vec![
         pump(child.stdout.take().unwrap(), std::sync::Arc::clone(&logs)),
@@ -1832,6 +1844,70 @@ fn a_tls_private_key_inside_the_working_directory_warns_before_serving() {
         warned[0].contains("impersonat"),
         "the warning must name what is at stake: {}",
         warned[0]
+    );
+}
+
+/// …and that warning reaches `at_risk` on the trail, which is a separate claim and
+/// had no test at all.
+///
+/// `serve` logs the key's containment warning and then folds it into the warning
+/// set that decides `at_risk` on every `policy-set` line. Deleting that one line —
+/// `warnings.extend(key_warnings)` — left the entire suite green: the only
+/// assertion on `at_risk` anywhere asserted *false*, and the one test that puts a
+/// key in the working directory through the binary uses an untrusted certificate,
+/// so the daemon refuses at the T6 self-test and never opens an audit log. The
+/// at-risk path was unreachable from it by construction.
+///
+/// So this one mints a **trusted** pair, in the working directory, and lets the
+/// daemon actually serve. `at_risk` is a statement about this trail's
+/// completeness: an agent that can read the key answers nono's approvals in our
+/// place, and none of those approvals appear here — so a reader who trusts the
+/// trail has to be told the trail may be partial. The audit log and the policy
+/// directory are deliberately outside the working directory, so the key's warning
+/// is the only one available and a green run cannot be one of theirs.
+///
+/// The mirror of the `at_risk == false` row in
+/// `the_real_binary_serves_decisions_and_records_them`, which is the control: with
+/// no assertion that it can be true, "always false" passes both.
+#[test]
+fn a_tls_key_inside_the_working_directory_marks_the_audit_trail_at_risk() {
+    let dir = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let Some((cert, key)) = platform_trusted_pair(dir.path()) else {
+        return;
+    };
+    let audit_log = elsewhere.path().join("decisions.jsonl");
+
+    let mut daemon = start_daemon_in(
+        elsewhere.path(),
+        &format!(
+            "policy_dir = \"{POLICY_DIR}\"\naudit_log = \"{}\"\nbind = \"127.0.0.1:0\"\n{}\n\
+             [agents]\ncedar = \"claude-code\"\n",
+            audit_log.display(),
+            tls_block_for(&cert, &key)
+        ),
+        Some(dir.path()),
+    );
+    let logs = daemon.stop();
+
+    let trail = std::fs::read_to_string(&audit_log)
+        .unwrap_or_else(|e| panic!("nothing at the configured audit log: {e} (log: {logs})"));
+    let provenance: Vec<serde_json::Value> = trail
+        .lines()
+        .map(|l| {
+            serde_json::from_str(l).unwrap_or_else(|e| panic!("unparseable audit line {l:?}: {e}"))
+        })
+        .filter(|r: &serde_json::Value| r["kind"] == "policy-set")
+        .collect();
+    assert_eq!(provenance.len(), 1, "{trail}");
+    assert_eq!(
+        provenance[0]["at_risk"],
+        serde_json::json!(true),
+        "the private key is inside the working directory and the daemon said so at \
+         WARN, but the trail it then wrote claims not to be at risk. A reader of \
+         this line cannot see the warning — that is what the field is for: {} \
+         (log: {logs})",
+        provenance[0]
     );
 }
 
