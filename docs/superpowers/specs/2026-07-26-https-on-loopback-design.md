@@ -117,8 +117,18 @@ log rather than inferred from the absence of a line.
 
 ### T3 — `axum-server` 0.8 with `rustls`/`ring`
 
-The listener runs `axum_server::bind_rustls`. The router is untouched, so every existing
-`tests/server.rs` case exercises the same handlers over the new transport.
+The listener runs `axum_server::from_tcp_rustls` over a `TcpListener` bound here. The
+router is untouched, so every existing `tests/server.rs` case exercises the same handlers
+over the new transport.
+
+**Not `bind_rustls`**, which this document originally specified. It binds internally, so
+the daemon never sees the socket and cannot report the address the kernel actually gave
+it. That report is load-bearing for the tests: they ask for `bind = "127.0.0.1:0"` and read
+the port back out of the daemon's own `listening` line, which is what replaced an earlier
+free-port guess that could hand back an address the child never bound. Binding here and
+handing the listener over keeps both properties. Corrected after implementation, and noted
+rather than silently rewritten because "the design says X, the code does Y" is worth
+seeing.
 
 **Why not hand-roll it.** axum 0.8's `Listener::accept` returns `(Io, Addr)` with **no
 `Result`**, so a hand-written TLS listener must both retry internally and keep the
@@ -193,11 +203,23 @@ ephemeral port while asserting the server name derived from **`bind`**, which is
 it a genuine test of "does this certificate cover the address I am about to serve on".
 
 This answers the operator's actual question — *will nono accept this certificate?* — with
-the code that decides it, at startup, instead of in a runbook. It is the same crate ureq's
-`platform-verifier` feature uses (§2), so it is not a model of nono's verifier; it is
-nono's verifier. It also catches conditions no minting procedure can: a certificate that
-expired, a CA removed from the trust store since, a `bind` changed to an address the
-certificate does not cover.
+the code that decides it, at startup, instead of in a runbook. It also catches conditions
+no minting procedure can: a certificate that expired, a CA removed from the trust store
+since, a `bind` changed to an address the certificate does not cover.
+
+**The same crate, but pin the claim to the version.** This document first said "it is not a
+model of nono's verifier; it is nono's verifier". That is true of the crate and was not
+true of the version: nono v0.69.0's webhook client goes through `ureq` 3.3.0, which
+resolves `rustls-platform-verifier` **0.6.2**, while this daemon pins **0.7.0**. (The
+0.7.0 in nono's lockfile belongs to the sigstore/`reqwest` chain, which is not the webhook
+client — an easy misread.) The two `verification/apple.rs` files are byte-identical apart
+from two `docsrs` attributes, so the identity holds *today* and the self-test really is
+running nono's verification path. But nothing mechanically pins that, unlike the wire
+contract, which has `tests/conformance.rs` precisely because "we checked once" decays. The
+honest statement is therefore: **the same verification code as nono today, verified by
+diff, with no guard against the two drifting.** Closing that would mean a conformance-style
+test asserting the resolved versions match — worth filing, not worth blocking on, since a
+divergence degrades the self-test's fidelity rather than opening a bypass.
 
 Cost: one dependency, `rustls-platform-verifier`. Justified on the same terms as T3 — it
 is the load-bearing correctness check for this feature, not incidental machinery.
