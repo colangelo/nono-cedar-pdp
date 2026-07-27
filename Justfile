@@ -371,8 +371,9 @@ smoke-tls:
         examples/cedar-pdp-smoke.json > "$PROFILE"
     fi
     # Asserted, not trusted, exactly as in `just smoke`: a jq edit that widened a
-    # write grant would hand the sandboxed agent the PDP's own trust boundary — and
-    # now its private key, which is the whole control this recipe is testing.
+    # write grant would hand the sandboxed agent the PDP's own trust boundary. It
+    # says nothing about the *read* surface, which is the one the jq edits above
+    # actually touch — the two sweeps below are what cover that.
     for surface in '.filesystem.allow' '.workdir.access' \
       '.command_policies.commands.git.from.session.sandbox.fs_write'; do
       if [ "$(jq -c "$surface" examples/cedar-pdp-smoke.json)" \
@@ -381,17 +382,37 @@ smoke-tls:
       fi
     done
     nono profile validate "$PROFILE" >/dev/null
-    echo "--- the profile's write grants must not reach the PDP's own state or key"
+    echo "--- the profile's write grants must not reach the PDP's own state"
     for granted in $(nono profile show "$PROFILE" --format manifest \
       | jq -r '.filesystem.grants[] | select(.access | test("write")) | .path'); do
-      for own in "$POLICIES" "$AUDIT" "$TLS"; do
+      for own in "$POLICIES" "$AUDIT"; do
         case "$own" in
           "$granted"|"$granted"/*)
             echo "FAIL: the profile grants write to $granted, which contains $own"; exit 1;;
         esac
       done
     done
-    echo "OK: $POLICIES, $AUDIT and $TLS are outside every write grant"
+    echo "OK: $POLICIES and $AUDIT are outside every write grant"
+    # A separate sweep, over READ, because the private key is the one path here
+    # where read is the dangerous grant: whoever can read it completes nono's
+    # handshake and *is* this daemon, and nono has no other way to tell (A04). The
+    # write sweep above would pass a profile granting read on the whole TLS
+    # directory in silence — and a read grant is exactly what the jq edits in this
+    # recipe add. `test("read")` matches `readwrite` too, deliberately. This is the
+    # command README's "What TLS does not buy" sends an operator to run against
+    # their own profile, run here against the one this recipe generated.
+    echo "--- and the private key must be outside every READ grant"
+    for granted in $(nono profile show "$PROFILE" --format manifest \
+      | jq -r '.filesystem.grants[] | select(.access | test("read")) | .path'); do
+      case "$TLS" in
+        "$granted"|"$granted"/*)
+          echo "FAIL: the profile grants read to $granted, which contains $TLS."
+          echo "  Read access to the private key is the ability to answer nono's"
+          echo "  approvals in this daemon's place, with no record here at all."
+          exit 1;;
+      esac
+    done
+    echo "OK: $TLS is outside every read grant"
 
     cargo build --quiet
     PDP=""

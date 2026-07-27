@@ -216,6 +216,15 @@ fn the_readme_snippet_defines_the_same_backends_as_the_shipped_profile() {
 /// short and load-bearing: the point is that a future edit cannot silently delete the
 /// guidance that keeps a policy author from writing a fail-open rule, or the operator
 /// from mistaking an unauthenticated webhook for an authenticated one.
+///
+/// Every needle must match **exactly once**, and that is the assertion rather than
+/// `contains`. A needle matching twice is not a stricter test, it is a vacuous one:
+/// the passage it claims to pin can be deleted whole and the other match keeps it
+/// green. Measured — `"is not a substitute"` also matched an unrelated sentence about
+/// the working-directory warning eight sections away, so the "a self-signed leaf is
+/// not an anchor" guidance was deletable with the suite green, and seven more needles
+/// were in the same state. Zero is the guidance gone; more than one means the needle
+/// no longer names one passage, so narrow it to a phrase only that passage has.
 #[test]
 fn the_documented_caveats_and_risks_are_still_in_the_readme() {
     for (scenario, needle) in [
@@ -235,7 +244,10 @@ fn the_documented_caveats_and_risks_are_still_in_the_readme() {
         ),
         ("unanchored globs are forbid-only", "forbid-only"),
         // The args[0] shim-path contract, and that reading argv fails to load.
-        ("args[0] is a per-run shim path", "shims/git"),
+        (
+            "args[0] is a per-run shim path",
+            "`args[0]` is not the command name",
+        ),
         (
             "a policy reading argv will not load",
             "fails strict validation",
@@ -274,13 +286,16 @@ fn the_documented_caveats_and_risks_are_still_in_the_readme() {
         // and the one-flag fix, since the failure mode is a 415 rather than a deny.
         (
             "the decide endpoint requires a JSON content-type",
-            "Content-Type: application/json",
+            "`Content-Type: application/json` is required",
         ),
         (
             "the one-flag fix for anyone POSTing by hand",
             "-H 'Content-Type: application/json'",
         ),
-        ("a request carrying an Origin is refused", "`Origin`"),
+        (
+            "a request carrying an Origin is refused",
+            "A request carrying an `Origin` header is `403`",
+        ),
         // The residual, in the same words as the spec and the module docs: recording
         // the User-Agent must never read as authenticating the caller.
         (
@@ -289,11 +304,11 @@ fn the_documented_caveats_and_risks_are_still_in_the_readme() {
         ),
         (
             "a local process as the same user can still forge a record",
-            "forge an audit record",
+            "still forge an audit record that is indistinguishable",
         ),
         (
             "the User-Agent is evidence, not verification",
-            "not verification",
+            "is evidence, **not verification**",
         ),
         // Raising the log level relocates the audit log's content into a stream with
         // none of its permissions.
@@ -310,7 +325,10 @@ fn the_documented_caveats_and_risks_are_still_in_the_readme() {
             "loopback is the access control",
             "non-loopback `bind` is a hard config error",
         ),
-        ("https on loopback is the mitigation", "https on loopback"),
+        (
+            "https on loopback is the mitigation",
+            "closes the outbound half",
+        ),
         // The fallback posture, described as what it does.
         (
             "a Cedar denial becomes a prompt",
@@ -320,13 +338,34 @@ fn the_documented_caveats_and_risks_are_still_in_the_readme() {
         // the one control that works against the sandboxed agent, so it must
         // stay findable: the resolved-manifest command, and the per-command
         // fs_write/fs_write_file sweep the resolved manifest omits.
+        // The whole command, not just `nono profile show … --format manifest`,
+        // which now appears twice: once for the write sweep and once for the read
+        // one. Two commands doing different jobs are not two chances to pass.
         (
-            "the profile-checking procedure: resolved grants",
-            "nono profile show <profile> --format manifest",
+            "the profile-checking procedure: resolved write grants",
+            "nono profile show <profile> --format manifest \\ | jq -r \
+             '.filesystem.grants[] | select(.access | test(\"write\"))",
         ),
         (
             "the profile-checking procedure: per-command grants",
-            "fs_write_file",
+            "fs_write_file // []",
+        ),
+        // And the same procedure for the key, whose grant kind is the other one.
+        // `just smoke-tls` asserts this against its own generated profile; the
+        // README is where an operator gets it for theirs, and it was write-only
+        // while the key's whole rule is read.
+        (
+            "the profile-checking procedure: the key's rule is read, not write",
+            "the private key's rule is READ, not write",
+        ),
+        (
+            "the profile-checking procedure: resolved read grants",
+            "nono profile show <profile> --format manifest \\ | jq -r \
+             '.filesystem.grants[] | select(.access | test(\"read\"))",
+        ),
+        (
+            "the profile-checking procedure: per-command read grants",
+            "fs_read_file // []",
         ),
         // Why a /tmp-style 1777 chain is fine while a 770 parent is not — and
         // why the same exemption never applies to the policy dir itself.
@@ -364,7 +403,7 @@ fn the_documented_caveats_and_risks_are_still_in_the_readme() {
         ),
         (
             "a self-signed leaf dropped in a keychain is not one",
-            "is not a substitute",
+            "it is not an anchor",
         ),
         (
             "and `security verify-cert` is not the way to check any of it",
@@ -405,9 +444,14 @@ fn the_documented_caveats_and_risks_are_still_in_the_readme() {
         // Matched against the README with every whitespace run collapsed, so
         // re-wrapping a paragraph is not a test failure — only deleting the guidance
         // is.
-        assert!(
-            flowed(README).contains(&flowed(needle)),
-            "README.md no longer documents {scenario:?} (looked for {needle:?})"
+        let hits = flowed(README).matches(&flowed(needle)).count();
+        assert_eq!(
+            hits, 1,
+            "README.md documents {scenario:?} in {hits} places (looked for \
+             {needle:?}). Zero means the guidance is gone. More than one means this \
+             needle no longer pins the passage it names — the passage can be deleted \
+             whole and the other match keeps this test green — so narrow it to a \
+             phrase only that passage has."
         );
     }
 }
@@ -580,6 +624,23 @@ fn recipe(name: &str) -> String {
     body.unwrap_or_else(|| panic!("the Justfile has no `{name}` recipe"))
 }
 
+/// `body` with every whole-line comment removed, which is what the needles below
+/// are matched against.
+///
+/// Measured, and the reason this function exists: with the comments left in, the
+/// per-arm skip guard stayed **green** after `echo "      mkcert -install"` was
+/// deleted from the T6 refusal arm, because the comment eight lines above it
+/// explains that the daemon's refusal "names `mkcert -install`". A recipe's
+/// comments are prose about the checks; a guard that a comment can satisfy is
+/// pinning the prose and not the check, which is the exact defect these needles
+/// were tightened to close.
+fn code_of(body: &str) -> String {
+    body.lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
 /// `just smoke-tls` is the only verification that drives real nono against a
 /// squatter, and nothing in `cargo test` can run it: it needs the `nono` binary,
 /// `nono setup` to have been run, and a local CA installed by a human with an admin
@@ -588,9 +649,6 @@ fn recipe(name: &str) -> String {
 ///
 /// Each of these has a specific way of failing silently:
 ///
-/// - The **skip** has to name `mkcert -install`. A recipe that skips without saying
-///   what to install reads like a pass, and T10 exists because that is how a
-///   verification step stops being one.
 /// - The block has to be asserted as **exit 126 specifically**. Both of nono's
 ///   blocking paths — `Err(SandboxInit)` from a transport failure and
 ///   `Err(BlockedCommand)` from a policy denial — reach the same `write_response(…,
@@ -600,42 +658,113 @@ fn recipe(name: &str) -> String {
 ///   the denial shape and must be absent, `Sandbox initialization failed` is the
 ///   transport shape and must be present. That distinction is T1, and it is the
 ///   thing a future reader will get wrong.
+/// - The **read**-grant sweep over the resolved manifest. The write sweep beside it
+///   is the policy directory's and the audit log's rule; a private key is handed
+///   over completely by a *read* grant, so a profile that only reads the TLS tree
+///   passes the write sweep in silence (A04).
+///
+/// Every needle is the **assertion's own text**, matched exactly once, rather than a
+/// word from the prose around it — and that is the whole lesson of this test's own
+/// history. `"126"` matched four comments and echoes as well as the `if` that tests
+/// it, so the exit-code check this docstring calls the point of the recipe could be
+/// deleted whole with this green; `"mkcert -install"` matched four places the same
+/// way. A needle a comment can satisfy pins a comment.
+///
+/// The skip is pinned by
+/// [`every_early_success_in_the_squat_recipe_announces_itself_as_a_skip`], which has
+/// to reason per-arm and cannot be a needle here at all.
 #[test]
 fn the_squat_recipe_keeps_what_makes_a_run_of_it_mean_something() {
-    let body = recipe("smoke-tls");
+    let body = code_of(&recipe("smoke-tls"));
     for (why, needle) in [
         (
-            "the skip names the command that fixes it (T10)",
-            "mkcert -install",
-        ),
-        (
-            "and announces itself as a skip rather than reading like a pass",
-            "SKIPPED",
-        ),
-        (
             "the block is asserted as exit 126, not merely non-zero (T1)",
-            "126",
+            "[ \"$CODE\" -ne 126 ]",
         ),
         (
             "the denial shape must be absent — a denial exits 126 too",
-            "approval_denied",
+            "*approval_denied*)",
         ),
         (
             "and the transport shape must be present",
-            "Sandbox initialization failed",
+            "*\"Sandbox initialization failed\"*)",
         ),
         (
             "and specifically the certificate — connection-refused is also a \
              transport failure at exit 126, so without this the whole block half \
              passes with nothing listening",
-            "invalid peer certificate",
+            "*\"invalid peer certificate\"*)",
+        ),
+        (
+            "the private key is swept out of every READ grant, not just every write \
+             grant (A04)",
+            "select(.access | test(\"read\"))",
         ),
     ] {
-        assert!(
-            body.contains(needle),
-            "the smoke-tls recipe no longer pins {why:?} (looked for {needle:?})"
+        let hits = body.matches(needle).count();
+        assert_eq!(
+            hits, 1,
+            "the smoke-tls recipe pins {why:?} in {hits} places (looked for \
+             {needle:?}). Zero means the check is gone. More than one means the \
+             needle is satisfied by something other than the check — a comment or an \
+             echo — so it no longer pins it."
         );
     }
+}
+
+/// Every early **success** in `smoke-tls` is a skip, and each arm has to say so on
+/// its own.
+///
+/// `exit 0` before the verification has run is the one outcome that reads exactly
+/// like a pass in CI and in a terminal, so T10's rule is that it must announce
+/// itself and name the command that fixes it. There are three such arms — no
+/// `mkcert`, `mkcert` cannot issue, and the daemon's own T6 refusal — and a single
+/// `body.contains("mkcert -install")` was satisfied by any one of them plus two
+/// comments, so the remedy could be dropped from the arm task 7.2 is actually about
+/// and nothing noticed.
+///
+/// So the window is per-arm: everything since the previous `exit`, which is where
+/// the branch this one belongs to can start. Deleting the message from any single
+/// arm reddens this, which is what a needle over the whole body could not do —
+/// and the window is [`code_of`], comments removed, because with them in it the
+/// mutation stayed green on a *comment* explaining that the refusal names
+/// `mkcert -install`.
+#[test]
+fn every_early_success_in_the_squat_recipe_announces_itself_as_a_skip() {
+    let body = code_of(&recipe("smoke-tls"));
+    let mut arms = 0;
+    let mut window = String::new();
+    for line in body.lines() {
+        window.push_str(line);
+        window.push('\n');
+        if !line.contains("exit ") {
+            continue;
+        }
+        if line.trim() == "exit 0" {
+            arms += 1;
+            for (why, needle) in [
+                (
+                    "announce itself as a skip rather than reading like a pass",
+                    "SKIPPED (not run, not passed)",
+                ),
+                ("name the command that fixes it (T10)", "mkcert -install"),
+            ] {
+                assert!(
+                    window.contains(needle),
+                    "the smoke-tls arm ending at this `exit 0` does not {why} \
+                     (looked for {needle:?} since the previous exit):\n{window}"
+                );
+            }
+        }
+        window.clear();
+    }
+    assert_eq!(
+        arms, 3,
+        "smoke-tls has three skip arms — no mkcert, mkcert cannot issue, and the \
+         daemon's own T6 refusal. Finding a different number means one was added \
+         without a message or one was removed, and either way this test is no longer \
+         checking what it says."
+    );
 }
 
 /// `[ "$a" != "$b" ] && VAR=…` under `set -e` **exits the script** when the test is

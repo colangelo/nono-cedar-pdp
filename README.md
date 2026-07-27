@@ -645,7 +645,8 @@ the daemon could set, it sets against *other* users; against the sandboxed agent
 nothing. So the rule is:
 
 > The policy directory and the audit log must never sit inside a path the sandbox profile
-> grants write access to.
+> grants write access to — and if you configured `[tls]`, the private key must never sit
+> inside a path it grants **read** access to.
 
 ### Checking your own profile against that rule
 
@@ -673,6 +674,28 @@ underneath one. `just smoke` runs exactly this comparison as an assertion, again
 sandboxed `git` `fs_write: ["."]` **and** `workdir.access: "readwrite"`, so the repository
 root is agent-writable and the smoke daemon's state deliberately lives elsewhere
 (`~/.cache/nono-cedar-pdp/smoke`).
+
+Running with `[tls]`? Sweep the same two places again, because **the private key's rule is
+READ, not write**: a grant that only reads the key still hands over the ability to complete
+nono's handshake and *be* this daemon, with nothing in this daemon's audit log to show for
+it. `test("read")` matches `readwrite` as well, which is the point.
+
+```bash
+# 3. The read column of the resolved manifest.
+nono profile show <profile> --format manifest \
+  | jq -r '.filesystem.grants[] | select(.access | test("read")) | "\(.access)\t\(.path)"'
+
+# 4. And the per-command read grants, which the resolved manifest again omits.
+jq -r '.command_policies.commands // {} | to_entries[] as $c
+       | $c.value.from // {} | to_entries[]
+       | "\($c.key) from \(.key): fs_read=\(.value.sandbox.fs_read // [])"
+         + " fs_read_file=\(.value.sandbox.fs_read_file // [])"' <profile>
+```
+
+Then check that your `[tls]` `key` is not one of *those* paths or underneath one.
+`just smoke-tls` runs this sweep as an assertion against the profile it generates, for the
+same reason `just smoke` runs the write one — that recipe adds a read grant of its own, so
+a check that only swept writes would have passed it in silence.
 
 Two traps worth knowing: on macOS the **default** profile groups grant write to `/tmp`,
 `/private/tmp`, `$TMPDIR` and `/var/folders`, so a policy directory under any temp path is
